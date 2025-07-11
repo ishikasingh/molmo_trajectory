@@ -3,7 +3,7 @@
 # Licensed under The MIT License [see LICENSE for details]
 # Written by Jiasen Lu, Jianwei Yang, based on code from Ross Girshick
 # --------------------------------------------------------
-"""this model processes a video and saves the output to a video file"""
+"""this model processes videos in a folder and saves the output to video files"""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F 
 from PIL import Image
+import glob
 
 import torchvision.transforms as transforms
 import torchvision.datasets as dset
@@ -66,13 +67,13 @@ def parse_args():
   parser.add_argument('--load_dir', dest='load_dir',
                       help='directory to load models',
                       default="models")
-  parser.add_argument('--input_video', dest='input_video',
-                      help='path to input video file',
+  parser.add_argument('--input_folder', dest='input_folder',
+                      help='path to input folder containing video files',
                       required=True, type=str)
-  parser.add_argument('--output_video', dest='output_video',
-                      help='path to output video file',
-                      default="output_video.mp4", type=str)
-  parser.add_argument('--cuda', dest='cuda', 
+  parser.add_argument('--output_folder', dest='output_folder',
+                      help='path to output folder for processed videos (optional - if not specified, saves in same folder as input)',
+                      default=None, type=str)
+  parser.add_argument('--cuda', dest='cuda',  default=True,
                       help='whether use CUDA',
                       action='store_true')
   parser.add_argument('--mGPUs', dest='mGPUs',
@@ -92,17 +93,17 @@ def parse_args():
                       default=8, type=int)
   parser.add_argument('--checkpoint', dest='checkpoint',
                       help='checkpoint to load network',
-                      default=89999, type=int, required=True)
+                      default=132028, type=int, required=False)
   parser.add_argument('--bs', dest='batch_size',
                       help='batch_size',
                       default=1, type=int)
   parser.add_argument('--vis', dest='vis',
                       help='visualization mode',
-                      default=True)
+                      default=False)
   parser.add_argument('--thresh_hand',
-                      type=float, default=0.5,
+                      type=float, default=0.01,
                       required=False)
-  parser.add_argument('--thresh_obj', default=0.5,
+  parser.add_argument('--thresh_obj', default=0.98,
                       type=float,
                       required=False)
 
@@ -146,6 +147,220 @@ def _get_image_blob(im):
   blob = im_list_to_blob(processed_ims)
 
   return blob, np.array(im_scale_factors)
+
+def get_video_files(folder_path):
+  """
+  Get all video files from the specified folder
+  """
+  video_extensions = ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.flv', '*.wmv', '*.m4v']
+  video_files = []
+  
+  for extension in video_extensions:
+    video_files.extend(glob.glob(os.path.join(folder_path, extension)))
+    video_files.extend(glob.glob(os.path.join(folder_path, extension.upper())))
+  
+  return sorted(video_files)
+
+def process_single_video(input_video_path, output_video_path, fasterRCNN, args):
+  """
+  Process a single video file
+  """
+  # Initialize tensor holders
+  im_data = torch.FloatTensor(1)
+  im_info = torch.FloatTensor(1)
+  num_boxes = torch.LongTensor(1)
+  gt_boxes = torch.FloatTensor(1)
+  box_info = torch.FloatTensor(1)
+
+  # Ship to cuda
+  if args.cuda > 0:
+    im_data = im_data.cuda()
+    im_info = im_info.cuda()
+    num_boxes = num_boxes.cuda()
+    gt_boxes = gt_boxes.cuda()
+
+  thresh_hand = args.thresh_hand 
+  thresh_obj = args.thresh_obj
+  vis = args.vis
+
+  # Video file mode
+  cap = cv2.VideoCapture(input_video_path)
+  if not cap.isOpened():
+      print(f"Warning: Could not open video file: {input_video_path}")
+      return False
+  
+  # Get video properties
+  fps = int(cap.get(cv2.CAP_PROP_FPS))
+  width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+  height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+  total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+  
+  # Set up video writer
+  fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+  out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+  
+  frame_count = 0
+  print(f'Processing video: {input_video_path}')
+  print(f'Video properties: {width}x{height}, {fps} FPS, {total_frames} frames')
+  print(f'Output video: {output_video_path}')
+
+  while True:
+      total_tic = time.time()
+      frame_count += 1
+
+      # Get frame from video
+      ret, frame = cap.read()
+      if not ret:
+          break
+      im_in = np.array(frame)
+      
+      # bgr
+      im = im_in
+
+      blobs, im_scales = _get_image_blob(im)
+      assert len(im_scales) == 1, "Only single-image batch implemented"
+      im_blob = blobs
+      im_info_np = np.array([[im_blob.shape[1], im_blob.shape[2], im_scales[0]]], dtype=np.float32)
+
+      im_data_pt = torch.from_numpy(im_blob)
+      im_data_pt = im_data_pt.permute(0, 3, 1, 2)
+      im_info_pt = torch.from_numpy(im_info_np)
+
+      with torch.no_grad():
+              im_data.resize_(im_data_pt.size()).copy_(im_data_pt)
+              im_info.resize_(im_info_pt.size()).copy_(im_info_pt)
+              gt_boxes.resize_(1, 1, 5).zero_()
+              num_boxes.resize_(1).zero_()
+              box_info.resize_(1, 1, 5).zero_() 
+
+      # pdb.set_trace()
+      det_tic = time.time()
+
+      rois, cls_prob, bbox_pred, \
+      rpn_loss_cls, rpn_loss_box, \
+      RCNN_loss_cls, RCNN_loss_bbox, \
+      rois_label, loss_list = fasterRCNN(im_data, im_info, gt_boxes, num_boxes, box_info) 
+
+      scores = cls_prob.data
+      boxes = rois.data[:, :, 1:5]
+
+      # extact predicted params
+      contact_vector = loss_list[0][0] # hand contact state info
+      offset_vector = loss_list[1][0].detach() # offset vector (factored into a unit vector and a magnitude)
+      lr_vector = loss_list[2][0].detach() # hand side info (left/right)
+
+      # get hand contact 
+      _, contact_indices = torch.max(contact_vector, 2)
+      contact_indices = contact_indices.squeeze(0).unsqueeze(-1).float()
+
+      # get hand side 
+      lr = torch.sigmoid(lr_vector) > 0.5
+      lr = lr.squeeze(0).float()
+
+      if cfg.TEST.BBOX_REG:
+          # Apply bounding-box regression deltas
+          box_deltas = bbox_pred.data
+          if cfg.TRAIN.BBOX_NORMALIZE_TARGETS_PRECOMPUTED:
+          # Optionally normalize targets by a precomputed mean and stdev
+            if args.class_agnostic:
+                if args.cuda > 0:
+                    box_deltas = box_deltas.view(-1, 4) * torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_STDS).cuda() \
+                              + torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_MEANS).cuda()
+                else:
+                    box_deltas = box_deltas.view(-1, 4) * torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_STDS) \
+                              + torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_MEANS)
+
+                box_deltas = box_deltas.view(1, -1, 4)
+            else:
+                if args.cuda > 0:
+                    box_deltas = box_deltas.view(-1, 4) * torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_STDS).cuda() \
+                              + torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_MEANS).cuda()
+                else:
+                    box_deltas = box_deltas.view(-1, 4) * torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_STDS) \
+                              + torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_MEANS)
+                box_deltas = box_deltas.view(1, -1, 4 * len(pascal_classes))
+
+          pred_boxes = bbox_transform_inv(boxes, box_deltas, 1)
+          pred_boxes = clip_boxes(pred_boxes, im_info.data, 1)
+      else:
+          # Simply repeat the boxes, once for each class
+          pred_boxes = np.tile(boxes, (1, scores.shape[1]))
+
+      pred_boxes /= im_scales[0]
+
+      scores = scores.squeeze()
+      pred_boxes = pred_boxes.squeeze()
+      det_toc = time.time()
+      detect_time = det_toc - det_tic
+      misc_tic = time.time()
+      if vis:
+          im2show = np.copy(im)
+      obj_dets, hand_dets = None, None
+      for j in xrange(1, len(pascal_classes)):
+          # inds = torch.nonzero(scores[:,j] > thresh).view(-1)
+          if pascal_classes[j] == 'hand':
+            inds = torch.nonzero(scores[:,j]>thresh_hand).view(-1)
+          elif pascal_classes[j] == 'targetobject':
+            inds = torch.nonzero(scores[:,j]>thresh_obj).view(-1)
+
+          # if there is det
+          if inds.numel() > 0:
+            cls_scores = scores[:,j][inds]
+            _, order = torch.sort(cls_scores, 0, True)
+            if args.class_agnostic:
+              cls_boxes = pred_boxes[inds, :]
+            else:
+              cls_boxes = pred_boxes[inds][:, j * 4:(j + 1) * 4]
+              
+              cls_dets = torch.cat((cls_boxes, cls_scores.unsqueeze(1), contact_indices[inds], offset_vector.squeeze(0)[inds], lr[inds]), 1)
+              cls_dets = cls_dets[order]
+              keep = nms(cls_boxes[order, :], cls_scores[order], cfg.TEST.NMS)
+              cls_dets = cls_dets[keep.view(-1).long()]
+              if pascal_classes[j] == 'targetobject':
+                obj_dets = cls_dets.cpu().numpy()
+              if pascal_classes[j] == 'hand':
+                hand_dets = cls_dets.cpu().numpy()
+
+      if vis:
+        # visualization
+        im2show = vis_detections_filtered_objects_PIL(im2show, obj_dets, hand_dets, thresh_hand, thresh_obj)
+        # extract hand info
+        # for i in range(len(hand_dets)):
+        #   bbox = list(int(np.round(x)) for x in hand_dets[i, :4])
+        #   score = hand_dets[i, 4]
+        #   lr = hand_dets[i, -1] # 0 means left, 1 means right
+        #   state = hand_dets[i, 5]
+        #   state_map2 = {0:'N', 1:'S', 2:'O', 3:'P', 4:'F'}
+        #   state = state_map2[state]
+          # print(f'Hand {i+1}: BBox={bbox}, Score={score}, L/R={lr}, State={state}')
+        # extract object info
+        # for i in range(len(obj_dets)):
+        #   bbox = list(int(np.round(x)) for x in obj_dets[i, :4])
+        #   score = obj_dets[i, 4]
+        #   print(f'Object {i+1}: BBox={bbox}, Score={score}')
+
+      misc_toc = time.time()
+      nms_time = misc_toc - misc_tic
+
+      # Output progress
+      sys.stdout.write('frame: {:d}/{:d} {:.3f}s {:.3f}s   \r' \
+                      .format(frame_count, total_frames, detect_time, nms_time))
+      sys.stdout.flush()
+
+      if vis:
+          # Convert PIL image back to OpenCV format and write to video
+          im2show_cv = cv2.cvtColor(np.array(im2show), cv2.COLOR_RGB2BGR)
+          out.write(im2show_cv)
+      
+      # Check if we've processed all frames
+      if frame_count >= total_frames:
+          break
+            
+  # Cleanup
+  cap.release()
+  out.release()
+  print(f'\nVideo processing complete. Output saved to: {output_video_path}')
+  return True
 
 if __name__ == '__main__':
 
@@ -198,19 +413,18 @@ if __name__ == '__main__':
   print('load model successfully!')
 
 
-  # initilize the tensor holder here.
-  im_data = torch.FloatTensor(1)
-  im_info = torch.FloatTensor(1)
-  num_boxes = torch.LongTensor(1)
-  gt_boxes = torch.FloatTensor(1)
-  box_info = torch.FloatTensor(1) 
+  # Create output folder if specified and doesn't exist
+  if args.output_folder and not os.path.exists(args.output_folder):
+    os.makedirs(args.output_folder)
 
-  # ship to cuda
-  if args.cuda > 0:
-    im_data = im_data.cuda()
-    im_info = im_info.cuda()
-    num_boxes = num_boxes.cuda()
-    gt_boxes = gt_boxes.cuda()
+  # Get all video files from input folder
+  video_files = get_video_files(args.input_folder)
+  
+  if not video_files:
+    print(f"No video files found in {args.input_folder}")
+    sys.exit(1)
+
+  print(f"Found {len(video_files)} video files to process")
 
   with torch.no_grad():
     if args.cuda > 0:
@@ -221,185 +435,32 @@ if __name__ == '__main__':
 
     fasterRCNN.eval()
 
-    start = time.time()
-    max_per_image = 100
-    thresh_hand = args.thresh_hand 
-    thresh_obj = args.thresh_obj
-    vis = args.vis
-
-    # Video file mode
-    cap = cv2.VideoCapture(args.input_video)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video file: {args.input_video}")
+    # Process each video file
+    successful_count = 0
+    for i, video_file in enumerate(video_files):
+      print(f"\n=== Processing video {i+1}/{len(video_files)} ===")
+      
+      # Generate output filename
+      video_name = os.path.basename(video_file)
+      name_without_ext = os.path.splitext(video_name)[0]
+      
+      # If output folder is specified, use it; otherwise save in same folder as input
+      if args.output_folder:
+        output_video_path = os.path.join(args.output_folder, f"{name_without_ext}_processed.mp4")
+      else:
+        # Save in the same directory as the original video
+        video_dir = os.path.dirname(video_file)
+        output_video_path = os.path.join(video_dir, f"{name_without_ext}_processed.mp4")
+      
+      # Process the video
+      success = process_single_video(video_file, output_video_path, fasterRCNN, args)
+      if success:
+        successful_count += 1
+      
+    print(f"\n=== Processing Complete ===")
+    print(f"Successfully processed {successful_count}/{len(video_files)} videos")
     
-    # Get video properties
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    # Set up video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(args.output_video, fourcc, fps, (width, height))
-    
-    frame_count = 0
-    print(f'Processing video: {args.input_video}')
-    print(f'Video properties: {width}x{height}, {fps} FPS, {total_frames} frames')
-    print(f'Output video: {args.output_video}')
-
-    while True:
-        total_tic = time.time()
-        frame_count += 1
-
-        # Get frame from video
-        ret, frame = cap.read()
-        if not ret:
-            break
-        im_in = np.array(frame)
-        
-        # bgr
-        im = im_in
-
-        blobs, im_scales = _get_image_blob(im)
-        assert len(im_scales) == 1, "Only single-image batch implemented"
-        im_blob = blobs
-        im_info_np = np.array([[im_blob.shape[1], im_blob.shape[2], im_scales[0]]], dtype=np.float32)
-
-        im_data_pt = torch.from_numpy(im_blob)
-        im_data_pt = im_data_pt.permute(0, 3, 1, 2)
-        im_info_pt = torch.from_numpy(im_info_np)
-
-        with torch.no_grad():
-                im_data.resize_(im_data_pt.size()).copy_(im_data_pt)
-                im_info.resize_(im_info_pt.size()).copy_(im_info_pt)
-                gt_boxes.resize_(1, 1, 5).zero_()
-                num_boxes.resize_(1).zero_()
-                box_info.resize_(1, 1, 5).zero_() 
-
-        # pdb.set_trace()
-        det_tic = time.time()
-
-        rois, cls_prob, bbox_pred, \
-        rpn_loss_cls, rpn_loss_box, \
-        RCNN_loss_cls, RCNN_loss_bbox, \
-        rois_label, loss_list = fasterRCNN(im_data, im_info, gt_boxes, num_boxes, box_info) 
-
-        scores = cls_prob.data
-        boxes = rois.data[:, :, 1:5]
-
-        # extact predicted params
-        contact_vector = loss_list[0][0] # hand contact state info
-        offset_vector = loss_list[1][0].detach() # offset vector (factored into a unit vector and a magnitude)
-        lr_vector = loss_list[2][0].detach() # hand side info (left/right)
-
-        # get hand contact 
-        _, contact_indices = torch.max(contact_vector, 2)
-        contact_indices = contact_indices.squeeze(0).unsqueeze(-1).float()
-
-        # get hand side 
-        lr = torch.sigmoid(lr_vector) > 0.5
-        lr = lr.squeeze(0).float()
-
-        if cfg.TEST.BBOX_REG:
-            # Apply bounding-box regression deltas
-            box_deltas = bbox_pred.data
-            if cfg.TRAIN.BBOX_NORMALIZE_TARGETS_PRECOMPUTED:
-            # Optionally normalize targets by a precomputed mean and stdev
-              if args.class_agnostic:
-                  if args.cuda > 0:
-                      box_deltas = box_deltas.view(-1, 4) * torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_STDS).cuda() \
-                                + torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_MEANS).cuda()
-                  else:
-                      box_deltas = box_deltas.view(-1, 4) * torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_STDS) \
-                                + torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_MEANS)
-
-                  box_deltas = box_deltas.view(1, -1, 4)
-              else:
-                  if args.cuda > 0:
-                      box_deltas = box_deltas.view(-1, 4) * torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_STDS).cuda() \
-                                + torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_MEANS).cuda()
-                  else:
-                      box_deltas = box_deltas.view(-1, 4) * torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_STDS) \
-                                + torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_MEANS)
-                  box_deltas = box_deltas.view(1, -1, 4 * len(pascal_classes))
-
-            pred_boxes = bbox_transform_inv(boxes, box_deltas, 1)
-            pred_boxes = clip_boxes(pred_boxes, im_info.data, 1)
-        else:
-            # Simply repeat the boxes, once for each class
-            pred_boxes = np.tile(boxes, (1, scores.shape[1]))
-
-        pred_boxes /= im_scales[0]
-
-        scores = scores.squeeze()
-        pred_boxes = pred_boxes.squeeze()
-        det_toc = time.time()
-        detect_time = det_toc - det_tic
-        misc_tic = time.time()
-        if vis:
-            im2show = np.copy(im)
-        obj_dets, hand_dets = None, None
-        for j in xrange(1, len(pascal_classes)):
-            # inds = torch.nonzero(scores[:,j] > thresh).view(-1)
-            if pascal_classes[j] == 'hand':
-              inds = torch.nonzero(scores[:,j]>thresh_hand).view(-1)
-            elif pascal_classes[j] == 'targetobject':
-              inds = torch.nonzero(scores[:,j]>thresh_obj).view(-1)
-
-            # if there is det
-            if inds.numel() > 0:
-              cls_scores = scores[:,j][inds]
-              _, order = torch.sort(cls_scores, 0, True)
-              if args.class_agnostic:
-                cls_boxes = pred_boxes[inds, :]
-              else:
-                cls_boxes = pred_boxes[inds][:, j * 4:(j + 1) * 4]
-              
-              cls_dets = torch.cat((cls_boxes, cls_scores.unsqueeze(1), contact_indices[inds], offset_vector.squeeze(0)[inds], lr[inds]), 1)
-              cls_dets = cls_dets[order]
-              keep = nms(cls_boxes[order, :], cls_scores[order], cfg.TEST.NMS)
-              cls_dets = cls_dets[keep.view(-1).long()]
-              if pascal_classes[j] == 'targetobject':
-                obj_dets = cls_dets.cpu().numpy()
-              if pascal_classes[j] == 'hand':
-                hand_dets = cls_dets.cpu().numpy()
-              
-        if vis:
-          # visualization
-          im2show = vis_detections_filtered_objects_PIL(im2show, obj_dets, hand_dets, thresh_hand, thresh_obj)
-          # extract hand info
-          for i in range(len(hand_dets)):
-            bbox = list(int(np.round(x)) for x in hand_dets[i, :4])
-            score = hand_dets[i, 4]
-            lr = hand_dets[i, -1] # 0 means left, 1 means right
-            state = hand_dets[i, 5]
-            state_map2 = {0:'N', 1:'S', 2:'O', 3:'P', 4:'F'}
-            state = state_map2[state]
-            print(f'Hand {i+1}: BBox={bbox}, Score={score}, L/R={lr}, State={state}')
-          # extract object info
-          for i in range(len(obj_dets)):
-            bbox = list(int(np.round(x)) for x in obj_dets[i, :4])
-            score = obj_dets[i, 4]
-            print(f'Object {i+1}: BBox={bbox}, Score={score}')
-
-        misc_toc = time.time()
-        nms_time = misc_toc - misc_tic
-
-        # Output progress
-        sys.stdout.write('frame: {:d}/{:d} {:.3f}s {:.3f}s   \r' \
-                        .format(frame_count, total_frames, detect_time, nms_time))
-        sys.stdout.flush()
-
-        if vis:
-            # Convert PIL image back to OpenCV format and write to video
-            im2show_cv = cv2.cvtColor(np.array(im2show), cv2.COLOR_RGB2BGR)
-            out.write(im2show_cv)
-        
-        # Check if we've processed all frames
-        if frame_count >= total_frames:
-            break
-              
-    # Cleanup
-    cap.release()
-    out.release()
-    print(f'\nVideo processing complete. Output saved to: {args.output_video}')
+    if args.output_folder:
+      print(f"Output videos saved to: {args.output_folder}")
+    else:
+      print(f"Output videos saved in the same folders as input videos with '_processed' suffix")

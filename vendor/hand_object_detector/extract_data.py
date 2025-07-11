@@ -23,6 +23,11 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F 
 from PIL import Image
+import glob
+import multiprocessing as mp
+import queue
+import threading
+from collections import defaultdict
 
 import torchvision.transforms as transforms
 import torchvision.datasets as dset
@@ -65,12 +70,15 @@ def parse_args():
   parser.add_argument('--load_dir', dest='load_dir',
                       help='directory to load models',
                       default="models")
-  parser.add_argument('--input_video', dest='input_video',
-                      help='path to input video file',
+  parser.add_argument('--input_folder', dest='input_folder',
+                      help='path to folder containing video files',
                       required=True, type=str)
   parser.add_argument('--cuda', dest='cuda', 
                       help='whether use CUDA',
-                      action='store_true')
+                      action='store_true', default=True)
+  parser.add_argument('--num_gpus', dest='num_gpus',
+                      help='number of GPUs to use (0 for auto-detect, -1 for CPU only)',
+                      default=0, type=int)
   parser.add_argument('--mGPUs', dest='mGPUs',
                       help='whether use multiple GPUs',
                       action='store_true')
@@ -143,13 +151,38 @@ def _get_image_blob(im):
 
   return blob, np.array(im_scale_factors)
 
-if __name__ == '__main__':
+def get_video_files(folder_path):
+  """
+  Get all video files from the specified folder
+  """
+  video_extensions = ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.flv', '*.wmv', '*.m4v']
+  video_files = []
+  
+  for extension in video_extensions:
+    pattern = os.path.join(folder_path, extension)
+    video_files.extend(glob.glob(pattern))
+    # Also check for uppercase extensions
+    pattern = os.path.join(folder_path, extension.upper())
+    video_files.extend(glob.glob(pattern))
+  
+  return sorted(video_files)
 
-  args = parse_args()
+def get_available_gpus():
+  """
+  Get the number of available GPUs
+  """
+  if not torch.cuda.is_available():
+    return 0
+  return torch.cuda.device_count()
 
-  # print('Called with args:')
-  # print(args)
-
+def initialize_model_on_gpu(args, gpu_id):
+  """
+  Initialize the model on a specific GPU
+  """
+  # Set the device
+  torch.cuda.set_device(gpu_id)
+  
+  # Load configuration
   if args.cfg_file is not None:
     cfg_from_file(args.cfg_file)
   if args.set_cfgs is not None:
@@ -167,7 +200,7 @@ if __name__ == '__main__':
   pascal_classes = np.asarray(['__background__', 'targetobject', 'hand']) 
   args.set_cfgs = ['ANCHOR_SCALES', '[8, 16, 32, 64]', 'ANCHOR_RATIOS', '[0.5, 1, 2]'] 
 
-  # initilize the network here.
+  # initialize the network here.
   if args.net == 'vgg16':
     fasterRCNN = vgg16(pascal_classes, pretrained=False, class_agnostic=args.class_agnostic)
   elif args.net == 'res101':
@@ -177,74 +210,114 @@ if __name__ == '__main__':
   elif args.net == 'res152':
     fasterRCNN = resnet(pascal_classes, 152, pretrained=False, class_agnostic=args.class_agnostic)
   else:
-    print("network is not defined")
-    pdb.set_trace()
+    raise ValueError("network is not defined")
 
   fasterRCNN.create_architecture()
 
-  print("load checkpoint %s" % (load_name))
-  if args.cuda > 0:
-    checkpoint = torch.load(load_name)
-  else:
-    checkpoint = torch.load(load_name, map_location=(lambda storage, loc: storage))
+  print(f"[GPU {gpu_id}] Loading checkpoint {load_name}")
+  checkpoint = torch.load(load_name, map_location=f'cuda:{gpu_id}')
   fasterRCNN.load_state_dict(checkpoint['model'])
   if 'pooling_mode' in checkpoint.keys():
     cfg.POOLING_MODE = checkpoint['pooling_mode']
 
-  print('load model successfully!')
+  print(f'[GPU {gpu_id}] Model loaded successfully!')
 
+  # Move model to GPU
+  fasterRCNN.cuda(gpu_id)
+  fasterRCNN.eval()
 
-  # initilize the tensor holder here.
-  im_data = torch.FloatTensor(1)
-  im_info = torch.FloatTensor(1)
-  num_boxes = torch.LongTensor(1)
-  gt_boxes = torch.FloatTensor(1)
-  box_info = torch.FloatTensor(1) 
+  # Initialize tensor holders
+  im_data = torch.FloatTensor(1).cuda(gpu_id)
+  im_info = torch.FloatTensor(1).cuda(gpu_id)
+  num_boxes = torch.LongTensor(1).cuda(gpu_id)
+  gt_boxes = torch.FloatTensor(1).cuda(gpu_id)
+  box_info = torch.FloatTensor(1).cuda(gpu_id)
 
-  # ship to cuda
-  if args.cuda > 0:
-    im_data = im_data.cuda()
-    im_info = im_info.cuda()
-    num_boxes = num_boxes.cuda()
-    gt_boxes = gt_boxes.cuda()
+  return fasterRCNN, im_data, im_info, num_boxes, gt_boxes, box_info, pascal_classes
 
-  with torch.no_grad():
-    if args.cuda > 0:
-      cfg.CUDA = True
-
-    if args.cuda > 0:
-      fasterRCNN.cuda()
-
-    fasterRCNN.eval()
-
-    start = time.time()
-    max_per_image = 100
-    thresh_hand = args.thresh_hand 
-    thresh_obj = args.thresh_obj
-    vis = args.vis
-
-    # Video file mode
-    cap = cv2.VideoCapture(args.input_video)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video file: {args.input_video}")
+def gpu_worker(gpu_id, video_queue, result_queue, args):
+  """
+  Worker function that processes videos on a specific GPU
+  """
+  try:
+    # Initialize model on this GPU
+    fasterRCNN, im_data, im_info, num_boxes, gt_boxes, box_info, pascal_classes = initialize_model_on_gpu(args, gpu_id)
     
-    # Get video properties
-    fps = 30
-    # fps = int(cap.get(cv2.CAP_PROP_FPS))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cfg.CUDA = True
     
-    # Set up video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    
-    frame_count = 0
-    print(f'Processing video: {args.input_video}')
-    print(f'Video properties: {width}x{height}, {fps} FPS, {total_frames} frames')
-    video_data = []
+    with torch.no_grad():
+      while True:
+        try:
+          # Get next video from queue (with timeout to avoid hanging)
+          video_path = video_queue.get(timeout=1)
+          if video_path is None:  # Sentinel value to stop worker
+            break
+            
+          print(f"[GPU {gpu_id}] Processing: {os.path.basename(video_path)}")
+          
+          # Process the video
+          start_time = time.time()
+          success = process_single_video_gpu(video_path, fasterRCNN, args, im_data, im_info, 
+                                           num_boxes, gt_boxes, box_info, pascal_classes, gpu_id)
+          end_time = time.time()
+          
+          # Report result
+          result_queue.put({
+            'gpu_id': gpu_id,
+            'video_path': video_path,
+            'success': success,
+            'processing_time': end_time - start_time
+          })
+          
+          print(f"[GPU {gpu_id}] Completed: {os.path.basename(video_path)} in {end_time - start_time:.2f}s")
+          
+        except queue.Empty:
+          continue
+        except Exception as e:
+          print(f"[GPU {gpu_id}] Error processing video: {str(e)}")
+          result_queue.put({
+            'gpu_id': gpu_id,
+            'video_path': video_path if 'video_path' in locals() else 'unknown',
+            'success': False,
+            'processing_time': 0,
+            'error': str(e)
+          })
+          
+  except Exception as e:
+    print(f"[GPU {gpu_id}] Worker initialization failed: {str(e)}")
+    result_queue.put({
+      'gpu_id': gpu_id,
+      'video_path': 'initialization',
+      'success': False,
+      'processing_time': 0,
+      'error': str(e)
+    })
 
+def process_single_video_gpu(video_path, fasterRCNN, args, im_data, im_info, num_boxes, gt_boxes, box_info, pascal_classes, gpu_id):
+  """
+  Process a single video file on a specific GPU
+  """
+  # Video file mode
+  cap = cv2.VideoCapture(video_path)
+  if not cap.isOpened():
+      print(f"[GPU {gpu_id}] Warning: Could not open video file: {video_path}")
+      return False
+  
+  # Get video properties
+  fps = 30
+  width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+  height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+  total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+  
+  frame_count = 0
+  video_data = []
+
+  thresh_hand = args.thresh_hand 
+  thresh_obj = args.thresh_obj
+  vis = args.vis
+
+  try:
     while True:
-        total_tic = time.time()
         frame_count += 1
 
         # Get frame from video
@@ -272,9 +345,6 @@ if __name__ == '__main__':
                 num_boxes.resize_(1).zero_()
                 box_info.resize_(1, 1, 5).zero_() 
 
-        # pdb.set_trace()
-        det_tic = time.time()
-
         rois, cls_prob, bbox_pred, \
         rpn_loss_cls, rpn_loss_box, \
         RCNN_loss_cls, RCNN_loss_bbox, \
@@ -283,7 +353,7 @@ if __name__ == '__main__':
         scores = cls_prob.data
         boxes = rois.data[:, :, 1:5]
 
-        # extact predicted params
+        # extract predicted params
         contact_vector = loss_list[0][0] # hand contact state info
         offset_vector = loss_list[1][0].detach() # offset vector (factored into a unit vector and a magnitude)
         lr_vector = loss_list[2][0].detach() # hand side info (left/right)
@@ -302,21 +372,12 @@ if __name__ == '__main__':
             if cfg.TRAIN.BBOX_NORMALIZE_TARGETS_PRECOMPUTED:
             # Optionally normalize targets by a precomputed mean and stdev
               if args.class_agnostic:
-                  if args.cuda > 0:
-                      box_deltas = box_deltas.view(-1, 4) * torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_STDS).cuda() \
-                                + torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_MEANS).cuda()
-                  else:
-                      box_deltas = box_deltas.view(-1, 4) * torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_STDS) \
-                                + torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_MEANS)
-
+                  box_deltas = box_deltas.view(-1, 4) * torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_STDS).cuda(gpu_id) \
+                            + torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_MEANS).cuda(gpu_id)
                   box_deltas = box_deltas.view(1, -1, 4)
               else:
-                  if args.cuda > 0:
-                      box_deltas = box_deltas.view(-1, 4) * torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_STDS).cuda() \
-                                + torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_MEANS).cuda()
-                  else:
-                      box_deltas = box_deltas.view(-1, 4) * torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_STDS) \
-                                + torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_MEANS)
+                  box_deltas = box_deltas.view(-1, 4) * torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_STDS).cuda(gpu_id) \
+                            + torch.FloatTensor(cfg.TRAIN.BBOX_NORMALIZE_MEANS).cuda(gpu_id)
                   box_deltas = box_deltas.view(1, -1, 4 * len(pascal_classes))
 
             pred_boxes = bbox_transform_inv(boxes, box_deltas, 1)
@@ -329,14 +390,11 @@ if __name__ == '__main__':
 
         scores = scores.squeeze()
         pred_boxes = pred_boxes.squeeze()
-        det_toc = time.time()
-        detect_time = det_toc - det_tic
-        misc_tic = time.time()
+        
         if vis:
             im2show = np.copy(im)
         obj_dets, hand_dets = None, None
         for j in xrange(1, len(pascal_classes)):
-            # inds = torch.nonzero(scores[:,j] > thresh).view(-1)
             if pascal_classes[j] == 'hand':
               inds = torch.nonzero(scores[:,j]>thresh_hand).view(-1)
             elif pascal_classes[j] == 'targetobject':
@@ -363,6 +421,7 @@ if __name__ == '__main__':
         if vis:
           # visualization
           im2show = vis_detections_filtered_objects_PIL(im2show, obj_dets, hand_dets, thresh_hand, thresh_obj)
+          
         # extract hand info
         frame_data = {"left_hand": None, "right_hand": None, "objects": None}
         if hand_dets is not None:
@@ -373,7 +432,6 @@ if __name__ == '__main__':
             state = hand_dets[i, 5]
             state_map2 = {0:'N', 1:'S', 2:'O', 3:'P', 4:'F'}
             state = state_map2[state]
-            # print(f'Hand {i+1}: BBox={bbox}, Score={score}, L/R={lr}, State={state_map2[state]}')
             if lr == 0 and score > args.thresh_hand:
               frame_data["left_hand"] = {"bbox": bbox, "score": score, "state": state}
             elif lr == 1 and score > args.thresh_hand:
@@ -383,31 +441,146 @@ if __name__ == '__main__':
           for i in range(len(obj_dets)):
             bbox = list(int(np.round(x)) for x in obj_dets[i, :4])
             score = float(obj_dets[i, 4])  # Convert numpy float32 to Python float
-            # print(f'Object {i+1}: BBox={bbox}, Score={score}')
             if score > args.thresh_obj:
               frame_data["objects"] = {"bbox": bbox, "score": score}
         video_data.append(frame_data)
 
-        misc_toc = time.time()
-        nms_time = misc_toc - misc_tic
-
-        # Output progress
-        sys.stdout.write('frame: {:d}/{:d} {:.3f}s {:.3f}s   \r' \
-                        .format(frame_count, total_frames, detect_time, nms_time))
-        sys.stdout.flush()
-
-        if vis:
-            # Convert PIL image back to OpenCV format and write to video
-            im2show_cv = cv2.cvtColor(np.array(im2show), cv2.COLOR_RGB2BGR)
-            out.write(im2show_cv)
+        # Progress output (less frequent to avoid spam)
+        if frame_count % 30 == 0 or frame_count >= total_frames:
+            print(f'[GPU {gpu_id}] {os.path.basename(video_path)}: frame {frame_count}/{total_frames}')
         
         # Check if we've processed all frames
         if frame_count >= total_frames:
             break
               
-    # Cleanup
+  except Exception as e:
+    print(f"[GPU {gpu_id}] Error during video processing: {str(e)}")
     cap.release()
-    # save video_data to json
-    with open(f'{args.input_video.split(".")[0]}_video_data.json', 'w') as f:
-      json.dump(video_data, f)
-    print(f'\nVideo processing complete. Output saved to: {args.input_video.split(".")[0]}_video_data.json')
+    return False
+            
+  # Cleanup
+  cap.release()
+  
+  # save video_data to json
+  output_json_path = f'{video_path.rsplit(".", 1)[0]}.json'
+  with open(output_json_path, 'w') as f:
+    json.dump(video_data, f)
+  print(f'[GPU {gpu_id}] Video processing complete. Output saved to: {output_json_path}')
+  return True
+
+if __name__ == '__main__':
+
+  args = parse_args()
+
+  # Get all video files from the input folder
+  video_files = get_video_files(args.input_folder)
+  if not video_files:
+      print(f"No video files found in folder: {args.input_folder}")
+      print("Supported formats: mp4, avi, mov, mkv, flv, wmv, m4v")
+      sys.exit(1)
+  
+  print(f"Found {len(video_files)} video files to process:")
+  for video_file in video_files:
+      print(f"  - {os.path.basename(video_file)}")
+
+  # Determine number of GPUs to use
+  available_gpus = get_available_gpus()
+  
+  if args.num_gpus == -1:  # CPU only
+    num_gpus = 0
+    args.cuda = False
+  elif args.num_gpus == 0:  # Auto-detect
+    num_gpus = available_gpus
+  else:  # User specified
+    num_gpus = min(args.num_gpus, available_gpus)
+  
+  print(f"\nGPU Configuration:")
+  print(f"  Available GPUs: {available_gpus}")
+  print(f"  Using GPUs: {num_gpus}")
+  
+  if num_gpus == 0:
+    print("Warning: Running on CPU only. This will be much slower.")
+    # Fall back to single-threaded CPU processing
+    # ... (implement CPU fallback if needed)
+    sys.exit(1)
+  
+  # Create queues for communication between processes
+  video_queue = mp.Queue()
+  result_queue = mp.Queue()
+  
+  # Add all videos to the queue
+  for video_path in video_files:
+    video_queue.put(video_path)
+  
+  # Add sentinel values to signal workers to stop
+  for _ in range(num_gpus):
+    video_queue.put(None)
+  
+  # Start worker processes
+  processes = []
+  for gpu_id in range(num_gpus):
+    p = mp.Process(target=gpu_worker, args=(gpu_id, video_queue, result_queue, args))
+    p.start()
+    processes.append(p)
+  
+  # Monitor progress
+  start_time = time.time()
+  completed_videos = 0
+  successful_videos = 0
+  failed_videos = 0
+  gpu_stats = defaultdict(lambda: {'count': 0, 'time': 0})
+  
+  print(f"\nStarting parallel processing with {num_gpus} GPUs...")
+  print("="*80)
+  
+  # Collect results
+  while completed_videos < len(video_files):
+    try:
+      result = result_queue.get(timeout=5)
+      completed_videos += 1
+      
+      gpu_id = result['gpu_id']
+      video_name = os.path.basename(result['video_path'])
+      
+      if result['success']:
+        successful_videos += 1
+        gpu_stats[gpu_id]['count'] += 1
+        gpu_stats[gpu_id]['time'] += result['processing_time']
+        print(f"[{completed_videos}/{len(video_files)}] ✓ {video_name} (GPU {gpu_id}, {result['processing_time']:.1f}s)")
+      else:
+        failed_videos += 1
+        error_msg = result.get('error', 'Unknown error')
+        print(f"[{completed_videos}/{len(video_files)}] ✗ {video_name} (GPU {gpu_id}) - {error_msg}")
+        
+    except queue.Empty:
+      print("Waiting for results...")
+      continue
+  
+  # Wait for all processes to complete
+  for p in processes:
+    p.join()
+  
+  # Print final statistics
+  total_time = time.time() - start_time
+  print("\n" + "="*80)
+  print("PROCESSING COMPLETE")
+  print("="*80)
+  print(f"Total videos: {len(video_files)}")
+  print(f"Successful: {successful_videos}")
+  print(f"Failed: {failed_videos}")
+  print(f"Total wall time: {total_time:.2f} seconds")
+  print(f"Average wall time per video: {total_time/len(video_files):.2f} seconds")
+  
+  print(f"\nGPU Statistics:")
+  for gpu_id in range(num_gpus):
+    stats = gpu_stats[gpu_id]
+    if stats['count'] > 0:
+      avg_time = stats['time'] / stats['count']
+      print(f"  GPU {gpu_id}: {stats['count']} videos, avg {avg_time:.1f}s per video")
+    else:
+      print(f"  GPU {gpu_id}: 0 videos processed")
+  
+  if successful_videos > 0:
+    total_processing_time = sum(gpu_stats[gpu_id]['time'] for gpu_id in range(num_gpus))
+    speedup = total_processing_time / total_time
+    print(f"\nSpeedup achieved: {speedup:.1f}x (vs sequential processing)")
