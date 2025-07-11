@@ -3,6 +3,7 @@
 # Licensed under The MIT License [see LICENSE for details]
 # Written by Jiasen Lu, Jianwei Yang, based on code from Ross Girshick
 # --------------------------------------------------------
+"""this model extracts data from a video and saves it to a json file"""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -38,12 +39,11 @@ from model.utils.blob import im_list_to_blob
 from model.faster_rcnn.vgg16 import vgg16
 from model.faster_rcnn.resnet import resnet
 import pdb
-
+import json
 try:
     xrange          # Python 2
 except NameError:
     xrange = range  # Python 3
-
 
 def parse_args():
   """
@@ -65,18 +65,9 @@ def parse_args():
   parser.add_argument('--load_dir', dest='load_dir',
                       help='directory to load models',
                       default="models")
-  parser.add_argument('--image_dir', dest='image_dir',
-                      help='directory to load images for demo',
-                      default="images")
-  parser.add_argument('--save_dir', dest='save_dir',
-                      help='directory to save results',
-                      default="images_det")
   parser.add_argument('--input_video', dest='input_video',
                       help='path to input video file',
-                      default=None, type=str)
-  parser.add_argument('--output_video', dest='output_video',
-                      help='path to output video file',
-                      default="output_video.mp4", type=str)
+                      required=True, type=str)
   parser.add_argument('--cuda', dest='cuda', 
                       help='whether use CUDA',
                       action='store_true')
@@ -97,16 +88,13 @@ def parse_args():
                       default=8, type=int)
   parser.add_argument('--checkpoint', dest='checkpoint',
                       help='checkpoint to load network',
-                      default=89999, type=int, required=True)
+                      default=132028, type=int)
   parser.add_argument('--bs', dest='batch_size',
                       help='batch_size',
                       default=1, type=int)
   parser.add_argument('--vis', dest='vis',
                       help='visualization mode',
-                      default=True)
-  parser.add_argument('--webcam_num', dest='webcam_num',
-                      help='webcam ID number',
-                      default=-1, type=int)
+                      default=False)
   parser.add_argument('--thresh_hand',
                       type=float, default=0.5,
                       required=False)
@@ -235,74 +223,35 @@ if __name__ == '__main__':
     thresh_obj = args.thresh_obj
     vis = args.vis
 
-    # print(f'thresh_hand = {thresh_hand}')
-    # print(f'thnres_obj = {thresh_obj}')
-
-    webcam_num = args.webcam_num
+    # Video file mode
+    cap = cv2.VideoCapture(args.input_video)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video file: {args.input_video}")
     
-    # Determine input mode: webcam, video file, or image folder
-    if webcam_num >= 0:
-        # Webcam mode
-        cap = cv2.VideoCapture(webcam_num)
-        num_images = 0
-        input_mode = 'webcam'
-        print('Using webcam input')
-    elif args.input_video is not None:
-        # Video file mode
-        cap = cv2.VideoCapture(args.input_video)
-        if not cap.isOpened():
-            raise RuntimeError(f"Could not open video file: {args.input_video}")
-        
-        # Get video properties
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        # Set up video writer
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(args.output_video, fourcc, fps, (width, height))
-        
-        num_images = total_frames
-        input_mode = 'video'
-        frame_count = 0
-        print(f'Processing video: {args.input_video}')
-        print(f'Video properties: {width}x{height}, {fps} FPS, {total_frames} frames')
-        print(f'Output video: {args.output_video}')
-    else:
-        # Image folder mode
-        print(f'image dir = {args.image_dir}')
-        print(f'save dir = {args.save_dir}')
-        imglist = os.listdir(args.image_dir)
-        num_images = len(imglist)
-        input_mode = 'folder'
+    # Get video properties
+    fps = 30
+    # fps = int(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Set up video writer
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    
+    frame_count = 0
+    print(f'Processing video: {args.input_video}')
+    print(f'Video properties: {width}x{height}, {fps} FPS, {total_frames} frames')
+    video_data = []
 
-    print('Loaded Photo: {} images.'.format(num_images))
-
-    while (num_images >= 0):
+    while True:
         total_tic = time.time()
-        
-        if input_mode == 'folder':
-            num_images -= 1
-        elif input_mode == 'video':
-            frame_count += 1
+        frame_count += 1
 
-        # Get image from the appropriate source
-        if input_mode == 'webcam':
-            if not cap.isOpened():
-                raise RuntimeError("Webcam could not open. Please check connection.")
-            ret, frame = cap.read()
-            if not ret:
-                break
-            im_in = np.array(frame)
-        elif input_mode == 'video':
-            ret, frame = cap.read()
-            if not ret:
-                break
-            im_in = np.array(frame)
-        else:  # folder mode
-            im_file = os.path.join(args.image_dir, imglist[num_images])
-            im_in = cv2.imread(im_file)
+        # Get frame from video
+        ret, frame = cap.read()
+        if not ret:
+            break
+        im_in = np.array(frame)
         
         # bgr
         im = im_in
@@ -414,48 +363,51 @@ if __name__ == '__main__':
         if vis:
           # visualization
           im2show = vis_detections_filtered_objects_PIL(im2show, obj_dets, hand_dets, thresh_hand, thresh_obj)
+        # extract hand info
+        frame_data = {"left_hand": None, "right_hand": None, "objects": None}
+        if hand_dets is not None:
+          for i in range(len(hand_dets)):
+            bbox = list(int(np.round(x)) for x in hand_dets[i, :4])
+            score = float(hand_dets[i, 4])  # Convert numpy float32 to Python float
+            lr = hand_dets[i, -1] # 0 means left, 1 means right
+            state = hand_dets[i, 5]
+            state_map2 = {0:'N', 1:'S', 2:'O', 3:'P', 4:'F'}
+            state = state_map2[state]
+            # print(f'Hand {i+1}: BBox={bbox}, Score={score}, L/R={lr}, State={state_map2[state]}')
+            if lr == 0 and score > args.thresh_hand:
+              frame_data["left_hand"] = {"bbox": bbox, "score": score, "state": state}
+            elif lr == 1 and score > args.thresh_hand:
+              frame_data["right_hand"] = {"bbox": bbox, "score": score, "state": state}
+        # extract object info
+        if obj_dets is not None:
+          for i in range(len(obj_dets)):
+            bbox = list(int(np.round(x)) for x in obj_dets[i, :4])
+            score = float(obj_dets[i, 4])  # Convert numpy float32 to Python float
+            # print(f'Object {i+1}: BBox={bbox}, Score={score}')
+            if score > args.thresh_obj:
+              frame_data["objects"] = {"bbox": bbox, "score": score}
+        video_data.append(frame_data)
 
         misc_toc = time.time()
         nms_time = misc_toc - misc_tic
 
-        # Output handling based on input mode
-        if input_mode == 'folder':
-            sys.stdout.write('im_detect: {:d}/{:d} {:.3f}s {:.3f}s   \r' \
-                            .format(num_images + 1, len(imglist), detect_time, nms_time))
-            sys.stdout.flush()
-        elif input_mode == 'video':
-            sys.stdout.write('frame: {:d}/{:d} {:.3f}s {:.3f}s   \r' \
-                            .format(frame_count, total_frames, detect_time, nms_time))
-            sys.stdout.flush()
+        # Output progress
+        sys.stdout.write('frame: {:d}/{:d} {:.3f}s {:.3f}s   \r' \
+                        .format(frame_count, total_frames, detect_time, nms_time))
+        sys.stdout.flush()
 
         if vis:
-            if input_mode == 'folder':
-                folder_name = args.save_dir
-                os.makedirs(folder_name, exist_ok=True)
-                result_path = os.path.join(folder_name, imglist[num_images][:-4] + "_det.png")
-                im2show.save(result_path)
-            elif input_mode == 'video':
-                # Convert PIL image back to OpenCV format and write to video
-                im2show_cv = cv2.cvtColor(np.array(im2show), cv2.COLOR_RGB2BGR)
-                out.write(im2show_cv)
-            else:  # webcam
-                im2showRGB = cv2.cvtColor(np.array(im2show), cv2.COLOR_RGB2BGR)
-                cv2.imshow("frame", im2showRGB)
-                total_toc = time.time()
-                total_time = total_toc - total_tic
-                frame_rate = 1 / total_time
-                print('Frame rate:', frame_rate)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
+            # Convert PIL image back to OpenCV format and write to video
+            im2show_cv = cv2.cvtColor(np.array(im2show), cv2.COLOR_RGB2BGR)
+            out.write(im2show_cv)
         
-        # For video processing, check if we've processed all frames
-        if input_mode == 'video' and frame_count >= total_frames:
+        # Check if we've processed all frames
+        if frame_count >= total_frames:
             break
               
     # Cleanup
-    if input_mode == 'webcam' or input_mode == 'video':
-        cap.release()
-        if input_mode == 'video':
-            out.release()
-            print(f'\nVideo processing complete. Output saved to: {args.output_video}')
-        cv2.destroyAllWindows()
+    cap.release()
+    # save video_data to json
+    with open(f'{args.input_video.split(".")[0]}_video_data.json', 'w') as f:
+      json.dump(video_data, f)
+    print(f'\nVideo processing complete. Output saved to: {args.input_video.split(".")[0]}_video_data.json')

@@ -17,6 +17,7 @@ compare/
 
 images/
 images_det/
+videos/
 
 models/*
 predata_dandan/multitask/*.json
