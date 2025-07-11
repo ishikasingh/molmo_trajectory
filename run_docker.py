@@ -205,7 +205,7 @@ def main():
     parser.add_argument("--force-build", action=argparse.BooleanOptionalAction)
     parser.add_argument("--use-local-image", action=argparse.BooleanOptionalAction, help="Use the local image", default=False)
     parser.add_argument("--push-built-image", action=argparse.BooleanOptionalAction, help="Push the image to the Docker repo")
-    parser.add_argument("--image-tag", type=str, default="groot", help="Tag of the image to use")
+    parser.add_argument("--image-tag", type=str, default="affordance", help="Tag of the image to use")
     parser.add_argument("--shm-size", type=int, default=64, help="Size of the shared memory in GB")
     parser.add_argument("--cmd", type=str, default=None, help="Command of the container")
     parser.add_argument("--use-gpus", dest="use_gpus", action="store_true", default=None, help="Use GPUs")

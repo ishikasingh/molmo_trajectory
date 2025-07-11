@@ -28,6 +28,7 @@ import multiprocessing as mp
 import queue
 import threading
 from collections import defaultdict
+from tqdm import tqdm
 
 import torchvision.transforms as transforms
 import torchvision.datasets as dset
@@ -253,7 +254,7 @@ def gpu_worker(gpu_id, video_queue, result_queue, args):
           if video_path is None:  # Sentinel value to stop worker
             break
             
-          print(f"[GPU {gpu_id}] Processing: {os.path.basename(video_path)}")
+          # print(f"[GPU {gpu_id}] Processing: {os.path.basename(video_path)}")
           
           # Process the video
           start_time = time.time()
@@ -269,7 +270,7 @@ def gpu_worker(gpu_id, video_queue, result_queue, args):
             'processing_time': end_time - start_time
           })
           
-          print(f"[GPU {gpu_id}] Completed: {os.path.basename(video_path)} in {end_time - start_time:.2f}s")
+          # print(f"[GPU {gpu_id}] Completed: {os.path.basename(video_path)} in {end_time - start_time:.2f}s")
           
         except queue.Empty:
           continue
@@ -446,8 +447,8 @@ def process_single_video_gpu(video_path, fasterRCNN, args, im_data, im_info, num
         video_data.append(frame_data)
 
         # Progress output (less frequent to avoid spam)
-        if frame_count % 30 == 0 or frame_count >= total_frames:
-            print(f'[GPU {gpu_id}] {os.path.basename(video_path)}: frame {frame_count}/{total_frames}')
+        # if frame_count % 30 == 0 or frame_count >= total_frames:
+        #     print(f'[GPU {gpu_id}] {os.path.basename(video_path)}: frame {frame_count}/{total_frames}')
         
         # Check if we've processed all frames
         if frame_count >= total_frames:
@@ -465,11 +466,13 @@ def process_single_video_gpu(video_path, fasterRCNN, args, im_data, im_info, num
   output_json_path = f'{video_path.rsplit(".", 1)[0]}.json'
   with open(output_json_path, 'w') as f:
     json.dump(video_data, f)
-  print(f'[GPU {gpu_id}] Video processing complete. Output saved to: {output_json_path}')
+  # print(f'[GPU {gpu_id}] Video processing complete. Output saved to: {output_json_path}')
   return True
 
 if __name__ == '__main__':
-
+  # Set multiprocessing start method to 'spawn' for CUDA compatibility
+  mp.set_start_method('spawn', force=True)
+  
   args = parse_args()
 
   # Get all video files from the input folder
@@ -480,8 +483,8 @@ if __name__ == '__main__':
       sys.exit(1)
   
   print(f"Found {len(video_files)} video files to process:")
-  for video_file in video_files:
-      print(f"  - {os.path.basename(video_file)}")
+  # for video_file in video_files:
+  #     print(f"  - {os.path.basename(video_file)}")
 
   # Determine number of GPUs to use
   available_gpus = get_available_gpus()
@@ -531,7 +534,16 @@ if __name__ == '__main__':
   gpu_stats = defaultdict(lambda: {'count': 0, 'time': 0})
   
   print(f"\nStarting parallel processing with {num_gpus} GPUs...")
-  print("="*80)
+  
+  # Create progress bar
+  progress_bar = tqdm(
+    total=len(video_files),
+    desc="Processing videos",
+    unit="video",
+    ncols=100,
+    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] Success: {postfix[0]} Failed: {postfix[1]}',
+    postfix=[0, 0]
+  )
   
   # Collect results
   while completed_videos < len(video_files):
@@ -546,15 +558,23 @@ if __name__ == '__main__':
         successful_videos += 1
         gpu_stats[gpu_id]['count'] += 1
         gpu_stats[gpu_id]['time'] += result['processing_time']
-        print(f"[{completed_videos}/{len(video_files)}] ✓ {video_name} (GPU {gpu_id}, {result['processing_time']:.1f}s)")
+        progress_bar.set_description(f"✓ {video_name[:20]:<20}")
       else:
         failed_videos += 1
         error_msg = result.get('error', 'Unknown error')
-        print(f"[{completed_videos}/{len(video_files)}] ✗ {video_name} (GPU {gpu_id}) - {error_msg}")
+        progress_bar.set_description(f"✗ {video_name[:20]:<20}")
+        
+      # Update progress bar
+      progress_bar.postfix[0] = successful_videos
+      progress_bar.postfix[1] = failed_videos
+      progress_bar.update(1)
         
     except queue.Empty:
-      print("Waiting for results...")
+      progress_bar.set_description("Waiting for results...")
       continue
+  
+  # Close progress bar
+  progress_bar.close()
   
   # Wait for all processes to complete
   for p in processes:
