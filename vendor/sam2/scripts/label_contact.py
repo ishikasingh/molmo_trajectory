@@ -9,6 +9,8 @@ import torch
 import matplotlib.pyplot as plt
 from sam2.hand_contact.utils import filter_contact_frames, get_contact_statistics
 from PIL import Image
+import json
+import h5py
 
 # Add these constants at the top of the file after imports
 LEFT_HAND_ID = 0
@@ -21,36 +23,15 @@ OBJECT_IDS = {LEFT_OBJECT_ID, RIGHT_OBJECT_ID}
 
 # Contact detection threshold (minimum overlap area to consider contact)
 CONTACT_THRESHOLD = 0  # pixels
+DEFAULT_INTRINSIC = np.array([
+    [736.6339, 0., 960.], 
+    [0., 736.6339, 540.], 
+    [0., 0., 1.]
+])
 
-def detect_hand_object_contact(hand_masks, object_masks):
-    """
-    Detect contact between hand and object masks by calculating intersection areas.
-    
-    Args:
-        hand_masks (dict): Dictionary of hand_id -> mask
-        object_masks (dict): Dictionary of object_id -> mask
-    
-    Returns:
-        dict: Contact information with intersection areas
-    """
-    contact_info = {}
-    
-    for hand_id, hand_mask in hand_masks.items():
-        for object_id, object_mask in object_masks.items():
-            # Calculate intersection
-            intersection = np.logical_and(hand_mask.squeeze(), object_mask.squeeze())
-            intersection_area = np.sum(intersection)
-            
-            if intersection_area > CONTACT_THRESHOLD:
-                contact_key = f"hand_{hand_id}_object_{object_id}"
-                contact_info[contact_key] = {
-                    'intersection_area': intersection_area,
-                    'intersection_mask': intersection,
-                    'hand_id': hand_id,
-                    'object_id': object_id
-                }
-    
-    return contact_info
+JOINT_NAMES_OF_INTEREST = ['leftHand', 'leftThumbTip', 'leftIndexFingerTip', 'leftMiddleFingerTip', 'leftRingFingerTip', 'leftLittleFingerTip',
+                           'rightHand', 'rightThumbTip', 'rightIndexFingerTip', 'rightMiddleFingerTip', 'rightRingFingerTip', 'rightLittleFingerTip',
+                           'camera']
 
 def detect_hand_object_contact_dilation(hand_masks, object_masks, dilation_pixels=1):
     """
@@ -195,69 +176,162 @@ def show_box(box, ax):
     w, h = box[2] - box[0], box[3] - box[1]
     ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0, 0, 0, 0), lw=2))
 
-
-def create_tracking_video(video_segments, frame_names, video_dir, output_path, fps=30):
+def filter_contact_temporal(contact_log, min_contact_duration=3, max_gap_to_fill=2):
     """
-    Create a video showing the tracking results with masks overlaid on original frames.
+    Apply temporal filtering to contact sequences to remove noise and fill gaps.
+    
+    Args:
+        contact_log (list): List of contact data for each frame
+        min_contact_duration (int): Minimum frames for a contact to be considered valid
+        max_gap_to_fill (int): Maximum gap size (in frames) to fill within contact sequences
+    
+    Returns:
+        list: Filtered contact log with the same structure
+    """
+    if not contact_log:
+        return contact_log
+    
+    # Extract binary sequences for each hand
+    left_contacts = [frame['left_hand_contact'] for frame in contact_log]
+    right_contacts = [frame['right_hand_contact'] for frame in contact_log]
+    
+    # Apply temporal filtering to each hand's contact sequence
+    filtered_left = _filter_binary_sequence(left_contacts, min_contact_duration, max_gap_to_fill)
+    filtered_right = _filter_binary_sequence(right_contacts, min_contact_duration, max_gap_to_fill)
+    
+    # Reconstruct the contact log with filtered results
+    filtered_contact_log = []
+    for i, frame_data in enumerate(contact_log):
+        filtered_frame = frame_data.copy()
+        filtered_frame['left_hand_contact'] = filtered_left[i]
+        filtered_frame['right_hand_contact'] = filtered_right[i]
+        filtered_contact_log.append(filtered_frame)
+    
+    return filtered_contact_log
+
+def _filter_binary_sequence(binary_seq, min_duration, max_gap):
+    """
+    Filter a binary sequence to remove short bursts and fill short gaps.
+    
+    Args:
+        binary_seq (list): List of boolean values
+        min_duration (int): Minimum duration for a True sequence to be kept
+        max_gap (int): Maximum gap size to fill within True sequences
+    
+    Returns:
+        list: Filtered binary sequence
+    """
+    if not binary_seq:
+        return binary_seq
+    
+    # Convert to numpy array for easier processing
+    seq = np.array(binary_seq, dtype=bool)
+    filtered = seq.copy()
+    
+    # Step 1: Remove short contact bursts (erosion-like operation)
+    # Find all True segments and remove those shorter than min_duration
+    diff = np.diff(np.concatenate(([False], seq, [False])).astype(int))
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    
+    for start, end in zip(starts, ends):
+        if end - start < min_duration:
+            filtered[start:end] = False
+    
+    # Step 2: Fill short gaps (dilation-like operation)
+    # Find all False segments within True regions and fill short ones
+    seq = filtered  # Use the result from step 1
+    diff = np.diff(np.concatenate(([False], seq, [False])).astype(int))
+    gap_starts = np.where(diff == -1)[0]
+    gap_ends = np.where(diff == 1)[0]
+    
+    for gap_start, gap_end in zip(gap_starts, gap_ends):
+        gap_length = gap_end - gap_start
+        if gap_length <= max_gap:
+            # Check if this gap is surrounded by True values
+            has_contact_before = gap_start > 0 and seq[gap_start - 1]
+            has_contact_after = gap_end < len(seq) and seq[gap_end]
+            
+            if has_contact_before and has_contact_after:
+                filtered[gap_start:gap_end] = True
+    
+    return filtered.tolist()
+
+def detect_transitions(contact_log):
+    """
+    Detect transitions in contact states for each frame.
+    
+    Args:
+        contact_log (list): List of contact data for each frame
+    
+    Returns:
+        dict: Dictionary with transition lists for left and right hands
+    """
+    left_hand_transitions = []
+    right_hand_transitions = []
+    
+    for i in range(len(contact_log)):
+        if i == 0:
+            # First frame has no transition
+            left_hand_transitions.append("no_change")
+            right_hand_transitions.append("no_change")
+        else:
+            prev_left = contact_log[i-1]['left_hand_contact']
+            curr_left = contact_log[i]['left_hand_contact']
+            prev_right = contact_log[i-1]['right_hand_contact']
+            curr_right = contact_log[i]['right_hand_contact']
+            
+            # Left hand
+            if prev_left == False and curr_left == True:
+                left_hand_transitions.append("0_to_1")
+            elif prev_left == True and curr_left == False:
+                left_hand_transitions.append("1_to_0")
+            else:
+                left_hand_transitions.append("no_change")
+            
+            # Right hand
+            if prev_right == False and curr_right == True:
+                right_hand_transitions.append("0_to_1")
+            elif prev_right == True and curr_right == False:
+                right_hand_transitions.append("1_to_0")
+            else:
+                right_hand_transitions.append("no_change")
+    
+    return {
+        'left_hand_transitions': left_hand_transitions,
+        'right_hand_transitions': right_hand_transitions
+    }
+
+def analyze_hand_object_contact(video_segments, frame_names, output_contact_path=None, apply_temporal_filtering=True):
+    """
+    Analyze hand-object contact throughout video segments - simplified version.
     
     Args:
         video_segments (dict): Segmentation results for each frame
         frame_names (list): List of frame filenames
-        video_dir (str): Directory containing the frames
-        output_path (str): Path to save the output video
-        fps (int): Frames per second for the output video
+        output_contact_path (str, optional): Path to save contact analysis results
+        apply_temporal_filtering (bool): Whether to apply temporal filtering to reduce noise
+    
+    Returns:
+        list: Simple contact log with binary flags for each frame
     """
     if not video_segments:
-        print("No segmentation results to create video")
-        return
+        print("No segmentation results to analyze")
+        return []
     
-    # Read the first frame to get dimensions
-    first_frame = cv2.imread(os.path.join(video_dir, frame_names[0]))
-    height, width = first_frame.shape[:2]
-    
-    # Define the codec and create VideoWriter object
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    
-    print(f"Creating tracking video with {len(frame_names)} frames...")
+    print(f"Analyzing hand-object contact across {len(frame_names)} frames...")
     
     contact_log = []
+    left_hand_contact_count = 0
+    right_hand_contact_count = 0
 
     for frame_idx in range(len(frame_names)):
-        # Read the original frame
-        frame_path = os.path.join(video_dir, frame_names[frame_idx])
-        frame = cv2.imread(frame_path)
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Create overlay with masks
-        overlay = frame_rgb.copy()
+        # Initialize contact flags for this frame
+        left_hand_contact = False
+        right_hand_contact = False
         
         if frame_idx in video_segments:
             frame_segments = video_segments[frame_idx]
-            
-            # Apply mask overlays
-            for obj_id, mask in frame_segments.items():
-                # Convert boolean mask to float and ensure it's 2D
-                mask_float = mask.squeeze().astype(np.float32)
-                
-                # Create 3D mask
-                mask_3d = np.stack([mask_float, mask_float, mask_float], axis=-1)
-                
-                # Generate a color for this object (using the same logic as show_mask)
-                cmap = plt.get_cmap("tab10")
-                color = np.array([*cmap(obj_id)[:3]]) # Keep color in [0,1] range
-                
-                # Apply colored mask with transparency
-                alpha = 0.6
-                # Ensure frame_rgb is float for calculations
-                frame_float = frame_rgb.astype(np.float32)
-                colored_mask = mask_3d * color.reshape(1, 1, 3) * 255.0
-                
-                # Proper alpha blending
-                overlay = overlay.astype(np.float32)
-                overlay = np.where(mask_3d > 0, 
-                                 frame_float * (1 - alpha) + colored_mask * alpha, 
-                                 overlay)
             
             # Check for hand-object contact
             present_hand_ids = HAND_IDS.intersection(frame_segments.keys())
@@ -272,90 +346,70 @@ def create_tracking_video(video_segments, frame_names, video_dir, output_path, f
                 contact_info = detect_hand_object_contact_dilation(hand_masks, object_masks)
                 
                 if contact_info:
-                    # Log contact for this frame
-                    contact_log.append({
-                        'frame_idx': frame_idx,
-                        'contacts': contact_info
-                    })
-                    
-                    # Instead of highlighting with overlay, add text labels
+                    # Check which hands are in contact
                     for contact_key, contact_data in contact_info.items():
-                        intersection_mask = contact_data['intersection_mask']
-                        
-                        # Find the center of the contact area
-                        contact_coords = np.where(intersection_mask)
-                        if len(contact_coords[0]) > 0:
-                            center_y = int(np.mean(contact_coords[0]))
-                            center_x = int(np.mean(contact_coords[1]))
-                            
-                            # Create contact text
-                            hand_id = contact_data['hand_id']
-                            object_id = contact_data['object_id']
-                            area = contact_data['intersection_area']
-                            
-                            # Determine hand type for better readability
-                            hand_type = "L" if hand_id == LEFT_HAND_ID else "R"
-                            contact_text = f"CONTACT: {hand_type}H-OBJ ({area}px)"
-                            
-                            # Convert overlay to BGR for OpenCV text rendering
-                            overlay_bgr = cv2.cvtColor(overlay.astype(np.uint8), cv2.COLOR_RGB2BGR)
-                            
-                            # Add text with background rectangle for better visibility
-                            font = cv2.FONT_HERSHEY_SIMPLEX
-                            font_scale = 0.6
-                            font_thickness = 2
-                            text_color = (0, 0, 255)  # Red text
-                            bg_color = (255, 255, 255)  # White background
-                            
-                            # Get text size to create background rectangle
-                            (text_width, text_height), baseline = cv2.getTextSize(
-                                contact_text, font, font_scale, font_thickness
-                            )
-                            
-                            # Position text near contact but avoid going off-screen
-                            text_x = max(10, min(center_x - text_width//2, width - text_width - 10))
-                            text_y = max(text_height + 10, min(center_y - 20, height - 10))
-                            
-                            # Draw background rectangle
-                            cv2.rectangle(overlay_bgr, 
-                                        (text_x - 5, text_y - text_height - 5),
-                                        (text_x + text_width + 5, text_y + baseline + 5),
-                                        bg_color, -1)
-                            
-                            # Draw border around rectangle
-                            cv2.rectangle(overlay_bgr, 
-                                        (text_x - 5, text_y - text_height - 5),
-                                        (text_x + text_width + 5, text_y + baseline + 5),
-                                        (0, 0, 0), 1)
-                            
-                            # Draw text
-                            cv2.putText(overlay_bgr, contact_text, (text_x, text_y),
-                                      font, font_scale, text_color, font_thickness)
-                            
-                            # Convert back to RGB
-                            overlay = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
-                        
-                        # print(f"Frame {frame_idx}: {contact_key} - Contact area: {contact_data['intersection_area']} pixels")
+                        hand_id = contact_data['hand_id']
+                        if hand_id == LEFT_HAND_ID:
+                            left_hand_contact = True
+                        elif hand_id == RIGHT_HAND_ID:
+                            right_hand_contact = True
         
-        # Convert back to BGR for OpenCV and ensure uint8
-        overlay_bgr = cv2.cvtColor(overlay.astype(np.uint8), cv2.COLOR_RGB2BGR)
-        out.write(overlay_bgr)
+        # Store simple contact info for this frame
+        contact_log.append({
+            'frame_idx': frame_idx,
+            'left_hand_contact': left_hand_contact,
+            'right_hand_contact': right_hand_contact
+        })
     
-    # Release everything
-    out.release()
-    print(f"Tracking video saved to {output_path}")
-
+    # Apply temporal filtering if requested
+    if apply_temporal_filtering:
+        print("Applying temporal filtering to reduce noise...")
+        original_contact_log = contact_log.copy()
+        contact_log = filter_contact_temporal(contact_log)
+        
+        # Compare before and after filtering
+        original_left_count = sum(1 for frame in original_contact_log if frame['left_hand_contact'])
+        original_right_count = sum(1 for frame in original_contact_log if frame['right_hand_contact'])
+        
+        print(f"Before filtering - Left: {original_left_count}, Right: {original_right_count}")
+    
+    # Count contacts for summary (after filtering)
+    left_hand_contact_count = sum(1 for frame in contact_log if frame['left_hand_contact'])
+    right_hand_contact_count = sum(1 for frame in contact_log if frame['right_hand_contact'])
+    
+    # Print summary statistics
+    print(f"\n=== Contact Analysis Summary ===")
+    print(f"Total frames processed: {len(frame_names)}")
+    print(f"Frames with left hand contact: {left_hand_contact_count}")
+    print(f"Frames with right hand contact: {right_hand_contact_count}")
+    print(f"Left hand contact rate: {left_hand_contact_count/len(frame_names)*100:.1f}%")
+    print(f"Right hand contact rate: {right_hand_contact_count/len(frame_names)*100:.1f}%")
+    
+    # Save contact information if output path is provided
+    if output_contact_path:
+        contact_summary = {
+            'total_frames': len(frame_names),
+            'left_hand_contact_frames': left_hand_contact_count,
+            'right_hand_contact_frames': right_hand_contact_count,
+            'left_hand_contact_rate': left_hand_contact_count/len(frame_names),
+            'right_hand_contact_rate': right_hand_contact_count/len(frame_names),
+            'frame_contacts': contact_log,
+            'temporal_filtering_applied': apply_temporal_filtering
+        }
+        
+        with open(output_contact_path, 'w') as f:
+            json.dump(contact_summary, f, indent=2, default=str)
+        print(f"Contact analysis saved to: {output_contact_path}")
+    
+    return contact_log
 
 # Specify your video file path here
-video_file_path = "/home/ANT.AMAZON.COM/fanyangr/code/hand_object_detector/videos/0.mp4"  # Change this to your video file path
-detection_result_path = "/home/ANT.AMAZON.COM/fanyangr/code/hand_object_detector/videos/0_video_data.json"
+video_file_path = "/home/ANT.AMAZON.COM/fanyangr/Downloads/small_test/basic_pick_place/0.mp4"  # Change this to your video file path
+detection_result_path = "/home/ANT.AMAZON.COM/fanyangr/Downloads/small_test/basic_pick_place/0.json"
+hdf5_path = "/home/ANT.AMAZON.COM/fanyangr/Downloads/small_test/basic_pick_place/0.hdf5"
 
-# Get original video FPS
-original_fps = 30
-print(f"Original video FPS: {original_fps}")
-
-# Create output path for tracking video
-output_video_path = video_file_path.replace('.mp4', '_tracking.mp4')
+# Create output path for contact analysis
+output_contact_path = video_file_path.replace('.mp4', '_contact_analysis.json')
 
 # Create a temporary directory for extracted frames
 temp_dir = tempfile.mkdtemp(prefix="sam2_frames_")
@@ -378,8 +432,9 @@ try:
     # plt.imshow(Image.open(os.path.join(video_dir, frame_names[frame_idx])))
 
     inference_state = predictor.init_state(video_path=video_dir)
+    # inference_state.reset_state()
 
-    # predictor.reset_state(inference_state)
+    predictor.reset_state(inference_state)
 
 
     contact_statistics = get_contact_statistics(detection_result_path)
@@ -427,26 +482,6 @@ try:
         if left_hand_frame_idx is not None and right_hand_frame_idx is not None:
             break
 
-    # ann_frame_idx = 0  # the frame index we interact with
-    # left_hand_id = 0  # give a unique id to each object we interact with (it can be any integers)
-
-    # # Let's add a box at (x_min, y_min, x_max, y_max) = (300, 0, 500, 400) to get started
-    # box = np.array([300, 0, 500, 400], dtype=np.float32)
-    # _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
-    #     inference_state=inference_state,
-    #     frame_idx=ann_frame_idx,
-    #     obj_id=left_hand_id,
-    #     box=box,
-    # )
-
-    # show the results on the current (interacted) frame
-    # plt.figure(figsize=(9, 6))
-    # plt.title(f"frame {right_hand_frame_idx}")
-    # plt.imshow(Image.open(os.path.join(video_dir, frame_names[right_hand_frame_idx])))
-    # show_box(right_hand_bbox, plt.gca())
-    # show_mask((out_mask_logits[0] > 0.0).cpu().numpy(), plt.gca(), obj_id=out_obj_ids[0])
-
-
     # run propagation throughout the video and collect the results in a dict
     video_segments = {}  # video_segments contains the per-frame segmentation results
     for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state, reverse=True):
@@ -460,19 +495,49 @@ try:
             for i, out_obj_id in enumerate(out_obj_ids)
         }
 
-    # Generate tracking video
-    create_tracking_video(video_segments, frame_names, video_dir, output_video_path, fps=original_fps)
+    # Analyze hand-object contact without creating video
+    contact_log = analyze_hand_object_contact(video_segments, frame_names, output_contact_path, apply_temporal_filtering=True)
 
-    # render the segmentation results every few frames
-    vis_frame_stride = 30
-    plt.close("all")
-    # for out_frame_idx in range(0, len(frame_names), vis_frame_stride):
-    #     plt.figure(figsize=(6, 4))
-    #     plt.title(f"frame {out_frame_idx}")
-    #     plt.imshow(Image.open(os.path.join(video_dir, frame_names[out_frame_idx])))
-    #     for out_obj_id, out_mask in video_segments[out_frame_idx].items():
-    #         show_mask(out_mask, plt.gca(), obj_id=out_obj_id)
-    # plt.show()
+    # Detect transitions
+    transitions = detect_transitions(contact_log)
+    
+    # Save transitions
+    transitions_output_path = video_file_path.replace('.mp4', '_transitions.json')
+    with open(transitions_output_path, 'w') as f:
+        json.dump(transitions, f, indent=2)
+    
+    print(f"Transitions saved to: {transitions_output_path}")
+
+    if hdf5_path is not None:
+        with h5py.File(hdf5_path, 'r') as f:
+            keypoints_traj = f['transforms']
+            camera_traj = keypoints_traj['camera'] # [T, 4, 4]
+            print(f.keys())
+        
+
+    # Print simple contact information
+    print(f"\n=== Simple Contact Information ===")
+    # simple_contact_info = []
+    
+    # for frame_data in contact_log:
+    #     frame_idx = frame_data['frame_idx']
+    #     left_contact = frame_data['left_hand_contact']
+    #     right_contact = frame_data['right_hand_contact']
+        
+    #     if left_contact or right_contact:
+    #         contact_status = []
+            
+    #         simple_contact_info.append({
+    #             'frame_idx': frame_idx,
+    #             'left_hand_contact': left_contact,
+    #             'right_hand_contact': right_contact
+    #         })
+    
+    # Save to JSON file
+    # simple_contact_output_path = video_file_path.replace('.mp4', '_simple_contact_info.json')
+    # with open(simple_contact_output_path, 'w') as f:
+    #     json.dump(simple_contact_info, f, indent=2)
+    
 
 finally:
     # Clean up: remove the temporary directory and all its contents
