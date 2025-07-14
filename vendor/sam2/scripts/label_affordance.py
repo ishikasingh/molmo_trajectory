@@ -11,6 +11,9 @@ from sam2.hand_contact.utils import filter_contact_frames, get_contact_statistic
 from PIL import Image
 import json
 import h5py
+import multiprocessing as mp
+from multiprocessing import Pool
+import time
 
 # Add these constants at the top of the file after imports
 LEFT_HAND_ID = 0
@@ -32,6 +35,9 @@ DEFAULT_INTRINSIC = np.array([
 JOINT_NAMES_OF_INTEREST = ['leftHand', 'leftThumbTip', 'leftIndexFingerTip', 'leftMiddleFingerTip', 'leftRingFingerTip', 'leftLittleFingerTip',
                            'rightHand', 'rightThumbTip', 'rightIndexFingerTip', 'rightMiddleFingerTip', 'rightRingFingerTip', 'rightLittleFingerTip',
                            'camera']
+
+# Configuration options
+SAVE_KEYPOINT_VIDEO = False  # Set to False to skip video generation and only save keypoint data
 
 def detect_hand_object_contact_dilation(hand_masks, object_masks, dilation_pixels=1):
     """
@@ -77,34 +83,34 @@ def detect_hand_object_contact_dilation(hand_masks, object_masks, dilation_pixel
 
 
 # select the device for computation
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
-print(f"using device: {device}")
+# if torch.cuda.is_available():
+#     device = torch.device("cuda")
+# elif torch.backends.mps.is_available():
+#     device = torch.device("mps")
+# else:
+#     device = torch.device("cpu")
+# print(f"using device: {device}")
 
-if device.type == "cuda":
-    # use bfloat16 for the entire notebook
-    torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
-    # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-    if torch.cuda.get_device_properties(0).major >= 8:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-elif device.type == "mps":
-    print(
-        "\nSupport for MPS devices is preliminary. SAM 2 is trained with CUDA and might "
-        "give numerically different outputs and sometimes degraded performance on MPS. "
-        "See e.g. https://github.com/pytorch/pytorch/issues/84936 for a discussion."
-    )
+# if device.type == "cuda":
+#     # use bfloat16 for the entire notebook
+#     torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+#     # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+#     if torch.cuda.get_device_properties(0).major >= 8:
+#         torch.backends.cuda.matmul.allow_tf32 = True
+#         torch.backends.cudnn.allow_tf32 = True
+# elif device.type == "mps":
+#     print(
+#         "\nSupport for MPS devices is preliminary. SAM 2 is trained with CUDA and might "
+#         "give numerically different outputs and sometimes degraded performance on MPS. "
+#         "See e.g. https://github.com/pytorch/pytorch/issues/84936 for a discussion."
+#     )
 
 from sam2.build_sam import build_sam2_video_predictor
 
 sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
 model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
-predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device)
+# predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device)
 
 def extract_frames_from_video(video_path, output_dir):
     """
@@ -176,7 +182,7 @@ def show_box(box, ax):
     w, h = box[2] - box[0], box[3] - box[1]
     ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0, 0, 0, 0), lw=2))
 
-def filter_contact_temporal(contact_log, min_contact_duration=3, max_gap_to_fill=2):
+def filter_contact_temporal(contact_log, min_contact_duration=5, max_gap_to_fill=10):
     """
     Apply temporal filtering to contact sequences to remove noise and fill gaps.
     
@@ -592,9 +598,9 @@ def render_keypoints_on_image(image_path, keypoints_2d, keypoints_info, output_p
     # Save image
     cv2.imwrite(output_path, image)
 
-def generate_keypoint_projection_video(video_dir, frame_names, keypoint_data, transitions, output_video_path, intrinsic_matrix=DEFAULT_INTRINSIC):
+def generate_keypoint_projection_video(video_dir, frame_names, keypoint_data, transitions, output_video_path, intrinsic_matrix=DEFAULT_INTRINSIC, save_video=True):
     """
-    Generate video with projected keypoints for frames with future transitions.
+    Generate video with projected keypoints for frames with future transitions and save keypoints to JSON.
     
     Args:
         video_dir (str): Directory containing video frames
@@ -603,6 +609,7 @@ def generate_keypoint_projection_video(video_dir, frame_names, keypoint_data, tr
         transitions (dict): Transition information
         output_video_path (str): Path to save output video
         intrinsic_matrix (np.ndarray): Camera intrinsic matrix
+        save_video (bool): Whether to save the video or just the keypoint data
     """
     camera_poses = keypoint_data['camera_poses']
     joint_trajectories = keypoint_data['joint_trajectories']
@@ -613,59 +620,137 @@ def generate_keypoint_projection_video(video_dir, frame_names, keypoint_data, tr
     
     rendered_frames = []
     
+    # Initialize data structure for saving keypoints to JSON
+    transition_keypoints_data = {
+        'total_frames': len(frame_names),
+        'frame_keypoints': []
+    }
+    
+    # Get the final frame index for fallback
+    final_frame_idx = len(frame_names) - 1
+    
     try:
         print(f"Generating keypoint projection video for {len(frame_names)} frames...")
         
         for frame_idx in range(len(frame_names)):
+            # Initialize frame data for JSON
+            frame_data = {
+                'frame_idx': frame_idx,
+                'frame_name': frame_names[frame_idx],
+                'has_future_transitions': False,
+                'future_transitions': None,
+                'keypoints_2d': None,
+                'keypoints_3d_camera': None,
+                'keypoints_3d_world': None
+            }
+            
             # Find closest future transitions for this frame
             future_transitions = find_closest_future_transitions(transitions, frame_idx, len(frame_names))
             
-            # Process all frames, but frames without future transitions will have no keypoint annotations
-            if future_transitions['left_hand'] or future_transitions['right_hand']:
-                print(f"Processing frame {frame_idx}: Left={future_transitions['left_hand']}, Right={future_transitions['right_hand']}")
+            # Check if this frame has future transitions
+            has_future_transitions = future_transitions['left_hand'] or future_transitions['right_hand']
+            
+            if has_future_transitions:
+                frame_data['has_future_transitions'] = True
+                frame_data['future_transitions'] = future_transitions
+                # print(f"Processing frame {frame_idx}: Left={future_transitions['left_hand']}, Right={future_transitions['right_hand']}")
             
             # Get current camera pose
             if frame_idx >= len(camera_poses):
                 print(f"Warning: Frame {frame_idx} exceeds camera pose data length")
+                transition_keypoints_data['frame_keypoints'].append(frame_data)
                 continue
             
             current_camera_pose = camera_poses[frame_idx]
             
-            # Project keypoints from future transition frames
+            # Project keypoints from future transition frames OR final frame
             keypoints_2d = {}
+            keypoints_3d_camera = {}
+            keypoints_3d_world = {}
             
-            # Process each hand independently
-            for hand in ['left_hand', 'right_hand']:
-                if future_transitions[hand]:
-                    transition_frame_idx = future_transitions[hand]['frame_idx']
-                    
-                    # Get keypoints for relevant joints at the transition frame
-                    for joint_name in JOINT_NAMES_OF_INTEREST:
-                        if joint_name in joint_trajectories:
-                            # Check if this joint belongs to the current hand
-                            joint_hand = get_hand_keypoints(joint_name)
-                            if (hand == 'left_hand' and joint_hand == 'left') or \
-                               (hand == 'right_hand' and joint_hand == 'right') or \
-                               (joint_name == 'camera'):  # Always include camera
+            # Determine which hands to process
+            hands_to_process = []
+            hands_to_process.append(('left_hand', future_transitions['left_hand']['frame_idx'] if future_transitions['left_hand'] else final_frame_idx))
+            hands_to_process.append(('right_hand', future_transitions['right_hand']['frame_idx'] if future_transitions['right_hand'] else final_frame_idx))
+            
+            # Process each hand
+            for hand, source_frame_idx in hands_to_process:
+                # Get keypoints for relevant joints at the source frame
+                for joint_name in JOINT_NAMES_OF_INTEREST:
+                    if joint_name in joint_trajectories:
+                        # Check if this joint belongs to the current hand
+                        joint_hand = get_hand_keypoints(joint_name)
+                        if (hand == 'left_hand' and joint_hand == 'left') or \
+                           (hand == 'right_hand' and joint_hand == 'right') or \
+                           (joint_name == 'camera'):  # Always include camera
+                            
+                            if source_frame_idx < len(joint_trajectories[joint_name]):
+                                # Get 3D position at source frame (world coordinates)
+                                joint_transform = joint_trajectories[joint_name][source_frame_idx]
+                                joint_3d_world = joint_transform[:3, 3].reshape(1, 3)  # Extract position
                                 
-                                if transition_frame_idx < len(joint_trajectories[joint_name]):
-                                    # Get 3D position at transition frame
-                                    joint_transform = joint_trajectories[joint_name][transition_frame_idx]
-                                    joint_3d = joint_transform[:3, 3].reshape(1, 3)  # Extract position
-                                    
-                                    # Project to 2D using current camera pose
-                                    joint_2d = project_3d_to_2d(joint_3d, current_camera_pose, intrinsic_matrix)
-                                    keypoints_2d[joint_name] = joint_2d[0]
+                                # Transform to camera coordinates
+                                world_to_camera = np.linalg.inv(current_camera_pose)
+                                joint_3d_world_homo = np.concatenate([joint_3d_world, np.ones((1, 1))], axis=1)
+                                joint_3d_camera_homo = (world_to_camera @ joint_3d_world_homo.T).T
+                                joint_3d_camera = joint_3d_camera_homo[:, :3]  # Remove homogeneous coordinate
+                                
+                                # Project to 2D using current camera pose
+                                joint_2d = project_3d_to_2d(joint_3d_world, current_camera_pose, intrinsic_matrix)
+                                
+                                # Store all three coordinate systems
+                                keypoints_2d[joint_name] = joint_2d[0]
+                                keypoints_3d_camera[joint_name] = joint_3d_camera[0]
+                                keypoints_3d_world[joint_name] = joint_3d_world[0]
             
-            # Render keypoints on image (will render without annotations if keypoints_2d is empty)
+            # Save keypoints data for JSON (convert numpy arrays to lists)
+            if keypoints_2d:
+                frame_data['keypoints_2d'] = {k: v.tolist() if hasattr(v, 'tolist') else v for k, v in keypoints_2d.items()}
+                frame_data['keypoints_3d_camera'] = {k: v.tolist() if hasattr(v, 'tolist') else v for k, v in keypoints_3d_camera.items()}
+                frame_data['keypoints_3d_world'] = {k: v.tolist() if hasattr(v, 'tolist') else v for k, v in keypoints_3d_world.items()}
+            
+            # Add frame data to the collection
+            transition_keypoints_data['frame_keypoints'].append(frame_data)
+            
+            # Render keypoints on image
             input_image_path = os.path.join(video_dir, frame_names[frame_idx])
             output_image_path = os.path.join(temp_render_dir, f"frame_{frame_idx:06d}.jpg")
             
-            render_keypoints_on_image(input_image_path, keypoints_2d, future_transitions, output_image_path)
+            # Create render info based on which hands have keypoint data available
+            render_keypoints_info = {
+                'left_hand': any(get_hand_keypoints(joint_name) == 'left' for joint_name in keypoints_2d.keys()),
+                'right_hand': any(get_hand_keypoints(joint_name) == 'right' for joint_name in keypoints_2d.keys())
+            }
+            
+            # If there are future transitions, use that information for better context
+            if has_future_transitions:
+                if future_transitions['left_hand']:
+                    render_keypoints_info['left_hand'] = future_transitions['left_hand']
+                if future_transitions['right_hand']:
+                    render_keypoints_info['right_hand'] = future_transitions['right_hand']            # For rendering, only show keypoints if there are actual future transitions
+            
+            
+            # render_keypoints_info = future_transitions if has_future_transitions else {'left_hand': None, 'right_hand': None}
+            render_keypoints_on_image(input_image_path, keypoints_2d, render_keypoints_info, output_image_path)
             rendered_frames.append(output_image_path)
         
+        # Save keypoints data to JSON file
+        json_output_path = output_video_path.replace('.mp4', '_keypoints.json')
+        with open(json_output_path, 'w') as f:
+            json.dump(transition_keypoints_data, f, indent=2, default=str)
+        
+        print(f"Transition keypoints saved to: {json_output_path}")
+        
+        # Print summary statistics
+        frames_with_transitions = sum(1 for frame in transition_keypoints_data['frame_keypoints'] 
+                                    if frame['has_future_transitions'])
+        frames_with_keypoints = sum(1 for frame in transition_keypoints_data['frame_keypoints'] 
+                                  if frame['keypoints_2d'] is not None)
+        print(f"Frames with future transitions: {frames_with_transitions}/{len(frame_names)}")
+        print(f"Frames with keypoint data: {frames_with_keypoints}/{len(frame_names)}")
+        
         # Create video from rendered frames
-        if rendered_frames:
+        if save_video and rendered_frames:
             print(f"Creating video from {len(rendered_frames)} rendered frames...")
             
             # Get frame dimensions from first frame
@@ -684,7 +769,7 @@ def generate_keypoint_projection_video(video_dir, frame_names, keypoint_data, tr
             
             video_writer.release()
             print(f"Keypoint projection video saved to: {output_video_path}")
-        else:
+        elif save_video and not rendered_frames:
             print("No frames found - no video generated")
     
     finally:
@@ -692,154 +777,374 @@ def generate_keypoint_projection_video(video_dir, frame_names, keypoint_data, tr
         print(f"Cleaning up temporary render directory: {temp_render_dir}")
         shutil.rmtree(temp_render_dir)
 
-# Specify your video file path here
-video_file_path = "/home/ANT.AMAZON.COM/fanyangr/Downloads/small_test/basic_pick_place/2.mp4"  # Change this to your video file path
-detection_result_path = "/home/ANT.AMAZON.COM/fanyangr/Downloads/small_test/basic_pick_place/2.json"
-hdf5_path = "/home/ANT.AMAZON.COM/fanyangr/Downloads/small_test/basic_pick_place/2.hdf5"
-
-# Create output path for contact analysis
-output_contact_path = video_file_path.replace('.mp4', '_contact_analysis.json')
-
-# Create a temporary directory for extracted frames
-temp_dir = tempfile.mkdtemp(prefix="sam2_frames_")
-print(f"Creating temporary directory: {temp_dir}")
-
-try:
-    # Extract frames from video
-    frame_names = extract_frames_from_video(video_file_path, temp_dir)
+def find_video_files(folder_path):
+    """
+    Find all video files and their corresponding .json and .hdf5 files in a folder.
     
-    # Set video_dir to our temporary directory
-    video_dir = temp_dir
-
-    # Sort frame names (they should already be in order, but just to be safe)
-    frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
-
-    # take a look the first video frame
-    frame_idx = 0
-    # plt.figure(figsize=(9, 6))
-    # plt.title(f"frame {frame_idx}")
-    # plt.imshow(Image.open(os.path.join(video_dir, frame_names[frame_idx])))
-
-    inference_state = predictor.init_state(video_path=video_dir)
-    # inference_state.reset_state()
-
-    predictor.reset_state(inference_state)
-
-
-    contact_statistics = get_contact_statistics(detection_result_path)
-    left_hand_frame_idx = None
-    right_hand_frame_idx = None
-    for contact in contact_statistics["contact_details"]:
-        if contact[1] == "left_hand" and left_hand_frame_idx is None:
-            left_hand_frame_idx = contact[0]
-            left_hand_bbox = contact[2]
-            left_hand_object_bbox = contact[3]
-
-            # Let's add a box at (x_min, y_min, x_max, y_max) = (300, 0, 500, 400) to get started
-            _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=left_hand_frame_idx,
-                obj_id=LEFT_HAND_ID,
-                box=left_hand_bbox,
-            )
-
-            _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=left_hand_frame_idx,
-                obj_id=LEFT_OBJECT_ID,
-                box=left_hand_object_bbox,
-            )
-
-
-        if contact[1] == "right_hand" and right_hand_frame_idx is None:
-            right_hand_frame_idx = contact[0]
-            right_hand_bbox = contact[2]
-            right_hand_object_bbox = contact[3]
-            _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=right_hand_frame_idx,
-                obj_id=RIGHT_HAND_ID,
-                box=right_hand_bbox,
-            )
-
-            _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=right_hand_frame_idx,
-                obj_id=RIGHT_OBJECT_ID,
-                box=right_hand_object_bbox,
-            )
-        if left_hand_frame_idx is not None and right_hand_frame_idx is not None:
-            break
-
-    # run propagation throughout the video and collect the results in a dict
-    video_segments = {}  # video_segments contains the per-frame segmentation results
-    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state, reverse=True):
-        video_segments[out_frame_idx] = {
-            out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-            for i, out_obj_id in enumerate(out_obj_ids)
-        }
-    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
-        video_segments[out_frame_idx] = {
-            out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-            for i, out_obj_id in enumerate(out_obj_ids)
-        }
-
-    # Analyze hand-object contact without creating video
-    contact_log = analyze_hand_object_contact(video_segments, frame_names, output_contact_path, apply_temporal_filtering=True)
-
-    # Detect transitions
-    transitions = detect_transitions(contact_log)
+    Args:
+        folder_path (str): Path to folder containing video files
     
-    # Save transitions
-    transitions_output_path = video_file_path.replace('.mp4', '_transitions.json')
-    with open(transitions_output_path, 'w') as f:
-        json.dump(transitions, f, indent=2)
+    Returns:
+        list: List of tuples (video_path, json_path, hdf5_path, base_name)
+    """
+    video_files = []
     
-    print(f"Transitions saved to: {transitions_output_path}")
-
-    # Load keypoint data from HDF5
-    if hdf5_path is not None:
-        print("Loading keypoint data from HDF5...")
-        keypoint_data = load_keypoints_from_hdf5(hdf5_path)
-        print(f"Loaded keypoint data for {len(keypoint_data['joint_trajectories'])} joints")
+    # Get all files in the folder
+    if not os.path.exists(folder_path):
+        print(f"Error: Folder {folder_path} does not exist")
+        return video_files
+    
+    files = os.listdir(folder_path)
+    
+    # Find all .mp4 files
+    mp4_files = [f for f in files if f.endswith('.mp4')]
+    
+    for mp4_file in mp4_files:
+        base_name = os.path.splitext(mp4_file)[0]  # Remove .mp4 extension
         
-        # Generate keypoint projection video
-        output_video_path = video_file_path.replace('.mp4', '_keypoint_projections.mp4')
-        generate_keypoint_projection_video(
-            video_dir, 
-            frame_names, 
-            keypoint_data, 
-            transitions, 
-            output_video_path, 
-            DEFAULT_INTRINSIC
-        )
-
-    # Print simple contact information
-    print(f"\n=== Simple Contact Information ===")
-    # simple_contact_info = []
-    
-    # for frame_data in contact_log:
-    #     frame_idx = frame_data['frame_idx']
-    #     left_contact = frame_data['left_hand_contact']
-    #     right_contact = frame_data['right_hand_contact']
+        # Construct paths for corresponding files
+        video_path = os.path.join(folder_path, mp4_file)
+        json_path = os.path.join(folder_path, f"{base_name}.json")
+        hdf5_path = os.path.join(folder_path, f"{base_name}.hdf5")
         
-    #     if left_contact or right_contact:
-    #         contact_status = []
+        # Check if corresponding files exist
+        if os.path.exists(json_path) and os.path.exists(hdf5_path):
+            video_files.append((video_path, json_path, hdf5_path, base_name))
+            print(f"Found complete set: {base_name}")
+        else:
+            missing = []
+            if not os.path.exists(json_path):
+                missing.append("json")
+            if not os.path.exists(hdf5_path):
+                missing.append("hdf5")
+            print(f"Warning: Missing {', '.join(missing)} file(s) for {base_name}")
+    
+    print(f"Found {len(video_files)} complete video sets to process")
+    return video_files
+
+def get_available_gpus():
+    """
+    Get list of available GPU devices.
+    
+    Returns:
+        list: List of GPU device IDs
+    """
+    if not torch.cuda.is_available():
+        print("CUDA is not available. Using CPU.")
+        return [torch.device("cpu")]
+    
+    gpu_count = torch.cuda.device_count()
+    gpu_devices = [torch.device(f"cuda:{i}") for i in range(gpu_count)]
+    print(f"Found {gpu_count} GPU(s): {gpu_devices}")
+    return gpu_devices
+
+def create_sam2_predictor(device):
+    """
+    Create a SAM2 predictor for a specific device.
+    
+    Args:
+        device (torch.device): Device to load the model on
+    
+    Returns:
+        SAM2VideoPredictor: Initialized predictor
+    """
+    from sam2.build_sam import build_sam2_video_predictor
+    
+    sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
+    model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    
+    # Configure device-specific settings
+    if device.type == "cuda":
+        # use bfloat16 for the entire notebook
+        torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+        # turn on tfloat32 for Ampere GPUs
+        if torch.cuda.get_device_properties(device.index).major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+    
+    predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device)
+    return predictor
+
+def gpu_worker(args):
+    """
+    Worker function for GPU processing.
+    
+    Args:
+        args (tuple): (gpu_device, video_files_batch)
+    
+    Returns:
+        dict: Processing results
+    """
+    gpu_device, video_files_batch = args
+    
+    print(f"Worker on {gpu_device} processing {len(video_files_batch)} videos")
+    
+    # Initialize SAM2 predictor for this GPU
+    predictor = create_sam2_predictor(gpu_device)
+    
+    results = {
+        'gpu_device': str(gpu_device),
+        'total_videos': len(video_files_batch),
+        'successful': 0,
+        'failed': 0,
+        'video_results': []
+    }
+    
+    for i, (video_path, json_path, hdf5_path, base_name) in enumerate(video_files_batch, 1):
+        print(f"[{gpu_device}] Processing {i}/{len(video_files_batch)}: {base_name}")
+        
+        start_time = time.time()
+        success = process_single_video_with_predictor(video_path, json_path, hdf5_path, base_name, predictor)
+        processing_time = time.time() - start_time
+        
+        result = {
+            'video_name': base_name,
+            'success': success,
+            'processing_time': processing_time
+        }
+        
+        results['video_results'].append(result)
+        
+        if success:
+            results['successful'] += 1
+            print(f"[{gpu_device}] ✓ {base_name} completed in {processing_time:.2f}s")
+        else:
+            results['failed'] += 1
+            print(f"[{gpu_device}] ✗ {base_name} failed after {processing_time:.2f}s")
+    
+    return results
+
+def process_single_video_with_predictor(video_file_path, detection_result_path, hdf5_path, base_name, predictor):
+    """
+    Process a single video file with a provided predictor.
+    
+    Args:
+        video_file_path (str): Path to video file
+        detection_result_path (str): Path to detection JSON file
+        hdf5_path (str): Path to HDF5 keypoint file
+        base_name (str): Base name for output files
+        predictor: SAM2 predictor instance
+    
+    Returns:
+        bool: True if processing succeeded, False otherwise
+    """
+    try:
+        # Create output path for contact analysis
+        output_contact_path = video_file_path.replace('.mp4', '_contact_analysis.json')
+
+        # Create a temporary directory for extracted frames
+        temp_dir = tempfile.mkdtemp(prefix=f"sam2_frames_{base_name}_")
+
+        try:
+            # Extract frames from video
+            frame_names = extract_frames_from_video(video_file_path, temp_dir)
             
-    #         simple_contact_info.append({
-    #             'frame_idx': frame_idx,
-    #             'left_hand_contact': left_contact,
-    #             'right_hand_contact': right_contact
-    #         })
-    
-    # Save to JSON file
-    # simple_contact_output_path = video_file_path.replace('.mp4', '_simple_contact_info.json')
-    # with open(simple_contact_output_path, 'w') as f:
-    #     json.dump(simple_contact_info, f, indent=2)
-    
+            # Set video_dir to our temporary directory
+            video_dir = temp_dir
 
-finally:
-    # Clean up: remove the temporary directory and all its contents
-    print(f"Cleaning up temporary directory: {temp_dir}")
-    shutil.rmtree(temp_dir)
-    print("Cleanup completed")
+            # Sort frame names (they should already be in order, but just to be safe)
+            frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+
+            inference_state = predictor.init_state(video_path=video_dir)
+            predictor.reset_state(inference_state)
+
+            contact_statistics = get_contact_statistics(detection_result_path)
+            left_hand_frame_idx = None
+            right_hand_frame_idx = None
+            
+            for contact in contact_statistics["contact_details"]:
+                if contact[1] == "left_hand" and left_hand_frame_idx is None:
+                    left_hand_frame_idx = contact[0]
+                    left_hand_bbox = contact[2]
+                    left_hand_object_bbox = contact[3]
+
+                    _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+                        inference_state=inference_state,
+                        frame_idx=left_hand_frame_idx,
+                        obj_id=LEFT_HAND_ID,
+                        box=left_hand_bbox,
+                    )
+
+                    _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+                        inference_state=inference_state,
+                        frame_idx=left_hand_frame_idx,
+                        obj_id=LEFT_OBJECT_ID,
+                        box=left_hand_object_bbox,
+                    )
+
+                if contact[1] == "right_hand" and right_hand_frame_idx is None:
+                    right_hand_frame_idx = contact[0]
+                    right_hand_bbox = contact[2]
+                    right_hand_object_bbox = contact[3]
+                    _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+                        inference_state=inference_state,
+                        frame_idx=right_hand_frame_idx,
+                        obj_id=RIGHT_HAND_ID,
+                        box=right_hand_bbox,
+                    )
+
+                    _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+                        inference_state=inference_state,
+                        frame_idx=right_hand_frame_idx,
+                        obj_id=RIGHT_OBJECT_ID,
+                        box=right_hand_object_bbox,
+                    )
+                if left_hand_frame_idx is not None and right_hand_frame_idx is not None:
+                    break
+
+            # run propagation throughout the video and collect the results in a dict
+            video_segments = {}  # video_segments contains the per-frame segmentation results
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state, reverse=True):
+                video_segments[out_frame_idx] = {
+                    out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                    for i, out_obj_id in enumerate(out_obj_ids)
+                }
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+                video_segments[out_frame_idx] = {
+                    out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                    for i, out_obj_id in enumerate(out_obj_ids)
+                }
+
+            # Analyze hand-object contact without creating video
+            contact_log = analyze_hand_object_contact(video_segments, frame_names, output_contact_path, apply_temporal_filtering=True)
+
+            # Detect transitions
+            transitions = detect_transitions(contact_log)
+            
+            # Save transitions
+            transitions_output_path = video_file_path.replace('.mp4', '_transitions.json')
+            with open(transitions_output_path, 'w') as f:
+                json.dump(transitions, f, indent=2)
+
+            # Load keypoint data from HDF5
+            if hdf5_path is not None:
+                keypoint_data = load_keypoints_from_hdf5(hdf5_path)
+                
+                # Generate keypoint projection video (or just keypoint data)
+                output_video_path = video_file_path.replace('.mp4', '_keypoint_projections.mp4')
+                generate_keypoint_projection_video(
+                    video_dir, 
+                    frame_names, 
+                    keypoint_data, 
+                    transitions, 
+                    output_video_path, 
+                    DEFAULT_INTRINSIC,
+                    save_video=SAVE_KEYPOINT_VIDEO
+                )
+
+            return True
+
+        finally:
+            # Clean up: remove the temporary directory and all its contents
+            shutil.rmtree(temp_dir)
+            
+    except Exception as e:
+        print(f"Error processing {base_name}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def distribute_videos_across_gpus(video_files, gpu_devices):
+    """
+    Distribute video files across available GPUs.
+    
+    Args:
+        video_files (list): List of video file tuples
+        gpu_devices (list): List of GPU devices
+    
+    Returns:
+        list: List of (gpu_device, video_batch) tuples
+    """
+    gpu_assignments = []
+    videos_per_gpu = len(video_files) // len(gpu_devices)
+    remainder = len(video_files) % len(gpu_devices)
+    
+    start_idx = 0
+    for i, gpu_device in enumerate(gpu_devices):
+        # Give one extra video to the first 'remainder' GPUs
+        batch_size = videos_per_gpu + (1 if i < remainder else 0)
+        end_idx = start_idx + batch_size
+        
+        video_batch = video_files[start_idx:end_idx]
+        gpu_assignments.append((gpu_device, video_batch))
+        
+        print(f"GPU {gpu_device}: {len(video_batch)} videos (indices {start_idx}-{end_idx-1})")
+        start_idx = end_idx
+    
+    return gpu_assignments
+
+def process_folder_multi_gpu(folder_path, use_all_gpus=True, max_gpus=None):
+    """
+    Process all videos in a folder using multiple GPUs in parallel.
+    
+    Args:
+        folder_path (str): Path to folder containing video files
+        use_all_gpus (bool): Whether to use all available GPUs
+        max_gpus (int): Maximum number of GPUs to use (None for no limit)
+    """
+    # Set multiprocessing start method for CUDA compatibility
+    mp.set_start_method('spawn', force=True)
+    
+    # Find all video files and their corresponding files
+    video_files = find_video_files(folder_path)
+    
+    if not video_files:
+        print("No complete video sets found to process")
+        return
+    
+    # Get available GPUs
+    gpu_devices = get_available_gpus()
+    
+    if max_gpus is not None:
+        gpu_devices = gpu_devices[:max_gpus]
+    
+    if not use_all_gpus:
+        gpu_devices = gpu_devices[:1]  # Use only first GPU
+    
+    print(f"\nStarting multi-GPU batch processing:")
+    print(f"- Total videos: {len(video_files)}")
+    print(f"- GPUs to use: {len(gpu_devices)} {gpu_devices}")
+    print(f"- Videos per GPU: ~{len(video_files) // len(gpu_devices)}")
+    
+    # Distribute videos across GPUs
+    gpu_assignments = distribute_videos_across_gpus(video_files, gpu_devices)
+    
+    # Start processing
+    start_time = time.time()
+    
+    # Use multiprocessing to run on multiple GPUs
+    with Pool(processes=len(gpu_devices)) as pool:
+        all_results = pool.map(gpu_worker, gpu_assignments)
+    
+    total_time = time.time() - start_time
+    
+    # Aggregate results
+    total_successful = sum(result['successful'] for result in all_results)
+    total_failed = sum(result['failed'] for result in all_results)
+    
+    print(f"\n{'='*70}")
+    print(f"MULTI-GPU BATCH PROCESSING COMPLETE")
+    print(f"{'='*70}")
+    print(f"Total processing time: {total_time:.2f} seconds ({total_time/60:.1f} minutes)")
+    print(f"Total videos: {len(video_files)}")
+    print(f"Successful: {total_successful}")
+    print(f"Failed: {total_failed}")
+    print(f"Success rate: {total_successful/len(video_files)*100:.1f}%")
+    print(f"Average time per video: {total_time/len(video_files):.2f} seconds")
+    
+    # Print per-GPU statistics
+    print(f"\nPer-GPU Results:")
+    for result in all_results:
+        print(f"  {result['gpu_device']}: {result['successful']}/{result['total_videos']} successful")
+        avg_time = np.mean([v['processing_time'] for v in result['video_results']])
+        print(f"    Average time per video: {avg_time:.2f}s")
+
+# Main execution
+if __name__ == "__main__":
+    # Configuration
+    input_folder = "/home/ANT.AMAZON.COM/fanyangr/Downloads/small_test/basic_pick_place"
+    
+    # Multi-GPU processing options
+    MAX_GPUS = None  # Set to a number to limit GPU usage, None for all available
+    
+    process_folder_multi_gpu(input_folder, use_all_gpus=True, max_gpus=MAX_GPUS)

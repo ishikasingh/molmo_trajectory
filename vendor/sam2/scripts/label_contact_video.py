@@ -348,8 +348,8 @@ def create_tracking_video(video_segments, frame_names, video_dir, output_path, f
 
 
 # Specify your video file path here
-video_file_path = "/home/ANT.AMAZON.COM/fanyangr/code/hand_object_detector/videos/0.mp4"  # Change this to your video file path
-detection_result_path = "/home/ANT.AMAZON.COM/fanyangr/code/hand_object_detector/videos/0_video_data.json"
+video_file_path = "/home/ANT.AMAZON.COM/fanyangr/Downloads/small_test/basic_pick_place/4.mp4"  # Change this to your video file path
+detection_result_path = "/home/ANT.AMAZON.COM/fanyangr/Downloads/small_test/basic_pick_place/4.json"
 
 # Get original video FPS
 original_fps = 30
