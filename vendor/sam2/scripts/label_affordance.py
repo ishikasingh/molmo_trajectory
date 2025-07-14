@@ -14,6 +14,7 @@ import h5py
 import multiprocessing as mp
 from multiprocessing import Pool
 import time
+from tqdm import tqdm
 
 # Add these constants at the top of the file after imports
 LEFT_HAND_ID = 0
@@ -879,6 +880,13 @@ def gpu_worker(args):
     
     print(f"Worker on {gpu_device} processing {len(video_files_batch)} videos")
     
+    # CRITICAL: Set the current CUDA device for this process
+    if gpu_device.type == "cuda":
+        torch.cuda.set_device(gpu_device)
+        # Verify the device is set correctly
+        current_device = torch.cuda.current_device()
+        print(f"Worker process set to use CUDA device: {current_device}")
+    
     # Initialize SAM2 predictor for this GPU
     predictor = create_sam2_predictor(gpu_device)
     
@@ -890,31 +898,39 @@ def gpu_worker(args):
         'video_results': []
     }
     
-    for i, (video_path, json_path, hdf5_path, base_name) in enumerate(video_files_batch, 1):
-        print(f"[{gpu_device}] Processing {i}/{len(video_files_batch)}: {base_name}")
-        
-        start_time = time.time()
-        success = process_single_video_with_predictor(video_path, json_path, hdf5_path, base_name, predictor)
-        processing_time = time.time() - start_time
-        
-        result = {
-            'video_name': base_name,
-            'success': success,
-            'processing_time': processing_time
-        }
-        
-        results['video_results'].append(result)
-        
-        if success:
-            results['successful'] += 1
-            print(f"[{gpu_device}] ✓ {base_name} completed in {processing_time:.2f}s")
-        else:
-            results['failed'] += 1
-            print(f"[{gpu_device}] ✗ {base_name} failed after {processing_time:.2f}s")
+    # Add progress bar for video processing on this GPU
+    with tqdm(video_files_batch, desc=f"GPU {gpu_device}", unit="video", position=int(str(gpu_device).split(':')[-1]) if 'cuda' in str(gpu_device) else 0) as pbar:
+        for i, (video_path, json_path, hdf5_path, base_name) in enumerate(pbar, 1):
+            pbar.set_description(f"GPU {gpu_device} - {base_name[:20]}...")
+            
+            start_time = time.time()
+            num_contact = get_contact_statistics(json_path)['total_contacts']
+            if num_contact == 0:
+                print(f"No contact found for {base_name}")
+                success = False
+            else:
+                success = process_single_video_with_predictor(video_path, json_path, hdf5_path, base_name, predictor, gpu_device)
+            
+            processing_time = time.time() - start_time
+            
+            result = {
+                'video_name': base_name,
+                'success': success,
+                'processing_time': processing_time
+            }
+            
+            results['video_results'].append(result)
+            
+            if success:
+                results['successful'] += 1
+                pbar.set_postfix({"✓": results['successful'], "✗": results['failed'], "time": f"{processing_time:.1f}s"})
+            else:
+                results['failed'] += 1
+                pbar.set_postfix({"✓": results['successful'], "✗": results['failed'], "time": f"{processing_time:.1f}s"})
     
     return results
 
-def process_single_video_with_predictor(video_file_path, detection_result_path, hdf5_path, base_name, predictor):
+def process_single_video_with_predictor(video_file_path, detection_result_path, hdf5_path, base_name, predictor, device):
     """
     Process a single video file with a provided predictor.
     
@@ -924,11 +940,16 @@ def process_single_video_with_predictor(video_file_path, detection_result_path, 
         hdf5_path (str): Path to HDF5 keypoint file
         base_name (str): Base name for output files
         predictor: SAM2 predictor instance
+        device: The GPU device to use
     
     Returns:
         bool: True if processing succeeded, False otherwise
     """
     try:
+        # Ensure we're using the correct device
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+        
         # Create output path for contact analysis
         output_contact_path = video_file_path.replace('.mp4', '_contact_analysis.json')
 
@@ -945,6 +966,7 @@ def process_single_video_with_predictor(video_file_path, detection_result_path, 
             # Sort frame names (they should already be in order, but just to be safe)
             frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
 
+            # Initialize inference state
             inference_state = predictor.init_state(video_path=video_dir)
             predictor.reset_state(inference_state)
 
