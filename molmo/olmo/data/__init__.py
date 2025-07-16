@@ -15,6 +15,7 @@ from olmo.data.model_preprocessor import Preprocessor, MultiModalPreprocessor
 from olmo.data.pixmo_datasets import PixMoPointExplanations as PixMoPointExplanationHF, \
     PixMoDocs, PixMoCount, PixMoPoints, PixMoCapQa, PixMoCap, PixMoPointExplanations, \
     PixMoAskModelAnything, PixMoPointsEval
+from olmo.data.affordance_datsets import HandPositioningDataset
 from olmo.torch_util import get_global_rank, get_world_size
 
 log = logging.getLogger(__name__)
@@ -316,4 +317,10 @@ def get_dataset_by_name(dataset_name, split):
         if split == "validation":
             split = "testmini"
         return MathVista(split)
+    elif dataset_name == "affordance":
+        # You'll need to specify the data_path when using this dataset
+        # For now, we'll assume it's in the environment variable or default location
+        import os
+        data_path = os.environ.get("AFFORDANCE_DATA_PATH", "data/affordance")
+        return HandPositioningDataset(data_path=data_path, split=split)
     raise NotImplementedError(dataset_name, split)

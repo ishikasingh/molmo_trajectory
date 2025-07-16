@@ -231,6 +231,28 @@ GENERAL_PROMPTS_V1 = {
         "Find all the {label}. How many are there?",
         "Find each {label}. How many are there?",
     ],
+    "affordance": [
+        "Predict the hand keypoints for {label}",
+        "Show me where the hands should be positioned for {label}",
+        "Indicate the hand positions for {label}",
+        "Point to where the hands should be placed for {label}",
+        "Predict hand keypoints for the task: {label}",
+        "Where should the hands be positioned for {label}?",
+        "Show the hand positions needed for {label}",
+        "Indicate where the hands should be for {label}",
+        "Predict the hand pose for {label}",
+        "Show me the hand keypoints for {label}",
+        "Mark the hand positions for {label}",
+        "Indicate the hand keypoints needed for {label}",
+        "Where should the hands be placed for {label}?",
+        "Show the predicted hand positions for {label}",
+        "Point to the hand locations for {label}",
+        "Predict where the hands should be for {label}",
+        "Show me the hand affordance for {label}",
+        "Indicate the hand placement for {label}",
+        "Mark where the hands should be positioned for {label}",
+        "Show the hand keypoints needed for {label}",
+    ],
 }
 
 
@@ -256,6 +278,7 @@ STYLE_TO_GENERAL_PROMPT = {
     "point_count": "point_count",
     "count_then_point": "count_then_point",
     "only_count": "only_count",
+    "affordance": "affordance",
     "plain": "plain",
 }
 
@@ -341,7 +364,7 @@ class DataFormatter:
         else:
             label = example["question"]
         if len(points) == 0:
-            if style in ["pointing", "point_count"]:
+            if style in ["pointing", "point_count", "affordance"]:
                 return "There are none."
             else:
                 raise NotImplementedError()
@@ -355,6 +378,8 @@ class DataFormatter:
 
         if style == "point_count":
             return f"Counting the {point_txt} shows a total of {len(points)}."
+        elif style == "affordance":
+            return f"Hand keypoints for {label}: {point_txt}"
         else:
             return point_txt
 
@@ -466,7 +491,7 @@ class DataFormatter:
             # Bare-bone prompt with no templating or instructions
             if "prompt" in example:
                 prompt = example["prompt"]
-            elif style in ["pointing", "point_count"]:
+            elif style in ["pointing", "point_count", "affordance"]:
                 if "question" in example:
                     prompt = example["question"]
                 else:
@@ -492,7 +517,7 @@ class DataFormatter:
                 # plain text for everything else
                 if style == "long_caption":
                     prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1["long_caption"], example, rng, dbg=self.debug)
-                elif style in ["pointing", "point_count"]:
+                elif style in ["pointing", "point_count", "affordance"]:
                     # output, prompt, metadata = self.format_points(example)
                     if "question" in example:
                         prompt = example["question"]

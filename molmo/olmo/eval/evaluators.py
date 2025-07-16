@@ -479,6 +479,83 @@ class PointingEval(Evaluator):
         return out
 
 
+class AffordanceEval(Evaluator):
+    """
+    Evaluator for affordance prediction task - predicts hand keypoints
+    Similar to PointingEval but with affordance-specific metrics
+    """
+
+    def __init__(self, n_to_log=None):
+        self.n_to_log = n_to_log
+
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        vocab = tokenizer
+        scores = defaultdict(list)
+        pred_points = []
+        gt_points = []
+        hand_distances = []  # Track per-hand distances
+        
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            metadata = metadatas[ex_ix]
+            pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
+            answer_points = metadata["points"]
+            image_w, image_h = metadata["image_size"]
+            abs_preds = extract_points(pred, image_w, image_h)
+
+            if len(answer_points) == 0:
+                precision = recall = f1 = float(abs_preds is None or len(abs_preds) == 0)
+                abs_gts = None
+                hand_dist = 0.0
+            else:
+                abs_gts = answer_points
+                if not is_valid_format(pred):
+                    precision = recall = f1 = 0.0
+                    hand_dist = float('inf')
+                else:
+                    abs_preds = np.array(abs_preds)
+                    dists = cdist(abs_preds, abs_gts)
+                    row_ind, col_ind = linear_sum_assignment(dists)
+                    
+                    # Standard metrics
+                    precision = compute_precision(row_ind, col_ind, abs_preds, None)  # No masks for affordance
+                    recall = compute_recall(row_ind, col_ind, abs_preds, None)
+                    f1 = f1_score(precision, recall)
+                    
+                    # Compute mean distance between matched keypoints
+                    matched_dists = dists[row_ind, col_ind]
+                    hand_dist = np.mean(matched_dists) if len(matched_dists) > 0 else float('inf')
+            
+            scores["precision"].append(precision)
+            scores["recall"].append(recall)
+            scores["f1"].append(f1)
+            hand_distances.append(hand_dist)
+
+            pred_points.append(abs_preds)
+            gt_points.append(abs_gts)
+
+        # Add affordance-specific metrics
+        scores["mean_keypoint_distance"] = hand_distances
+        
+        # Compute accuracy at different thresholds (pixel distances)
+        for threshold in [10, 20, 30, 50]:
+            acc_at_threshold = [1.0 if d <= threshold else 0.0 for d in hand_distances if d != float('inf')]
+            scores[f"accuracy_at_{threshold}px"] = acc_at_threshold if acc_at_threshold else [0.0]
+
+        out = {}
+        for k, v in scores.items():
+            out[k] = mean_metric(v)
+
+        if self.n_to_log:
+            per_example_scores = [{k: scores[k][i] for k in scores} for i in range(len(new_tokens))]
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, vocab, metadatas, predictions, per_example_scores,
+                pred_points=pred_points, gt_points=gt_points
+            )
+        return out
+
+
 class PointCountEval(Evaluator):
 
     def __init__(self, n_to_log=None):

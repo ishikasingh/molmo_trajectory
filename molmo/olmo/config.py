@@ -1059,6 +1059,7 @@ class EvaluatorConfig(BaseConfig):
 
     # Other individual types of eval
     pointing_eval: bool = False
+    affordance_eval: bool = False
     count_eval: bool = False
     point_count_eval: bool = False
     android_eval: bool = False

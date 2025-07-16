@@ -28,6 +28,9 @@ PIXMO_DATASETS = [
     PixMoPointsEval, PixMoAskModelAnything
 ]
 
+PIXMO_POINT_DATASETS = [
+    PixMoPoints, PixMoPointsEval
+]
 DATASETS = ACADEMIC_DATASETS + PIXMO_DATASETS
 
 
@@ -54,6 +57,8 @@ def download():
         to_download = ACADEMIC_DATASETS
     elif args.dataset == "pixmo":
         to_download = PIXMO_DATASETS
+    elif args.dataset == "pixmo_point":
+        to_download = PIXMO_POINT_DATASETS
     elif args.dataset == "academic_eval":
         to_download = ACADEMIC_EVAL
     elif args.dataset.lower().replace("_", "") in DATASET_MAP:
