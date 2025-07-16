@@ -26,7 +26,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-dev python3-pip libevdev-dev \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /workspace
+# Set CUDA environment variables (base image should have CUDA in /usr/local/cuda)
+ENV CUDA_HOME=/usr/local/cuda-12.1
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+# Verify CUDA installation and add to bash profile
+RUN echo "export CUDA_HOME=/usr/local/cuda-12.1" >> /root/.bashrc && \
+    echo "export PATH=/usr/local/cuda-12.1/bin:\$PATH" >> /root/.bashrc && \
+    echo "export LD_LIBRARY_PATH=/usr/local/cuda-12.1/lib64:\$LD_LIBRARY_PATH" >> /root/.bashrc
+
+    WORKDIR /workspace
 COPY . ./
 
 # Install AWS ClI
