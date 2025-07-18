@@ -97,8 +97,8 @@ if __name__ == "__main__":
     parser.add_argument("--device_eval_batch_size", default=2, type=int)
     # parser.add_argument("--device_inf_batch_size", default=4, type=int)
     parser.add_argument("--device_inf_batch_size", default=2, type=int)
-    # parser.add_argument("--device_train_batch_size", default=, type=int)
-    parser.add_argument("--device_train_batch_size", default=1, type=int)
+    # parser.add_argument("--device_train_batch_size", default=2, type=int)
+    parser.add_argument("--device_train_batch_size", default=2, type=int)
     args, other_args = parser.parse_known_args()
 
     if args.mixture.startswith("single"):
