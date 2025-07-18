@@ -232,26 +232,28 @@ GENERAL_PROMPTS_V1 = {
         "Find each {label}. How many are there?",
     ],
     "affordance": [
-        "Predict the hand keypoints for {label}",
-        "Show me where the hands should be positioned for {label}",
-        "Indicate the hand positions for {label}",
-        "Point to where the hands should be placed for {label}",
+        "Predict the hand keypoints for the task: {label}",
+        "Show me where the hands should be positioned for the task: {label}",
+        "Indicate the hand positions for the task: {label}",
+        "Point to where the hands should be placed for the task: {label}",
         "Predict hand keypoints for the task: {label}",
-        "Where should the hands be positioned for {label}?",
-        "Show the hand positions needed for {label}",
-        "Indicate where the hands should be for {label}",
-        "Predict the hand pose for {label}",
-        "Show me the hand keypoints for {label}",
-        "Mark the hand positions for {label}",
-        "Indicate the hand keypoints needed for {label}",
-        "Where should the hands be placed for {label}?",
-        "Show the predicted hand positions for {label}",
-        "Point to the hand locations for {label}",
-        "Predict where the hands should be for {label}",
-        "Show me the hand affordance for {label}",
-        "Indicate the hand placement for {label}",
-        "Mark where the hands should be positioned for {label}",
-        "Show the hand keypoints needed for {label}",
+        "Where should the hands be positioned for the task: {label}?",
+        "Show the hand positions needed for the task: {label}",
+        "Indicate where the hands should be for the task: {label}",
+        "Predict the hand pose for the task: {label}",
+        "Show me the hand keypoints for the task: {label}",
+        "Mark the hand positions for the task: {label}",
+        "Indicate the hand keypoints needed for the task: {label}",
+        "Where should the hands be placed for the task: {label}?",
+        "Show the predicted hand positions for the task: {label}",
+        "Point to the hand locations for the task: {label}",
+        "Predict where the hands should be for the task: {label}",
+        "Show me the hand affordance for the task: {label}",
+        "Indicate the hand placement for the task: {label}",
+        "Mark where the hands should be positioned for the task: {label}",
+        "Show the hand keypoints needed for the task: {label}",
+        "I want to {label} please show me the hand keypoints",
+        "please show me how to {label} by outlining the hand keypoints",
     ],
 }
 
@@ -327,6 +329,7 @@ class DataFormatter:
     default_inference_len: int = 65  # Inference len for length-conditioned prompting
     select_answer: str = "best"  # How to select answer for questions with many answers
     debug: bool = False  # deterministic mode for debugging
+    # debug_print_counter: int = 0  # Add this as a class attribute
 
     def points_to_text(self, points, scale, label_text, alt_text):
         if isinstance(scale, (tuple, list)):
@@ -379,7 +382,7 @@ class DataFormatter:
         if style == "point_count":
             return f"Counting the {point_txt} shows a total of {len(points)}."
         elif style == "affordance":
-            return f"Hand keypoints for {label}: {point_txt}"
+            return point_txt  # Remove the verbose prefix
         else:
             return point_txt
 
@@ -577,6 +580,15 @@ class DataFormatter:
             if not for_inference:
                 assert response is not None
                 messages = [prompt, response]
+                
+                # ADD THIS DEBUG PRINTING - only print every 100th example for affordance
+                # if message.get("style") == "affordance" and self.debug_print_counter % 1== 0:
+                #     print(f"\n=== AFFORDANCE DEBUG (#{self.debug_print_counter}) ===")
+                #     print(f"INPUT:  {prompt}")
+                #     print(f"OUTPUT: {response}")
+                #     print("=" * 50)
+                # self.debug_print_counter += 1
+                
             else:
                 messages = [prompt]
         else:

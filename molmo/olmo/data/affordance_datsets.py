@@ -1,6 +1,6 @@
+import json
 import numpy as np
 import datasets
-import json
 from PIL import Image
 from olmo.data.dataset import Dataset
 
@@ -24,24 +24,12 @@ class HandPositioningDataset(Dataset):
         - hand_positions: dict with hand keypoints
         """
         # Try to load from HuggingFace dataset first
-        try:
-            if isinstance(data_path, str) and not data_path.endswith('.json'):
-                # Assume it's a HuggingFace dataset path
-                dataset = datasets.load_from_disk(data_path)
-                return dataset[split] if split in dataset else dataset
-        except:
-            pass
-            
-        # Fall back to JSON loading
-        json_path = f"{data_path}/{split}.json" if not data_path.endswith('.json') else data_path
-        try:
-            with open(json_path, "r") as f:
-                data = json.load(f)
-            return data
-        except FileNotFoundError:
-            print(f"Could not find data file at {json_path}")
-            print("Please make sure your data is in the correct format or create it using create_hf_dataset()")
-            return []
+        if isinstance(data_path, str) and not data_path.endswith('.json'):
+            # Assume it's a HuggingFace dataset path
+            dataset = datasets.load_from_disk(data_path)
+            return dataset[split] if split in dataset else dataset
+        else:
+            raise ValueError(f"Invalid data path: {data_path}")
     
     def __len__(self):
         return len(self.data)
@@ -49,107 +37,85 @@ class HandPositioningDataset(Dataset):
     def get(self, item, rng):
         example = self.data[item]
         
-        # Load image
-        if isinstance(example["image"], str):
-            image = Image.open(example["image"])
+        # Load image - handle both PIL Image objects and file paths
+        image_data = example["image"]
+        if isinstance(image_data, str):
+            image = Image.open(image_data)
+        elif hasattr(image_data, 'mode'):  # PIL Image object
+            image = image_data
         else:
-            image = example["image"]
+            # Assume it's already in the right format
+            image = image_data
         
         # Process hand positions
         hand_positions = self._process_hand_positions(example["hand_positions"])
+        
+        # Safely get metadata with fallbacks
+        try:
+            metadata = example["metadata"] if "metadata" in example else {}
+        except (KeyError, TypeError):
+            metadata = {}
+        
+        # Safe access to optional fields
+        def safe_get(obj, key, default):
+            try:
+                if hasattr(obj, 'get'):
+                    return obj.get(key, default)
+                elif key in obj:
+                    return obj[key]
+                else:
+                    return default
+            except (KeyError, TypeError, AttributeError):
+                print(f"KeyError: {key} not found in {obj}")
+                return default
         
         return {
             "image": image,
             "message_list": [
                 {
-                    "question": example["instruction"],
+                    "label": example["instruction"],
                     "points": hand_positions,
-                    "point_scale": 100,  # Adjust based on your coordinate system
-                    "style": "affordance"  # Changed from "hand_positioning" to "affordance"
+                    "point_scale": 100,  # Our coordinates are already in percentage (0-100)
+                    "style": "affordance"
                 }
             ],
             "metadata": {
-                "image_path": example.get("image_path", ""),
-                "hand_data": example["hand_positions"]  # Keep original for debugging
+                "image_path": safe_get(example, "image_path", ""),
+                "hand_data": example["hand_positions"],  # Keep original for debugging
+                "video_id": safe_get(metadata, "video_id", ""),
+                "frame_idx": safe_get(metadata, "frame_idx", 0),
+                "image_size": safe_get(metadata, "image_size", [1920, 1080])
             }
         }
     
     def _process_hand_positions(self, hand_data):
         """
-        Convert your hand position data to the expected format.
+        Convert hand position data to the expected format for molmo.
         
-        For both hands with fingertips + wrists, you might have:
-        - Left hand: 5 fingertips + 1 wrist = 6 points
-        - Right hand: 5 fingertips + 1 wrist = 6 points
-        - Total: 12 points
+        Input format from HuggingFace dataset:
+        {
+            "points": [hand_data1, hand_data2, ...],  # Raw hand data for each detected hand
+            "labels": ["left_hand", "right_hand", ...]  # Hand type labels
+        }
+        
+        Where each hand_data contains the actual keypoint coordinates.
         
         Returns: numpy array of shape (N, 2) where N is number of keypoints
         """
-        points = []
-        
-        # Example structure - adjust based on your data format
-        if "left_hand" in hand_data:
-            # Add left hand points (fingertips + wrist)
-            for fingertip in hand_data["left_hand"]["fingertips"]:
-                points.append([fingertip["x"], fingertip["y"]])
-            points.append([hand_data["left_hand"]["wrist"]["x"], 
-                          hand_data["left_hand"]["wrist"]["y"]])
-        
-        if "right_hand" in hand_data:
-            # Add right hand points (fingertips + wrist)
-            for fingertip in hand_data["right_hand"]["fingertips"]:
-                points.append([fingertip["x"], fingertip["y"]])
-            points.append([hand_data["right_hand"]["wrist"]["x"], 
-                          hand_data["right_hand"]["wrist"]["y"]])
-        
-        return np.array(points, dtype=np.float32)
-
-    @staticmethod
-    def create_hf_dataset(raw_data, output_path, splits=None):
-        """
-        Create a HuggingFace dataset from your raw data.
-        
-        Args:
-            raw_data: Your raw data in whatever format you have
-            output_path: Where to save the processed dataset
-            splits: Optional dict like {"train": 0.8, "validation": 0.1, "test": 0.1}
-        """
-        # This is a template - you'll need to adapt it to your specific data format
-        processed_data = []
-        
-        for item in raw_data:
-            processed_item = {
-                "image": item["image_path"],  # Adjust field names as needed
-                "instruction": item["instruction"],  # Adjust field names as needed
-                "hand_positions": item["hand_keypoints"],  # Adjust field names as needed
-                "image_path": item["image_path"]
-            }
-            processed_data.append(processed_item)
-        
-        # Convert to HuggingFace dataset
-        dataset = datasets.Dataset.from_list(processed_data)
-        
-        # Split if requested
-        if splits:
-            dataset = dataset.train_test_split(test_size=1-splits["train"], seed=42)
-            train_data = dataset["train"]
-            test_data = dataset["test"]
+        points_list = []
+        if isinstance(hand_data, dict) and "points" in hand_data:
+            # New format from HuggingFace dataset
             
-            if "validation" in splits:
-                val_size = splits["validation"] / (splits["validation"] + splits["test"])
-                test_val_split = test_data.train_test_split(test_size=val_size, seed=42)
-                dataset = datasets.DatasetDict({
-                    "train": train_data,
-                    "test": test_val_split["train"],
-                    "validation": test_val_split["test"]
-                })
-            else:
-                dataset = datasets.DatasetDict({
-                    "train": train_data,
-                    "test": test_data
-                })
-        
-        # Save to disk
-        dataset.save_to_disk(output_path)
-        print(f"Dataset saved to {output_path}")
-        return dataset
+            # Extract coordinate points from each hand's data
+            for hand_keypoints in hand_data["points"]:
+                # If hand_keypoints is already a list of coordinates
+                if len(hand_keypoints) == 2 and isinstance(hand_keypoints[0], (int, float)):
+                    # Single coordinate pair
+                    points_list.append([float(hand_keypoints[0]), float(hand_keypoints[1])])
+                else:
+                    raise ValueError(f"Invalid hand keypoints format: {hand_keypoints}")
+        else:
+            raise ValueError(f"Invalid hand data format: {hand_data}")
+            
+            
+        return np.array(points_list, dtype=np.float32)

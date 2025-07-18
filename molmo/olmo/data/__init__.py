@@ -1,5 +1,5 @@
 import logging
-
+import os
 import numpy as np
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -318,9 +318,11 @@ def get_dataset_by_name(dataset_name, split):
             split = "testmini"
         return MathVista(split)
     elif dataset_name == "affordance":
-        # You'll need to specify the data_path when using this dataset
-        # For now, we'll assume it's in the environment variable or default location
-        import os
-        data_path = os.environ.get("AFFORDANCE_DATA_PATH", "data/affordance")
+        data_path = os.environ.get("AFFORDANCE_DATA_PATH")
         return HandPositioningDataset(data_path=data_path, split=split)
+    elif dataset_name == "affordance_eval":
+        assert split == "validation"
+        data_path = os.environ.get("AFFORDANCE_DATA_PATH")
+        return HandPositioningDataset(data_path=data_path, split=split)
+
     raise NotImplementedError(dataset_name, split)
