@@ -122,6 +122,10 @@ def main():
                 # Do this last and low-res since it is HUGE
                 "vqa_v2_test:test2015", # No metrics
             ]
+        elif task == "affordance_eval":
+            tasks += [
+                "affordance_eval",
+            ]
         elif "," in task:
             tasks += task.split(",")   # support comma seperator just because the jax code does
         else:
