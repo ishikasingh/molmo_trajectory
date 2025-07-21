@@ -3,6 +3,7 @@ import numpy as np
 import datasets
 from PIL import Image
 from olmo.data.dataset import Dataset
+from pathlib import Path
 
 class HandPositioningDataset(Dataset):
     def __init__(self, data_path, split="train", keep_in_memory=False):
@@ -38,7 +39,14 @@ class HandPositioningDataset(Dataset):
         example = self.data[item]
         
         # Load image - handle both PIL Image objects and file paths
-        image_data = example["image"]
+        if "image" in example:
+            image_data = example["image"]
+        elif "image_path" in example:
+            image_data = example["image_path"]
+            image_data = Path(self.data_path).parent / "affordance_images" / image_data
+        else:
+            raise ValueError(f"Invalid image data format: {example}")
+        
         if isinstance(image_data, str):
             image = Image.open(image_data)
         elif hasattr(image_data, 'mode'):  # PIL Image object

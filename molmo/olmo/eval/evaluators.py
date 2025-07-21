@@ -482,11 +482,12 @@ class PointingEval(Evaluator):
 class AffordanceEval(Evaluator):
     """
     Evaluator for affordance prediction task - predicts hand keypoints
-    Similar to PointingEval but with affordance-specific metrics
+    Uses distance-based metrics instead of mask-based metrics
     """
 
-    def __init__(self, n_to_log=None):
+    def __init__(self, n_to_log=None, distance_threshold=20):
         self.n_to_log = n_to_log
+        self.distance_threshold = distance_threshold  # Default threshold in pixels
 
     def __call__(self, metadatas, predictions, tokenizer, step=None):
         new_tokens = predictions["predictions"]
@@ -500,32 +501,55 @@ class AffordanceEval(Evaluator):
         for ex_ix, pred_seq in enumerate(new_tokens):
             metadata = metadatas[ex_ix]
             pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
-            answer_points = metadata["points"]
+            
+            # Get points from hand_positions, not metadata["points"]
+            if "hand_positions" in metadata and "points" in metadata["hand_positions"]:
+                answer_points = metadata["hand_positions"]["points"]
+            else:
+                # Fallback to check if points are directly in metadata
+                answer_points = metadata.get("points", [])
+            
             image_w, image_h = metadata["image_size"]
+            
+            # Extract predicted points
             abs_preds = extract_points(pred, image_w, image_h)
-
+            
+            # Handle case where no ground truth points
             if len(answer_points) == 0:
+                # If no GT points, perfect score if no predictions, else 0
                 precision = recall = f1 = float(abs_preds is None or len(abs_preds) == 0)
                 abs_gts = None
-                hand_dist = 0.0
+                hand_dist = 0.0 if abs_preds is None or len(abs_preds) == 0 else 1000.0  # Use large finite number instead of inf
             else:
                 abs_gts = answer_points
-                if not is_valid_format(pred):
+                
+                # Handle invalid format predictions
+                if not is_valid_format(pred) or abs_preds is None or len(abs_preds) == 0:
                     precision = recall = f1 = 0.0
-                    hand_dist = float('inf')
+                    hand_dist = 1000.0  # Use large finite number instead of inf
                 else:
+                    # Convert to numpy arrays for distance calculation
                     abs_preds = np.array(abs_preds)
+                    abs_gts = np.array(abs_gts)
+                    
+                    # Compute distance matrix
                     dists = cdist(abs_preds, abs_gts)
+                    
+                    # Hungarian algorithm for optimal assignment
                     row_ind, col_ind = linear_sum_assignment(dists)
                     
-                    # Standard metrics
-                    precision = compute_precision(row_ind, col_ind, abs_preds, None)  # No masks for affordance
-                    recall = compute_recall(row_ind, col_ind, abs_preds, None)
+                    # Distance-based precision and recall
+                    precision = self._compute_distance_based_precision(
+                        row_ind, col_ind, abs_preds, abs_gts, dists
+                    )
+                    recall = self._compute_distance_based_recall(
+                        row_ind, col_ind, abs_preds, abs_gts, dists
+                    )
                     f1 = f1_score(precision, recall)
                     
                     # Compute mean distance between matched keypoints
                     matched_dists = dists[row_ind, col_ind]
-                    hand_dist = np.mean(matched_dists) if len(matched_dists) > 0 else float('inf')
+                    hand_dist = np.mean(matched_dists) if len(matched_dists) > 0 else 1000.0  # Use large finite number instead of inf
             
             scores["precision"].append(precision)
             scores["recall"].append(recall)
@@ -540,12 +564,49 @@ class AffordanceEval(Evaluator):
         
         # Compute accuracy at different thresholds (pixel distances)
         for threshold in [10, 20, 30, 50]:
-            acc_at_threshold = [1.0 if d <= threshold else 0.0 for d in hand_distances if d != float('inf')]
-            scores[f"accuracy_at_{threshold}px"] = acc_at_threshold if acc_at_threshold else [0.0]
+            acc_at_threshold = []
+            for d in hand_distances:
+                # Since we no longer use inf, just check if distance is within threshold
+                acc_at_threshold.append(1.0 if d <= threshold else 0.0)
+            scores[f"accuracy_at_{threshold}px"] = acc_at_threshold
+
+        # Compute percentage of correctly detected keypoints (within distance threshold)
+        correct_detections = []
+        total_detections = []
+        
+        for ex_ix in range(len(new_tokens)):
+            if gt_points[ex_ix] is not None and pred_points[ex_ix] is not None:
+                gt_pts = np.array(gt_points[ex_ix])
+                pred_pts = np.array(pred_points[ex_ix])
+                
+                if len(pred_pts) > 0 and len(gt_pts) > 0:
+                    dists = cdist(pred_pts, gt_pts)
+                    row_ind, col_ind = linear_sum_assignment(dists)
+                    matched_dists = dists[row_ind, col_ind]
+                    
+                    correct_within_threshold = np.sum(matched_dists <= self.distance_threshold)
+                    correct_detections.append(correct_within_threshold)
+                    total_detections.append(len(gt_pts))
+                else:
+                    correct_detections.append(0)
+                    total_detections.append(len(gt_pts) if len(gt_pts) > 0 else 1)
+            else:
+                correct_detections.append(0)
+                total_detections.append(1)
+        
+        # Detection rate: correctly detected keypoints / total ground truth keypoints
+        detection_rates = [c/t if t > 0 else 0.0 for c, t in zip(correct_detections, total_detections)]
+        scores["detection_rate"] = detection_rates
 
         out = {}
         for k, v in scores.items():
-            out[k] = mean_metric(v)
+            # Ensure all metrics are finite for logging
+            finite_values = [x for x in v if np.isfinite(x)]
+            if len(finite_values) == 0:
+                # If no finite values, use 0
+                out[k] = mean_metric([0.0])
+            else:
+                out[k] = mean_metric(finite_values)
 
         if self.n_to_log:
             per_example_scores = [{k: scores[k][i] for k in scores} for i in range(len(new_tokens))]
@@ -554,6 +615,36 @@ class AffordanceEval(Evaluator):
                 pred_points=pred_points, gt_points=gt_points
             )
         return out
+    
+    def _compute_distance_based_precision(self, row_ind, col_ind, preds, gts, dists):
+        """
+        Compute precision based on distance threshold.
+        Precision = (# of predicted points within threshold of any GT) / (# of predicted points)
+        """
+        if len(preds) == 0:
+            return 1.0  # Perfect precision if no predictions made
+        
+        correct_predictions = 0
+        for i, j in zip(row_ind, col_ind):
+            if dists[i, j] <= self.distance_threshold:
+                correct_predictions += 1
+        
+        return correct_predictions / len(preds)
+    
+    def _compute_distance_based_recall(self, row_ind, col_ind, preds, gts, dists):
+        """
+        Compute recall based on distance threshold.
+        Recall = (# of GT points with a prediction within threshold) / (# of GT points)
+        """
+        if len(gts) == 0:
+            return 1.0  # Perfect recall if no GT points
+        
+        correct_gts = 0
+        for i, j in zip(row_ind, col_ind):
+            if dists[i, j] <= self.distance_threshold:
+                correct_gts += 1
+        
+        return correct_gts / len(gts)
 
 
 class PointCountEval(Evaluator):

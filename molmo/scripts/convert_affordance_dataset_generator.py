@@ -7,6 +7,9 @@ from PIL import Image
 from pathlib import Path
 from typing import Dict, List, Union, Optional
 from tqdm import tqdm
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import functools
 
 def read_complete_file_sets(folder_path: str, recursive: bool = False) -> Dict:
     """
@@ -153,9 +156,127 @@ def read_file_set_generator(mp4_path: str, keypoint_json_path: str, hdf5_path: s
     
     cap.release()
 
+def process_single_file_set(file_set: Dict, frame_interval: int = 1) -> List[Dict]:
+    """
+    Worker function to process a single file set and return all its items.
+    This function is designed to be used with multiprocessing.
+    
+    Args:
+        file_set: Dictionary containing file paths for mp4, keypoint_json, and hdf5
+        frame_interval: Process every n-th frame
+        
+    Returns:
+        List of dataset items from this file set
+    """
+    items = []
+
+    # Use generator to process frames one by one
+    for frame_data in read_file_set_generator(
+        file_set['mp4_file'], 
+        file_set['keypoint_json'], 
+        file_set['hdf5_file'],
+        frame_interval
+    ):
+        frame = frame_data['frame']
+        keypoints = frame_data['keypoints']
+        
+        # Process keypoints to match the expected format
+        hand_positions = process_keypoints_for_dataset(
+            keypoints, 
+            image_width=frame.width, 
+            image_height=frame.height
+        )
+        
+        # Create dataset item
+        item = {
+            "image": frame,  # PIL Image
+            "instruction": frame_data['language_instruction'],
+            "hand_positions": hand_positions,
+            "metadata": {
+                "video_id": file_set['base_number'],
+                "frame_idx": frame_data['frame_idx'],
+                "original_frame_idx": frame_data['frame_idx'],
+                "image_size": [frame.width, frame.height],
+                "fps": frame_data['fps'],
+                "duration": frame_data['duration'],
+                "total_frames": frame_data['total_frames'],
+                "frame_interval": frame_interval,
+                # "mp4_file": file_set['mp4_file'],
+                # "keypoint_json": file_set['keypoint_json'],
+                # "hdf5_file": file_set['hdf5_file']
+            }
+        }
+        
+        items.append(item)
+        
+    
+    return items
+
+def dataset_generator_multiprocessing(folder_path: str, recursive: bool = True, frame_interval: int = 1, 
+                                    num_processes: int = None, batch_size: int = 4):
+    """
+    Generator that yields dataset items using multiprocessing for improved performance.
+    
+    Args:
+        folder_path: Path to the folder containing the data files
+        recursive: Whether to search subdirectories recursively
+        frame_interval: Process every n-th frame
+        num_processes: Number of processes to use (default: CPU count)
+        batch_size: Number of file sets to process in each batch
+        
+    Yields:
+        Dictionary containing processed dataset items
+    """
+    # Find all complete file sets
+    file_sets = read_complete_file_sets(folder_path, recursive=recursive)
+    
+    print(f"Found {file_sets['total_complete']} complete file sets")
+    print(f"Frame interval: {frame_interval} (processing every {frame_interval}{'st' if frame_interval == 1 else 'nd' if frame_interval == 2 else 'rd' if frame_interval == 3 else 'th'} frame)")
+    
+    if num_processes is None:
+        num_processes = mp.cpu_count()
+    
+    print(f"Using {num_processes} processes with batch size {batch_size}")
+    
+    complete_sets = file_sets['complete_sets']
+    
+    # Initialize progress bar for file sets
+    total_file_sets = len(complete_sets)
+    pbar = tqdm(total=total_file_sets, desc="Processing file sets", unit="set")
+    
+    # Process file sets in batches to manage memory usage
+    for i in range(0, len(complete_sets), batch_size):
+        batch = complete_sets[i:i + batch_size]
+        
+        # Create a partial function with frame_interval
+        worker_func = functools.partial(process_single_file_set, frame_interval=frame_interval)
+        
+        # Process this batch in parallel
+        with ProcessPoolExecutor(max_workers=num_processes) as executor:
+            # Submit all tasks in the batch
+            future_to_file_set = {
+                executor.submit(worker_func, file_set): file_set 
+                for file_set in batch
+            }
+            
+            # Process completed tasks as they finish
+            for future in as_completed(future_to_file_set):
+                file_set = future_to_file_set[future]
+                items = future.result()
+                # Update progress bar
+                pbar.update(1)
+                # Yield all items from this file set
+                for item in items:
+                    yield item
+    
+    # Close progress bar
+    pbar.close()
+
+
 def dataset_generator(folder_path: str, recursive: bool = True, frame_interval: int = 1):
     """
     Generator that yields dataset items one by one for memory-efficient processing.
+    This is the original single-threaded version.
     
     Args:
         folder_path: Path to the folder containing the data files
@@ -212,7 +333,9 @@ def dataset_generator(folder_path: str, recursive: bool = True, frame_interval: 
             
             yield item
 
-def create_huggingface_dataset_memory_efficient(folder_path: str, output_path: str, recursive: bool = True, frame_interval: int = 1):
+def create_huggingface_dataset_memory_efficient(folder_path: str, output_path: str, recursive: bool = True, 
+                                               frame_interval: int = 1, use_multiprocessing: bool = True,
+                                               num_processes: int = None, batch_size: int = 4):
     """
     Create a HuggingFace dataset from the complete file sets using generators for memory efficiency.
     
@@ -221,6 +344,9 @@ def create_huggingface_dataset_memory_efficient(folder_path: str, output_path: s
         output_path: Path where to save the HuggingFace dataset
         recursive: Whether to search subdirectories recursively
         frame_interval: Process every n-th frame (1 = every frame, 2 = every 2nd frame, etc.)
+        use_multiprocessing: Whether to use multiprocessing for faster processing
+        num_processes: Number of processes to use (default: CPU count)
+        batch_size: Number of file sets to process in each batch
     """
     import datasets
     
@@ -241,15 +367,25 @@ def create_huggingface_dataset_memory_efficient(folder_path: str, output_path: s
             "duration": datasets.Value("float32"),
             "total_frames": datasets.Value("int32"),
             "frame_interval": datasets.Value("int32"),
-            "mp4_file": datasets.Value("string"),
-            "keypoint_json": datasets.Value("string"),
-            "hdf5_file": datasets.Value("string")
+            # "mp4_file": datasets.Value("string"),
+            # "keypoint_json": datasets.Value("string"),
+            # "hdf5_file": datasets.Value("string")
         }
     })
     
+    # Choose the appropriate generator based on multiprocessing setting
+    if use_multiprocessing:
+        generator_func = lambda: dataset_generator_multiprocessing(
+            folder_path, recursive, frame_interval, num_processes, batch_size
+        )
+        print("Using multiprocessing for dataset generation")
+    else:
+        generator_func = lambda: dataset_generator(folder_path, recursive, frame_interval)
+        print("Using single-threaded dataset generation")
+    
     # Create dataset from generator
     dataset = datasets.Dataset.from_generator(
-        lambda: dataset_generator(folder_path, recursive, frame_interval),
+        generator_func,
         features=features
     )
     

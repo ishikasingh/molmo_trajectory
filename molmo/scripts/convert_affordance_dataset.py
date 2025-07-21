@@ -152,23 +152,31 @@ def read_file_set(mp4_path: str, keypoint_json_path: str, hdf5_path: str) -> Dic
         'metadata': metadata
     }
 
-def create_huggingface_dataset(folder_path: str, output_path: str, recursive: bool = True, frame_interval: int = 1):
+def create_huggingface_dataset(folder_path: str, output_path: str, images_output_path: str = None, recursive: bool = True, frame_interval: int = 1):
     """
     Create a HuggingFace dataset from the complete file sets.
     
     Args:
         folder_path: Path to the folder containing the data files
         output_path: Path where to save the HuggingFace dataset
+        images_output_path: Path where to save extracted images. If None, uses output_path/images
         recursive: Whether to search subdirectories recursively
         frame_interval: Process every n-th frame (1 = every frame, 2 = every 2nd frame, etc.)
     """
     import datasets
+    
+    # Set up images output directory
+    if images_output_path is None:
+        images_output_path = Path(output_path).parent / "images"
+    images_output_path = Path(images_output_path)
+    images_output_path.mkdir(parents=True, exist_ok=True)
     
     # Find all complete file sets
     file_sets = read_complete_file_sets(folder_path, recursive=recursive)
     
     print(f"Found {file_sets['total_complete']} complete file sets")
     print(f"Frame interval: {frame_interval} (processing every {frame_interval}{'st' if frame_interval == 1 else 'nd' if frame_interval == 2 else 'rd' if frame_interval == 3 else 'th'} frame)")
+    print(f"Images will be saved to: {images_output_path}")
     
     # Process each file set
     dataset_items = []
@@ -183,6 +191,10 @@ def create_huggingface_dataset(folder_path: str, output_path: str, recursive: bo
             file_set['hdf5_file']
         )
         
+        # Create directory for this video's frames
+        video_images_dir = images_output_path / f"video_{file_set['base_number']}"
+        video_images_dir.mkdir(exist_ok=True)
+        
         # Create dataset items for every n-th frame
         total_frames = len(file_data['frames'])
         selected_frames = 0
@@ -190,6 +202,16 @@ def create_huggingface_dataset(folder_path: str, output_path: str, recursive: bo
         for frame_idx in range(0, total_frames, frame_interval):
             frame = file_data['frames'][frame_idx]
             keypoints = file_data['keypoints'][frame_idx]
+            
+            # Save frame as image file
+            image_filename = f"frame_{frame_idx:06d}.jpg"
+            image_path = video_images_dir / image_filename
+            
+            # Save the frame as JPEG
+            frame.save(image_path, "JPEG", quality=95)
+            
+            # Create relative path for the dataset
+            relative_image_path = f"video_{file_set['base_number']}/{image_filename}"
             
             # Process keypoints to match the expected format
             hand_positions = process_keypoints_for_dataset(
@@ -200,10 +222,9 @@ def create_huggingface_dataset(folder_path: str, output_path: str, recursive: bo
             
             # Create dataset item
             item = {
-                "image": frame,  # PIL Image
+                "image_path": relative_image_path,  # Store path instead of PIL Image
                 "instruction": file_data['language_instruction'],
                 "hand_positions": hand_positions,
-                # "image_path": f"{file_set['base_number']}_frame_{frame_idx}.jpg",  # Virtual path
                 "metadata": {
                     "video_id": file_set['base_number'],
                     "frame_idx": frame_idx,
@@ -213,9 +234,7 @@ def create_huggingface_dataset(folder_path: str, output_path: str, recursive: bo
                     "duration": file_data['duration'],
                     "total_frames": total_frames,
                     "frame_interval": frame_interval,
-                    "mp4_file": file_set['mp4_file'],
-                    "keypoint_json": file_set['keypoint_json'],
-                    "hdf5_file": file_set['hdf5_file']
+                    "images_base_path": str(images_output_path),  # Store base path for loading images later
                 }
             }
             
@@ -232,6 +251,7 @@ def create_huggingface_dataset(folder_path: str, output_path: str, recursive: bo
     # Save to disk
     dataset.save_to_disk(output_path)
     print(f"Dataset saved to {output_path}")
+    print(f"Images saved to {images_output_path}")
     
     return dataset
 
@@ -321,6 +341,23 @@ def create_dataset_splits(dataset, output_path: str, splits: dict = None):
     
     return final_dataset
 
+def load_image_from_dataset_item(item, images_base_path: str = None):
+    """
+    Helper function to load an image from a dataset item.
+    
+    Args:
+        item: Dataset item containing image_path
+        images_base_path: Base path where images are stored. If None, uses the path from metadata
+        
+    Returns:
+        PIL Image object
+    """
+    if images_base_path is None:
+        images_base_path = item["metadata"]["images_base_path"]
+    
+    full_image_path = Path(images_base_path) / item["image_path"]
+    return Image.open(full_image_path)
+
 def create_dataset_example():
     """
     Complete example of creating a HuggingFace dataset from your data.
@@ -331,14 +368,16 @@ def create_dataset_example():
     # input_folder = "/root/sky_workdir/dataset/small_test"   
     output_dataset_path = "/root/sky_workdir/dataset/affordance_dataset"
     output_split_path = "/root/sky_workdir/dataset/affordance_dataset_splits"
+    images_output_path = "/root/sky_workdir/dataset/affordance_images"  # New: separate images directory
     
     # Step 2: Create the dataset
     print("Creating HuggingFace dataset...")
     dataset = create_huggingface_dataset(
         folder_path=input_folder,
         output_path=output_dataset_path,
+        images_output_path=images_output_path,  # New parameter
         recursive=True,
-        frame_interval=3  # Process every 5th frame - adjust this value as needed
+        frame_interval=5  # Process every 5th frame - adjust this value as needed
     )
     
     # Step 3: Create train/validation/test splits
@@ -354,8 +393,14 @@ def create_dataset_example():
     print(f"Dataset features: {dataset.features}")
     print(f"Sample item keys: {list(dataset[0].keys())}")
     print(f"Sample instruction: {dataset[0]['instruction']}")
+    print(f"Sample image_path: {dataset[0]['image_path']}")
     print(f"Sample hand_positions keys: {list(dataset[0]['hand_positions'].keys())}")
     print(f"Number of keypoints: {len(dataset[0]['hand_positions']['points'])}")
+    
+    # Example of how to load an image from the dataset
+    print("\nExample of loading an image:")
+    sample_image = load_image_from_dataset_item(dataset[0])
+    print(f"Loaded image size: {sample_image.size}")
     
     return split_dataset
 
