@@ -96,6 +96,26 @@ def gather_examples_as_html(
                 img.save(image_data, format='JPEG')
                 image_data = image_data.getvalue()
             image_src = f'data:image/jpeg;base64,{base64.b64encode(image_data).decode()}'
+        elif "image_path" in metadata:
+            # Handle image paths - need to construct full path and load image
+            if "images_base_path" in metadata:
+                # Use the base path from metadata
+                full_image_path = Path(metadata["images_base_path"]) / metadata["image_path"]
+            else:
+                # Try to construct path relative to common base paths
+                full_image_path = Path(metadata["image_path"])
+                if not full_image_path.is_absolute():
+                    raise ValueError(f"Image path {metadata['image_path']} is not absolute")
+
+            # Load image and convert to base64
+            if full_image_path.exists():
+                with Image.open(full_image_path) as img:
+                    image_data = io.BytesIO()
+                    img.save(image_data, format='JPEG')
+                    image_data = image_data.getvalue()
+                image_src = f'data:image/jpeg;base64,{base64.b64encode(image_data).decode()}'
+            else:
+                print(f"Warning: Image not found at {full_image_path}")
         if image_src is not None:
             ex_pred_points, gt_pred_points = None, None
             if pred_points is not None:
@@ -103,7 +123,7 @@ def gather_examples_as_html(
             if gt_points is not None:
                 gt_pred_points = gt_points[ix]
             if ex_pred_points is None and gt_pred_points is None:
-                row["image"] = f"<img style=\"max-height:500px;max-width:500px;height:auto;width:auto;\" src={image_src}><img>"
+                row["image"] = f"<img style=\"max-height:500px;max-width:500px;height:auto;width:auto;\" src='{image_src}'>"
             else:
                 to_show = []
                 if ex_pred_points is not None:

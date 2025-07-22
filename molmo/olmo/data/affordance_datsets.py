@@ -88,6 +88,7 @@ class HandPositioningDataset(Dataset):
                 }
             ],
             "metadata": {
+                "image": image,  # Add this line - put image in metadata too
                 "image_path": safe_get(example, "image_path", ""),
                 "hand_data": example["hand_positions"],  # Keep original for debugging
                 "video_id": safe_get(metadata, "video_id", ""),

@@ -1,6 +1,6 @@
 # Use the official NVIDIA CUDA base image for Ubuntu 22.04 with CUDA 12.2
 # FROM nvcr.io/nvidia/cuda:12.5.1-cudnn-devel-ubuntu22.04
-ARG CUDA_VERSION=12.6.0
+ARG CUDA_VERSION=12.8.1
 ARG UBUNTU_VERSION=24.04
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION}
 
@@ -21,16 +21,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     git \
     git-lfs \
-    iputils-ping \
-    iproute2 \
-    net-tools \
-    rsync \
-    screen \
     curl \
     wget \
-    libopenmpi-dev \
     vim \
-    openmpi-bin \    
     openssh-client \
     ca-certificates \
     unzip \
@@ -50,14 +43,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 #     WORKDIR /workspace
 
-ENV CUDA_HOME=/usr/local/cuda-12.6
+ENV CUDA_HOME=/usr/local/cuda-12.8
 ENV PATH=${CUDA_HOME}/bin:${PATH}
 ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 
 # Verify CUDA installation and add to bash profile
-RUN echo "export CUDA_HOME=/usr/local/cuda-12.6" >> /root/.bashrc && \
-    echo "export PATH=/usr/local/cuda-12.6/bin:\$PATH" >> /root/.bashrc && \
-    echo "export LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:\$LD_LIBRARY_PATH" >> /root/.bashrc
+RUN echo "export CUDA_HOME=/usr/local/cuda-12.8" >> /root/.bashrc && \
+    echo "export PATH=/usr/local/cuda-12.8/bin:\$PATH" >> /root/.bashrc && \
+    echo "export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:\$LD_LIBRARY_PATH" >> /root/.bashrc
 
     WORKDIR /workspace
 
