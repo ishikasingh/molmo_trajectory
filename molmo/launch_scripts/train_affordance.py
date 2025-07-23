@@ -22,6 +22,13 @@ from olmo.util import (
 )
 from scripts.train import main as train
 
+import os
+import torch
+
+# local_rank = int(os.environ.get("LOCAL_RANK", 0))
+# print(f"Setting device to {local_rank}")
+# torch.cuda.set_device(local_rank)
+
 log = logging.getLogger("train")
 
 
@@ -91,9 +98,9 @@ if __name__ == "__main__":
     parser.add_argument("--seq_len", default=2304, type=int)
     parser.add_argument("--inf_seq_len", default=1792, type=int)
     # parser.add_argument("--max_inf_examples", default=2048, type=int)
-    parser.add_argument("--max_inf_examples", default=64, type=int)
+    parser.add_argument("--max_inf_examples", default=32, type=int)
     # parser.add_argument("--global_batch_size", default=256, type=int)
-    parser.add_argument("--global_batch_size", default=64, type=int)
+    parser.add_argument("--global_batch_size", default=32, type=int)
     # parser.add_argument("--device_eval_batch_size", default=4, type=int)
     parser.add_argument("--device_eval_batch_size", default=2, type=int)
     # parser.add_argument("--device_inf_batch_size", default=4, type=int)
@@ -173,7 +180,7 @@ if __name__ == "__main__":
         eval_subset_batches = 4
     else:
         # eval_examples = 2048
-        eval_examples = 64
+        eval_examples = 32
         max_inf_examples = args.max_inf_examples
         log_interval = 20
         global_batch_size = args.global_batch_size

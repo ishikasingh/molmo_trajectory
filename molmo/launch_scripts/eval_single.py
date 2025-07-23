@@ -2,7 +2,7 @@ import argparse
 import torch
 from pathlib import Path
 import re
-
+import os
 from olmo.model import Molmo
 from olmo.data.model_preprocessor import load_image
 from olmo.data import build_mm_preprocessor
@@ -194,7 +194,9 @@ def main():
             
             # 11. Save the image with prompt as filename
             sanitized_prompt = sanitize_filename(prompt)
-            out_path = Path(f"{sanitized_prompt}_{idx+1}.jpg")
+            if not os.path.exists("temp_output"):
+                os.makedirs("temp_output")
+            out_path = Path(f"temp_output/{sanitized_prompt}_{idx+1}.jpg")
             image_pil.save(out_path)
             print(f"Saved image with points to {out_path}")
         else:
