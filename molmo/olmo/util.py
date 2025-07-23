@@ -913,3 +913,52 @@ def extract_points_from_point_count(text, image_w, image_h):
             point = point * np.array([image_w, image_h])
             all_points.append(point)
     return all_points
+
+
+def extract_points_no_filter(text, image_w, image_h):
+    all_points = []
+    for match in re.finditer(r"Click\(([0-9]+\.[0-9]), ?([0-9]+\.[0-9])\)", text):
+        try:
+            point = [float(match.group(i)) for i in range(1, 3)]
+        except ValueError:
+            pass
+        else:
+            point = np.array(point)
+            point /= 100.0
+            point = point * np.array([image_w, image_h])
+            all_points.append(point)
+
+    for match in re.finditer(r"\(([0-9]+\.[0-9]),? ?([0-9]+\.[0-9])\)", text):
+        try:
+            point = [float(match.group(i)) for i in range(1, 3)]
+        except ValueError:
+            pass
+        else:
+            point = np.array(point)
+            point /= 100.0
+            point = point * np.array([image_w, image_h])
+            all_points.append(point)
+    
+    for match in re.finditer(r'x\d*="\s*([0-9]+(?:\.[0-9]+)?)"\s+y\d*="\s*([0-9]+(?:\.[0-9]+)?)"', text):
+        try:
+            point = [float(match.group(i)) for i in range(1, 3)]
+        except ValueError:
+            pass
+        else:
+            point = np.array(point)
+            point /= 100.0
+            point = point * np.array([image_w, image_h])
+            all_points.append(point)
+    
+    for match in re.finditer(r'(?:\d+|p)\s*=\s*([0-9]{3})\s*,\s*([0-9]{3})', text):
+        try:
+            point = [int(match.group(i)) / 10.0 for i in range(1, 3)]
+        except ValueError:
+            pass
+        else:
+            point = np.array(point)
+            point /= 100.0
+            point = point * np.array([image_w, image_h])
+            all_points.append(point)
+    
+    return all_points

@@ -235,18 +235,18 @@ GENERAL_PROMPTS_V1 = {
         "Predict the hand keypoints for the task: {label}",
         "Show me where the hands should be positioned for the task: {label}",
         "Indicate the hand positions for the task: {label}",
-        "Point to where the hands should be placed for the task: {label}",
+        "Point to where the hands and fingers should be placed for the task: {label}",
         "Predict hand keypoints for the task: {label}",
-        "Where should the hands be positioned for the task: {label}?",
+        "Where should the hands be positioned for the task: {label}",
         "Show the hand positions needed for the task: {label}",
         "Indicate where the hands should be for the task: {label}",
-        "Predict the hand pose for the task: {label}",
+        "Predict the hand keypoints for the task: {label}",
         "Show me the hand keypoints for the task: {label}",
         "Mark the hand positions for the task: {label}",
         "Indicate the hand keypoints needed for the task: {label}",
         "Where should the hands be placed for the task: {label}?",
         "Show the predicted hand positions for the task: {label}",
-        "Point to the hand locations for the task: {label}",
+        "Point to the hand keypoint locations for the task: {label}",
         "Predict where the hands should be for the task: {label}",
         "Show me the hand affordance for the task: {label}",
         "Indicate the hand placement for the task: {label}",
@@ -331,13 +331,14 @@ class DataFormatter:
     debug: bool = False  # deterministic mode for debugging
     # debug_print_counter: int = 0  # Add this as a class attribute
 
-    def points_to_text(self, points, scale, label_text, alt_text):
+    def points_to_text(self, points, scale, label_text, alt_text, do_sort=True):
         if isinstance(scale, (tuple, list)):
             points /= np.array(scale)[None, :]
         else:
             points *= (100/scale)
         points = [[round(x, 1), round(y, 1)] for x, y in points]
-        points.sort(key=lambda x: x[0]*10000 + x[1])
+        if do_sort:
+            points.sort(key=lambda x: x[0]*10000 + x[1])
         if len(points) == 1:
             x_str, y_str = points[0]
             return f"<point x=\"{x_str:0.1f}\" y=\"{y_str:0.1f}\" alt=\"{alt_text}\">{label_text}</point>"
@@ -373,11 +374,17 @@ class DataFormatter:
                 raise NotImplementedError()
         if "point_scale" in example:
             # Points are already normalized
-            point_txt = self.points_to_text(points, example["point_scale"], label, label)
+            point_txt = self.points_to_text(
+                points, example["point_scale"], label, label,
+                do_sort=(style != "affordance")
+            )
         else:
             # Points are in pixel coordinate
             h, w = example["image"].shape[:2]
-            point_txt = self.points_to_text(points, [w/100, h/100], label, label)
+            point_txt = self.points_to_text(
+                points, [w/100, h/100], label, label,
+                do_sort=(style != "affordance")
+            )
 
         if style == "point_count":
             return f"Counting the {point_txt} shows a total of {len(points)}."
