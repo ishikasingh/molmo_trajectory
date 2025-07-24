@@ -1,29 +1,23 @@
 # Use the official NVIDIA CUDA base image for Ubuntu 22.04 with CUDA 12.2
 # FROM nvcr.io/nvidia/cuda:12.5.1-cudnn-devel-ubuntu22.04
-ARG CUDA_VERSION=12.8.1
+ARG CUDA_VERSION=12.6.3
 ARG UBUNTU_VERSION=24.04
 ARG TORCH_VERSION=2.6.0
 ARG PYTHON_VERSION=3.12.9
+ARG DOCKER_VERSION=28.0.4
 
 
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION} AS builder
 
 WORKDIR /root/
-# Set environment variables for non-interactive apt and PyTorch
-ENV LANG=C.UTF-8
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
-ENV NVIDIA_DRIVER_CAPABILITIES=all
-ENV NVIDIA_VISIBLE_DEVICES=all
 
 ADD https://bazel.build/bazel-release.pub.gpg .
 RUN echo "deb [arch=amd64] https://storage.googleapis.com/bazel-apt stable jdk1.8" >> /etc/apt/sources.list.d/bazel.list && \
     cat bazel-release.pub.gpg | apt-key add - && rm bazel-release.pub.gpg
 
+
 # Node
 RUN curl -sL https://deb.nodesource.com/setup_20.x | bash
-
-ARG DOCKER_VERSION=28.0.4
 
 ENV CMAKE_POLICY_VERSION_MINIMUM 3.5
 
@@ -64,6 +58,7 @@ RUN --mount=type=cache,target=/var/cache/apt --mount=type=cache,target=/var/lib/
     curl \
     emacs-nox \
     freeglut3-dev \
+    ffmpeg \
     gcc-12 \
     g++-12 \
     git \
@@ -80,11 +75,13 @@ RUN --mount=type=cache,target=/var/cache/apt --mount=type=cache,target=/var/lib/
     npm \
     ninja-build \
     less \
+    libaio-dev \
     libassimp-dev libopenmpi-dev liboctomap-dev libgomp1 libgl1 \
     libboost-all-dev \
     libeigen3-dev \
     libffi-dev \
     libflann-dev \
+    liblcm-dev \
     libleveldb-dev \
     liblmdb-dev \
     libglib2.0-0 \
@@ -109,6 +106,7 @@ RUN --mount=type=cache,target=/var/cache/apt --mount=type=cache,target=/var/lib/
     libstdc++-14-dev \
     libssl-dev \
     libtool \
+    libpng-dev \
     libpq-dev \
     libqhull-dev \
     liburdfdom-headers-dev \
@@ -125,10 +123,10 @@ RUN --mount=type=cache,target=/var/cache/apt --mount=type=cache,target=/var/lib/
     nodejs \
     openjdk-8-jdk \
     openmpi-bin \
-    openssh-client \
     postgresql \
     postgresql-contrib \
     psmisc \
+    retry \
     rsync \
     subversion \
     screen \
@@ -149,14 +147,14 @@ RUN --mount=type=cache,target=/var/cache/apt --mount=type=cache,target=/var/lib/
     # unzip -q awscliv2.zip && \
     # ./aws/install
 # Set CUDA environment variables (base image should have CUDA in /usr/local/cuda)
-ENV CUDA_HOME=/usr/local/cuda-12.8
+ENV CUDA_HOME=/usr/local/cuda-12.6
 ENV PATH=${CUDA_HOME}/bin:${PATH}
 ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 
 # # Verify CUDA installation and add to bash profile
-RUN echo "export CUDA_HOME=/usr/local/cuda-12.8" >> /root/.bashrc && \
-    echo "export PATH=/usr/local/cuda-12.8/bin:\$PATH" >> /root/.bashrc && \
-    echo "export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:\$LD_LIBRARY_PATH" >> /root/.bashrc
+RUN echo "export CUDA_HOME=/usr/local/cuda-12.6" >> /root/.bashrc && \
+    echo "export PATH=/usr/local/cuda-12.6/bin:\$PATH" >> /root/.bashrc && \
+    echo "export LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:\$LD_LIBRARY_PATH" >> /root/.bashrc
 
 #     WORKDIR /workspace
 ARG PYTHON_VERSION
@@ -266,6 +264,9 @@ RUN eval "$(~/miniconda3/bin/conda shell.bash hook)" && \
     pip install -e ".[train,serve]" && \
     pip uninstall -y torch torchvision && \
     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+ENV PATH=/root/.venv/bin/:$PATH
+ENV BAZEL_SH=/bin/bash
 
 ENTRYPOINT ["/bin/bash", "-c"]
 CMD ["bash"]
