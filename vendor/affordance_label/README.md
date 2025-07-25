@@ -1,14 +1,41 @@
 # Key Frame Detection for Affordance Dataset
 
-This script automatically detects key frames in video sequences based on hand keypoint velocities. Key frames are defined as frames where at least one hand has keypoints with velocities below a specified threshold.
+This script automatically detects key frames in video sequences based on hand velocity transitions. Key frames are defined as frames where at least one hand transitions from moving (velocity > threshold) to stationary (velocity <= threshold). This captures the moment when an action stops or pauses, rather than detecting frames where hands are already stationary.
 
 ## Features
 
-- **Hand-specific detection**: Separately analyzes left and right hand keypoints
-- **Flexible input**: Supports both JSON and HDF5 keypoint files
+- **Transition-based detection**: Detects when hands change from moving to stationary states
+- **Hand-specific analysis**: Separately analyzes left and right hand keypoints based on exact keypoint names from the affordance dataset
+- **HDF5 support**: Reads 3D keypoint trajectories from HDF5 files and projects them to 2D coordinates
+- **JSON support**: Also supports 2D keypoint data from JSON files
 - **Binary output**: Generates binary strings (e.g., "00011001") indicating key frames
 - **Video annotation**: Creates annotated videos with key frame indicators
 - **Detailed logging**: Provides comprehensive analysis results
+
+## Keypoint Structure
+
+The script is specifically designed for the affordance dataset with these hand keypoints:
+
+**Left Hand:**
+- `leftHand`, `leftThumbTip`, `leftIndexFingerTip`, `leftMiddleFingerTip`, `leftRingFingerTip`, `leftLittleFingerTip`
+
+**Right Hand:**
+- `rightHand`, `rightThumbTip`, `rightIndexFingerTip`, `rightMiddleFingerTip`, `rightRingFingerTip`, `rightLittleFingerTip`
+
+## HDF5 Data Structure
+
+The script expects HDF5 files with the following structure:
+```
+file.hdf5/
+├── transforms/
+│   ├── camera          # [T, 4, 4] camera poses
+│   ├── leftHand        # [T, 4, 4] transformation matrices
+│   ├── leftThumbTip    # [T, 4, 4] transformation matrices
+│   ├── rightHand       # [T, 4, 4] transformation matrices
+│   └── ...             # Other keypoint trajectories
+```
+
+Each keypoint has a 4x4 transformation matrix per frame, where the 3D position is extracted from the translation component `[:3, 3]` and then projected to 2D coordinates using camera intrinsics.
 
 ## Installation
 
@@ -116,17 +143,32 @@ Example: `"00011001"` means frames 2, 3, and 6 are key frames.
 
 ## Key Frame Detection Logic
 
-1. **Velocity Calculation**: For each keypoint, calculate the Euclidean distance between consecutive frames
-2. **Hand Classification**: Identify which keypoints belong to left/right hands using pattern matching
-3. **Threshold Comparison**: Compare velocities against the specified threshold
-4. **Frame Classification**: A frame is marked as a key frame if at least one hand has all keypoints below the velocity threshold
+1. **3D to 2D Projection**: For HDF5 files, extract 3D positions from transformation matrices and project to 2D using camera intrinsics
+2. **Velocity Calculation**: For each keypoint, calculate the Euclidean distance between consecutive frames
+3. **Hand State Analysis**: For each hand, determine if it's "moving" or "stationary" based on velocity thresholds:
+   - **Moving**: Majority (≥50%) of hand keypoints have velocity > threshold
+   - **Stationary**: Majority (≥50%) of hand keypoints have velocity ≤ threshold
+4. **Transition Detection**: A frame is marked as a key frame if at least one hand transitions from moving to stationary
+5. **Frame Classification**: Key frames represent moments when hands stop moving (action endpoints)
 
-### Hand Keypoint Patterns
+### Key Frame Definition
 
-The script recognizes these patterns as hand keypoints:
-- `left_hand`, `lefthand`, `left_wrist`, `left_thumb`, etc.
-- `right_hand`, `righthand`, `right_wrist`, `right_thumb`, etc.
-- Generic patterns: `hand`, `wrist`, `thumb`, `index`, `middle`, `ring`, `pinky`
+**Key Frame = Transition from Moving → Stationary**
+
+- ✅ Hand was moving in previous frame AND is stationary in current frame
+- ❌ Hand is stationary in both frames (not a transition)
+- ❌ Hand is moving in both frames (no transition)
+- ❌ Hand transitions from stationary to moving (start of movement, not endpoint)
+
+This approach captures meaningful action boundaries where hands come to rest, indicating completion of manipulation tasks.
+
+### Hand Keypoint Groupings
+
+**Left Hand Keypoints:**
+- `leftHand`, `leftThumbTip`, `leftIndexFingerTip`, `leftMiddleFingerTip`, `leftRingFingerTip`, `leftLittleFingerTip`
+
+**Right Hand Keypoints:**  
+- `rightHand`, `rightThumbTip`, `rightIndexFingerTip`, `rightMiddleFingerTip`, `rightRingFingerTip`, `rightLittleFingerTip`
 
 ## Example Workflow
 
@@ -150,8 +192,25 @@ The script recognizes these patterns as hand keypoints:
 
 ### Adjusting Sensitivity
 
-- **Lower threshold** (e.g., 1.0): More sensitive, detects more key frames
-- **Higher threshold** (e.g., 10.0): Less sensitive, detects fewer key frames
+- **Lower threshold** (e.g., 1.0): More sensitive, detects smaller movements as "moving" state
+- **Higher threshold** (e.g., 10.0): Less sensitive, requires larger movements to be considered "moving"
+
+**Typical values:**
+- `--velocity_threshold 3.0`: Good for precise manipulation tasks
+- `--velocity_threshold 5.0`: Good balance for general actions  
+- `--velocity_threshold 10.0`: For detecting only major movements
+
+### Expected Results
+
+Key frames should correspond to:
+- End of reaching motions
+- Completion of grasping actions
+- Moments when objects are placed down
+- Pauses between manipulation steps
+
+Key frames should NOT be detected during:
+- Continuous movement phases
+- Static periods where hands don't move at all
 
 ### Performance Tips
 
@@ -161,10 +220,26 @@ The script recognizes these patterns as hand keypoints:
 
 ## Testing
 
-Use the provided test script to verify the setup:
+Use the provided test script to verify the setup and see detection results:
 
 ```bash
+# Test with a specific dataset folder
+python test_keyframe_detection.py /path/to/your/dataset
+
+# Or run without arguments and edit the script to set the path
 python test_keyframe_detection.py
 ```
 
-Update the `data_folder` path in the test script to point to your dataset.
+The test script will:
+1. Find all episodes in your dataset
+2. Test key frame detection on the first few episodes
+3. Show detailed results including keypoint velocities and detection statistics
+4. Verify that the HDF5 structure is correctly read
+
+## Full Pipeline
+
+Once testing is successful, run the full pipeline:
+
+```bash
+python key_frame_extract.py --data_folder /path/to/dataset --output_folder ./results --create_videos --velocity_threshold 5.0
+```

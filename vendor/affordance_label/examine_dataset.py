@@ -55,7 +55,7 @@ def examine_json_keypoints(json_path: Path):
                     break
 
 def examine_hdf5_keypoints(hdf5_path: Path):
-    """Examine HDF5 keypoint file structure."""
+    """Examine HDF5 keypoint file structure for affordance dataset."""
     print(f"Examining HDF5 file: {hdf5_path}")
     
     with h5py.File(hdf5_path, 'r') as f:
@@ -73,25 +73,80 @@ def examine_hdf5_keypoints(hdf5_path: Path):
         print(f"  Root attributes: {list(f.attrs.keys())}")
         for attr_name in f.attrs.keys():
             print(f"    {attr_name}: {f.attrs[attr_name]}")
+        
+        # Specifically check for transforms structure
+        if 'transforms' in f:
+            print(f"\n  Transforms structure:")
+            transforms = f['transforms']
+            for key in transforms.keys():
+                dataset = transforms[key]
+                print(f"    {key}: shape={dataset.shape}, dtype={dataset.dtype}")
+                
+                # Show sample transformation matrix for first frame
+                if len(dataset) > 0:
+                    print(f"      First frame transformation matrix:")
+                    first_transform = dataset[0]
+                    if len(first_transform.shape) == 2 and first_transform.shape == (4, 4):
+                        print(f"        Translation: {first_transform[:3, 3]}")
+                        print(f"        Rotation (first row): {first_transform[0, :3]}")
+                    else:
+                        print(f"        Shape: {first_transform.shape}")
+        else:
+            print(f"  Warning: No 'transforms' group found!")
+            
+        # Check specifically for hand keypoints
+        hand_keypoints = [
+            'leftHand', 'leftThumbTip', 'leftIndexFingerTip', 'leftMiddleFingerTip', 
+            'leftRingFingerTip', 'leftLittleFingerTip', 'rightHand', 'rightThumbTip', 
+            'rightIndexFingerTip', 'rightMiddleFingerTip', 'rightRingFingerTip', 
+            'rightLittleFingerTip', 'camera'
+        ]
+        
+        if 'transforms' in f:
+            transforms = f['transforms']
+            found_keypoints = []
+            missing_keypoints = []
+            
+            for kp in hand_keypoints:
+                if kp in transforms:
+                    found_keypoints.append(kp)
+                else:
+                    missing_keypoints.append(kp)
+            
+            print(f"\n  Hand keypoints analysis:")
+            print(f"    Found ({len(found_keypoints)}): {found_keypoints}")
+            if missing_keypoints:
+                print(f"    Missing ({len(missing_keypoints)}): {missing_keypoints}")
 
 def find_hand_keypoints_in_data(keypoints_dict: dict):
     """
     Analyze a keypoints dictionary to find hand-related keypoints.
+    Updated for affordance dataset keypoint names.
     
     Args:
         keypoints_dict: Dictionary of keypoint names and coordinates
     """
     hand_keypoints = []
     
+    # Expected hand keypoints from affordance dataset
+    expected_hand_keypoints = [
+        'leftHand', 'leftThumbTip', 'leftIndexFingerTip', 'leftMiddleFingerTip', 
+        'leftRingFingerTip', 'leftLittleFingerTip', 'rightHand', 'rightThumbTip', 
+        'rightIndexFingerTip', 'rightMiddleFingerTip', 'rightRingFingerTip', 
+        'rightLittleFingerTip'
+    ]
+    
     for keypoint_name in keypoints_dict.keys():
-        name_lower = keypoint_name.lower()
-        
-        # Check for hand-related keywords
-        hand_keywords = ['hand', 'wrist', 'thumb', 'index', 'middle', 'ring', 'pinky', 
-                        'finger', 'palm', 'left', 'right']
-        
-        if any(keyword in name_lower for keyword in hand_keywords):
+        if keypoint_name in expected_hand_keypoints:
             hand_keypoints.append(keypoint_name)
+        else:
+            # Check for hand-related keywords as fallback
+            name_lower = keypoint_name.lower()
+            hand_keywords = ['hand', 'wrist', 'thumb', 'index', 'middle', 'ring', 'pinky', 
+                            'finger', 'palm', 'left', 'right']
+            
+            if any(keyword in name_lower for keyword in hand_keywords):
+                hand_keypoints.append(keypoint_name)
     
     return hand_keypoints
 

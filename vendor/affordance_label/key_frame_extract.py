@@ -2,9 +2,9 @@
 """
 Key Frame Extraction Script
 
-This script detects key frames based on hand keypoint velocities.
-Key frames are defined as frames where at least one hand has keypoints 
-with velocities below a certain threshold.
+This script detects key frames based on hand velocity transitions.
+Key frames are defined as frames where at least one hand transitions from 
+moving (velocity > threshold) to stationary (velocity <= threshold).
 
 Author: AI Assistant
 Date: 2025-07-24
@@ -24,7 +24,8 @@ import argparse
 
 class KeyFrameDetector:
     """
-    A class to detect key frames based on hand keypoint velocities.
+    A class to detect key frames based on hand velocity transitions.
+    Key frames are detected when hands transition from moving to stationary.
     """
     
     def __init__(self, velocity_threshold: float = 5.0, fps: int = 30):
@@ -57,6 +58,11 @@ class KeyFrameDetector:
                 curr_pos = keypoints_current[keypoint_name]
                 prev_pos = keypoints_previous[keypoint_name]
                 
+                # Skip if either position is None (missing data)
+                if curr_pos is None or prev_pos is None:
+                    velocities[keypoint_name] = float('inf')
+                    continue
+                
                 # Handle different possible data structures
                 if isinstance(curr_pos, list) and len(curr_pos) >= 2:
                     curr_x, curr_y = curr_pos[0], curr_pos[1]
@@ -74,9 +80,16 @@ class KeyFrameDetector:
                     velocities[keypoint_name] = float('inf')  # Invalid data
                     continue
                 
-                # Calculate Euclidean distance (velocity)
-                velocity = np.sqrt((curr_x - prev_x)**2 + (curr_y - prev_y)**2)
-                velocities[keypoint_name] = velocity
+                # Check for valid numeric values
+                try:
+                    curr_x, curr_y = float(curr_x), float(curr_y)
+                    prev_x, prev_y = float(prev_x), float(prev_y)
+                    
+                    # Calculate Euclidean distance (velocity)
+                    velocity = np.sqrt((curr_x - prev_x)**2 + (curr_y - prev_y)**2)
+                    velocities[keypoint_name] = velocity
+                except (ValueError, TypeError):
+                    velocities[keypoint_name] = float('inf')  # Invalid numeric data
             else:
                 velocities[keypoint_name] = float('inf')  # Missing data
                 
@@ -85,6 +98,9 @@ class KeyFrameDetector:
     def is_hand_keypoint(self, keypoint_name: str) -> Tuple[bool, str]:
         """
         Check if a keypoint belongs to a hand and which hand.
+        Based on JOINT_NAMES_OF_INTEREST from label_affordance.py:
+        ['leftHand', 'leftThumbTip', 'leftIndexFingerTip', 'leftMiddleFingerTip', 'leftRingFingerTip', 'leftLittleFingerTip',
+         'rightHand', 'rightThumbTip', 'rightIndexFingerTip', 'rightMiddleFingerTip', 'rightRingFingerTip', 'rightLittleFingerTip']
         
         Args:
             keypoint_name: Name of the keypoint
@@ -92,30 +108,36 @@ class KeyFrameDetector:
         Returns:
             Tuple of (is_hand_keypoint, hand_side) where hand_side is 'left' or 'right'
         """
+        # Exact patterns from label_affordance.py
+        left_hand_keypoints = [
+            'leftHand', 'leftThumbTip', 'leftIndexFingerTip', 'leftMiddleFingerTip', 
+            'leftRingFingerTip', 'leftLittleFingerTip'
+        ]
+        
+        right_hand_keypoints = [
+            'rightHand', 'rightThumbTip', 'rightIndexFingerTip', 'rightMiddleFingerTip',
+            'rightRingFingerTip', 'rightLittleFingerTip'
+        ]
+        
+        if keypoint_name in left_hand_keypoints:
+            return True, 'left'
+        elif keypoint_name in right_hand_keypoints:
+            return True, 'right'
+        
+        # Fallback to pattern matching for compatibility
         keypoint_lower = keypoint_name.lower()
-        
-        # Common hand keypoint patterns
-        left_patterns = ['left_hand', 'lefthand', 'left_wrist', 'leftwrist', 'left_thumb', 'left_index', 'left_middle', 'left_ring', 'left_pinky']
-        right_patterns = ['right_hand', 'righthand', 'right_wrist', 'rightwrist', 'right_thumb', 'right_index', 'right_middle', 'right_ring', 'right_pinky']
-        
-        for pattern in left_patterns:
-            if pattern in keypoint_lower:
-                return True, 'left'
-                
-        for pattern in right_patterns:
-            if pattern in keypoint_lower:
-                return True, 'right'
-                
-        # Generic hand patterns
-        if 'hand' in keypoint_lower or 'wrist' in keypoint_lower or 'thumb' in keypoint_lower or \
-           'index' in keypoint_lower or 'middle' in keypoint_lower or 'ring' in keypoint_lower or 'pinky' in keypoint_lower:
-            return True, 'unknown'
+        if keypoint_lower.startswith('left') and ('hand' in keypoint_lower or 'finger' in keypoint_lower or 'thumb' in keypoint_lower):
+            return True, 'left'
+        elif keypoint_lower.startswith('right') and ('hand' in keypoint_lower or 'finger' in keypoint_lower or 'thumb' in keypoint_lower):
+            return True, 'right'
             
         return False, ''
     
     def detect_keyframes_from_velocities(self, all_keypoints: List[Dict]) -> List[bool]:
         """
-        Detect key frames based on hand keypoint velocities.
+        Detect key frames based on hand velocity transitions.
+        A frame is considered a key frame if at least one hand transitions from moving 
+        (velocity > threshold) to stationary (velocity <= threshold).
         
         Args:
             all_keypoints: List of keypoint dictionaries for each frame
@@ -123,37 +145,91 @@ class KeyFrameDetector:
         Returns:
             List of boolean values indicating whether each frame is a key frame
         """
-        if len(all_keypoints) < 2:
+        if len(all_keypoints) < 3:  # Need at least 3 frames to detect transitions
             return [False] * len(all_keypoints)
             
-        keyframe_flags = [False]  # First frame is not a keyframe (no previous frame)
+        keyframe_flags = [False, False]  # First two frames cannot be keyframes
         
-        for frame_idx in range(1, len(all_keypoints)):
+        # Hand keypoint groupings
+        left_hand_keypoints = [
+            'leftHand', 'leftThumbTip', 'leftIndexFingerTip', 'leftMiddleFingerTip', 
+            'leftRingFingerTip', 'leftLittleFingerTip'
+        ]
+        
+        right_hand_keypoints = [
+            'rightHand', 'rightThumbTip', 'rightIndexFingerTip', 'rightMiddleFingerTip',
+            'rightRingFingerTip', 'rightLittleFingerTip'
+        ]
+        
+        # Track hand states for previous frame
+        prev_left_hand_moving = None
+        prev_right_hand_moving = None
+        
+        for frame_idx in range(2, len(all_keypoints)):  # Start from frame 2
             current_keypoints = all_keypoints[frame_idx]
             previous_keypoints = all_keypoints[frame_idx - 1]
+            prev_prev_keypoints = all_keypoints[frame_idx - 2]
             
-            # Calculate velocities for all keypoints
-            velocities = self.calculate_keypoint_velocity(current_keypoints, previous_keypoints)
+            # Calculate velocities between current and previous frame
+            curr_velocities = self.calculate_keypoint_velocity(current_keypoints, previous_keypoints)
             
-            # Check if any hand has low velocity keypoints
-            left_hand_low_velocity = False
-            right_hand_low_velocity = False
+            # Calculate velocities between previous and frame before that
+            prev_velocities = self.calculate_keypoint_velocity(previous_keypoints, prev_prev_keypoints)
             
-            for keypoint_name, velocity in velocities.items():
-                is_hand, hand_side = self.is_hand_keypoint(keypoint_name)
-                
-                if is_hand and velocity <= self.velocity_threshold:
-                    if hand_side == 'left':
-                        left_hand_low_velocity = True
-                    elif hand_side == 'right':
-                        right_hand_low_velocity = True
-                    elif hand_side == 'unknown':
-                        # If we can't determine the hand side, consider it as both
-                        left_hand_low_velocity = True
-                        right_hand_low_velocity = True
+            # Analyze left hand current state
+            left_hand_velocities_curr = []
+            for kp in left_hand_keypoints:
+                if kp in curr_velocities and curr_velocities[kp] != float('inf'):
+                    left_hand_velocities_curr.append(curr_velocities[kp])
             
-            # Frame is a keyframe if at least one hand has low velocity
-            is_keyframe = left_hand_low_velocity or right_hand_low_velocity
+            # Analyze left hand previous state
+            left_hand_velocities_prev = []
+            for kp in left_hand_keypoints:
+                if kp in prev_velocities and prev_velocities[kp] != float('inf'):
+                    left_hand_velocities_prev.append(prev_velocities[kp])
+            
+            # Analyze right hand current state
+            right_hand_velocities_curr = []
+            for kp in right_hand_keypoints:
+                if kp in curr_velocities and curr_velocities[kp] != float('inf'):
+                    right_hand_velocities_curr.append(curr_velocities[kp])
+            
+            # Analyze right hand previous state
+            right_hand_velocities_prev = []
+            for kp in right_hand_keypoints:
+                if kp in prev_velocities and prev_velocities[kp] != float('inf'):
+                    right_hand_velocities_prev.append(prev_velocities[kp])
+            
+            # Determine current hand states (moving vs stationary)
+            left_hand_moving_curr = False
+            right_hand_moving_curr = False
+            left_hand_moving_prev = False
+            right_hand_moving_prev = False
+            
+            # Current frame: hand is moving if majority of keypoints exceed threshold
+            if left_hand_velocities_curr:
+                moving_count = sum(1 for v in left_hand_velocities_curr if v > self.velocity_threshold)
+                left_hand_moving_curr = moving_count >= len(left_hand_velocities_curr) * 0.8
+            
+            if right_hand_velocities_curr:
+                moving_count = sum(1 for v in right_hand_velocities_curr if v > self.velocity_threshold)
+                right_hand_moving_curr = moving_count >= len(right_hand_velocities_curr) * 0.8
+            
+            # Previous frame: hand was moving if majority of keypoints exceeded threshold
+            if left_hand_velocities_prev:
+                moving_count = sum(1 for v in left_hand_velocities_prev if v > self.velocity_threshold)
+                left_hand_moving_prev = moving_count >= len(left_hand_velocities_prev) * 0.8
+            
+            if right_hand_velocities_prev:
+                moving_count = sum(1 for v in right_hand_velocities_prev if v > self.velocity_threshold)
+                right_hand_moving_prev = moving_count >= len(right_hand_velocities_prev) * 0.8
+            
+            # Detect transitions: moving -> stationary
+            left_hand_transition = left_hand_moving_prev and not left_hand_moving_curr
+            right_hand_transition = right_hand_moving_prev and not right_hand_moving_curr
+            
+            # Frame is a keyframe if at least one hand transitions from moving to stationary
+            is_keyframe = left_hand_transition or right_hand_transition
             keyframe_flags.append(is_keyframe)
             
         return keyframe_flags
@@ -179,41 +255,107 @@ class KeyFrameDetector:
     
     def read_keypoints_from_hdf5(self, hdf5_path: str) -> List[Dict]:
         """
-        Read keypoints from HDF5 file.
+        Read keypoints from HDF5 file using the same structure as label_affordance.py.
         
         Args:
             hdf5_path: Path to the HDF5 file
             
         Returns:
-            List of keypoint dictionaries for each frame
+            List of keypoint dictionaries for each frame with 2D projected coordinates
         """
+        # Hand keypoint names from label_affordance.py
+        JOINT_NAMES_OF_INTEREST = [
+            'leftHand', 'leftThumbTip', 'leftIndexFingerTip', 'leftMiddleFingerTip', 
+            'leftRingFingerTip', 'leftLittleFingerTip', 'rightHand', 'rightThumbTip', 
+            'rightIndexFingerTip', 'rightMiddleFingerTip', 'rightRingFingerTip', 
+            'rightLittleFingerTip', 'camera'
+        ]
+        
+        # Default camera intrinsics from label_affordance.py
+        DEFAULT_INTRINSIC = np.array([
+            [736.6339, 0., 960.], 
+            [0., 736.6339, 540.], 
+            [0., 0., 1.]
+        ])
+        
         keypoints_list = []
         
         with h5py.File(hdf5_path, 'r') as f:
-            # Try different possible structures in HDF5
-            if 'keypoints' in f:
-                keypoints_data = f['keypoints'][:]
-                # Convert to list of dictionaries
-                for frame_keypoints in keypoints_data:
-                    # This depends on the exact structure of your HDF5 file
-                    # You may need to adjust this based on your data format
-                    keypoints_list.append(frame_keypoints)
-            elif 'frame_keypoints' in f:
-                frame_keypoints = f['frame_keypoints']
-                for frame_idx in range(len(frame_keypoints)):
-                    keypoints_list.append(dict(frame_keypoints[frame_idx]))
-            else:
-                # Try to find any dataset that might contain keypoints
-                def find_keypoints(name, obj):
-                    if isinstance(obj, h5py.Dataset) and 'keypoint' in name.lower():
-                        keypoints_list.extend(obj[:])
+            if 'transforms' not in f:
+                raise ValueError(f"Expected 'transforms' key in HDF5 file: {hdf5_path}")
+            
+            keypoints_traj = f['transforms']
+            
+            # Load camera trajectory
+            if 'camera' not in keypoints_traj:
+                raise ValueError(f"Expected 'camera' trajectory in transforms: {hdf5_path}")
+            
+            camera_traj = keypoints_traj['camera'][:]  # [T, 4, 4]
+            
+            # Load keypoint trajectories for joints of interest
+            joint_trajectories = {}
+            for joint_name in JOINT_NAMES_OF_INTEREST:
+                if joint_name in keypoints_traj and joint_name != 'camera':
+                    joint_trajectories[joint_name] = keypoints_traj[joint_name][:]  # [T, 4, 4]
+            
+            # Convert 3D trajectories to 2D keypoints for each frame
+            num_frames = len(camera_traj)
+            
+            for frame_idx in range(num_frames):
+                frame_keypoints_2d = {}
+                current_camera_pose = camera_traj[frame_idx]
                 
-                f.visititems(find_keypoints)
+                for joint_name, trajectory in joint_trajectories.items():
+                    if frame_idx < len(trajectory):
+                        # Extract 3D position from transformation matrix
+                        transform_matrix = trajectory[frame_idx]  # [4, 4]
+                        pos_3d = transform_matrix[:3, 3]  # Extract translation part
+                        
+                        # Project 3D to 2D
+                        pos_2d = self.project_3d_to_2d(
+                            pos_3d.reshape(1, 3), 
+                            current_camera_pose, 
+                            DEFAULT_INTRINSIC
+                        )[0]  # Get first (and only) point
+                        
+                        frame_keypoints_2d[joint_name] = [float(pos_2d[0]), float(pos_2d[1])]
+                    else:
+                        frame_keypoints_2d[joint_name] = None
                 
-                if not keypoints_list:
-                    raise ValueError(f"Could not find keypoints data in HDF5 file: {hdf5_path}")
+                keypoints_list.append(frame_keypoints_2d)
         
         return keypoints_list
+    
+    def project_3d_to_2d(self, points_3d: np.ndarray, camera_pose: np.ndarray, intrinsic_matrix: np.ndarray) -> np.ndarray:
+        """
+        Project 3D points to 2D using camera pose and intrinsic matrix.
+        Based on the implementation in label_affordance.py.
+        
+        Args:
+            points_3d: 3D points in world coordinates [N, 3]
+            camera_pose: Camera pose transformation matrix [4, 4]
+            intrinsic_matrix: Camera intrinsic matrix [3, 3]
+        
+        Returns:
+            2D projected points [N, 2]
+        """
+        # Convert 3D points to homogeneous coordinates
+        points_3d_homo = np.concatenate([points_3d, np.ones((points_3d.shape[0], 1))], axis=1)
+        
+        # Transform points to camera coordinate system
+        # Note: camera_pose is world-to-camera transform, so we use it directly
+        world_to_camera = np.linalg.inv(camera_pose)
+        points_cam = (world_to_camera @ points_3d_homo.T).T
+        
+        # Extract 3D coordinates in camera frame
+        points_cam_3d = points_cam[:, :3]
+        
+        # Project to 2D using intrinsic matrix
+        points_2d_homo = (intrinsic_matrix @ points_cam_3d.T).T
+        
+        # Convert from homogeneous to 2D coordinates
+        points_2d = points_2d_homo[:, :2] / points_2d_homo[:, 2:3]
+        return points_2d
     
     def process_episode(self, mp4_path: str, keypoints_source: str) -> Tuple[List[bool], int]:
         """
@@ -264,16 +406,28 @@ class KeyFrameDetector:
         # Convert boolean flags to binary string (like "00011001")
         binary_string = ''.join('1' if flag else '0' for flag in keyframe_flags)
         
+        # Calculate transition intervals
+        transition_indices = [i for i, flag in enumerate(keyframe_flags) if flag]
+        transition_intervals = []
+        if len(transition_indices) > 1:
+            transition_intervals = [transition_indices[i+1] - transition_indices[i] 
+                                   for i in range(len(transition_indices)-1)]
+        
         # Create detailed output
         output_data = {
             'episode_id': episode_id,
             'total_frames': len(keyframe_flags),
             'keyframe_count': sum(keyframe_flags),
             'keyframe_binary': binary_string,
-            'keyframe_indices': [i for i, flag in enumerate(keyframe_flags) if flag],
+            'keyframe_indices': transition_indices,
+            'transition_intervals': transition_intervals,
+            'average_interval': sum(transition_intervals) / len(transition_intervals) if transition_intervals else 0,
+            'detection_method': 'velocity_transition',
+            'description': 'Key frames represent transitions from moving to stationary hand states',
             'parameters': {
                 'velocity_threshold': self.velocity_threshold,
-                'fps': self.fps
+                'fps': self.fps,
+                'detection_type': 'moving_to_stationary_transition'
             }
         }
         
@@ -312,8 +466,10 @@ class KeyFrameDetector:
             # Add annotation if this is a key frame
             if frame_idx < len(keyframe_flags) and keyframe_flags[frame_idx]:
                 # Add text overlay
-                cv2.putText(frame, 'KEY FRAME', (50, font_size + 20), 
+                cv2.putText(frame, 'TRANSITION', (50, font_size + 20), 
                            cv2.FONT_HERSHEY_SIMPLEX, font_size/30, (0, 255, 0), 3)
+                cv2.putText(frame, 'KEY FRAME', (50, font_size + 60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, font_size/40, (0, 255, 0), 2)
                 
                 # Add a colored border
                 cv2.rectangle(frame, (0, 0), (width-1, height-1), (0, 255, 0), 5)
@@ -369,11 +525,11 @@ def main():
     """
     Main function to run key frame detection on a dataset.
     """
-    parser = argparse.ArgumentParser(description='Extract key frames based on hand keypoint velocities')
+    parser = argparse.ArgumentParser(description='Extract key frames based on hand velocity transitions (moving to stationary)')
     parser.add_argument('--data_folder', required=True, help='Path to folder containing episode data')
     parser.add_argument('--output_folder', required=True, help='Path to save output files')
     parser.add_argument('--velocity_threshold', type=float, default=5.0, 
-                       help='Maximum velocity (pixels/frame) for keypoint to be considered stationary')
+                       help='Velocity threshold (pixels/frame) for detecting moving vs stationary states')
     parser.add_argument('--fps', type=int, default=30, help='Video frame rate')
     parser.add_argument('--create_videos', action='store_true', 
                        help='Create annotated videos showing key frames')
