@@ -6,5 +6,5 @@ torchrun \
     --nnodes=${SKYPILOT_NUM_NODES:-1} \
     --master_addr=${SKYPILOT_MASTER_ADDR:-localhost} \
     --master_port=9009 \
-    bazel-bin/covariant/models/llm/scripts/nccl_test \
+    /root/sky_workdir/FAR-affordance/nccl_test.py \
     $@
