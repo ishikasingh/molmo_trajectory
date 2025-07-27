@@ -98,15 +98,16 @@ if __name__ == "__main__":
     parser.add_argument("--seq_len", default=2304, type=int)
     parser.add_argument("--inf_seq_len", default=1792, type=int)
     # parser.add_argument("--max_inf_examples", default=2048, type=int)
-    parser.add_argument("--max_inf_examples", default=32, type=int)
+    parser.add_argument("--max_inf_examples", default=64, type=int)
     # parser.add_argument("--global_batch_size", default=256, type=int)
-    parser.add_argument("--global_batch_size", default=32, type=int)
+    parser.add_argument("--global_batch_size", default=64, type=int)
     # parser.add_argument("--device_eval_batch_size", default=4, type=int)
     parser.add_argument("--device_eval_batch_size", default=2, type=int)
     # parser.add_argument("--device_inf_batch_size", default=4, type=int)
     parser.add_argument("--device_inf_batch_size", default=2, type=int)
     # parser.add_argument("--device_train_batch_size", default=2, type=int)
     parser.add_argument("--device_train_batch_size", default=2, type=int)
+    parser.add_argument("--debug", default=False, action="store_true")
     args, other_args = parser.parse_known_args()
 
     if args.mixture.startswith("single"):
@@ -156,10 +157,15 @@ if __name__ == "__main__":
     elif args.mixture == "affordance":
         eval_tasks = ["affordance_eval"]
         tasks = [["train", ["affordance"], 1.0]]
+    elif args.mixture == "robo_casa_affordance":
+        # eval_tasks = ["robo_casa_affordance"]
+        eval_tasks = []
+        tasks = [["train", ["robo_casa_affordance"], 1.0]]
     else:
         raise NotImplementedError(args.mixture)
 
-    debug = args.checkpoint in ["debug", "debug2"]
+    # debug = args.checkpoint in ["debug", "debug2"] or args.debug
+    debug = args.debug
     if debug:
         model_cfg = DEBUG_MODEL
         if args.checkpoint == "debug2":

@@ -16,6 +16,7 @@ from olmo.data.pixmo_datasets import PixMoPointExplanations as PixMoPointExplana
     PixMoDocs, PixMoCount, PixMoPoints, PixMoCapQa, PixMoCap, PixMoPointExplanations, \
     PixMoAskModelAnything, PixMoPointsEval
 from olmo.data.affordance_datsets import HandPositioningDataset
+from olmo.data.robo_casa_affordance_datasets import RobotCasaHandPositioningDataset
 from olmo.torch_util import get_global_rank, get_world_size
 
 log = logging.getLogger(__name__)
@@ -320,6 +321,8 @@ def get_dataset_by_name(dataset_name, split):
     elif dataset_name == "affordance":
         data_path = os.environ.get("AFFORDANCE_DATA_PATH")
         return HandPositioningDataset(data_path=data_path, split=split)
+    elif dataset_name == "robo_casa_affordance":
+        return RobotCasaHandPositioningDataset(split=split)
     elif dataset_name == "affordance_eval":
         assert split == "validation"
         data_path = os.environ.get("AFFORDANCE_DATA_PATH")

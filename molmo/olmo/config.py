@@ -1283,7 +1283,8 @@ class FSDPConfig(BaseConfig):
     This must be ``True`` if using ``compile`` or you want to track the parameter norm during training.
     """
 
-    sharding_strategy: ShardingStrategy = ShardingStrategy.FULL_SHARD
+    # sharding_strategy: ShardingStrategy = ShardingStrategy.FULL_SHARD
+    sharding_strategy: ShardingStrategy = ShardingStrategy.HYBRID_SHARD
 
     wrapping_strategy: Optional[FSDPWrapStrategy] = None
     """
