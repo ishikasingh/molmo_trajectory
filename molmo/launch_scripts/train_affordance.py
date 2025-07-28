@@ -108,6 +108,8 @@ if __name__ == "__main__":
     # parser.add_argument("--device_train_batch_size", default=2, type=int)
     parser.add_argument("--device_train_batch_size", default=2, type=int)
     parser.add_argument("--debug", default=False, action="store_true")
+    parser.add_argument("--finetune", default=False, action="store_true",
+                        help="whether it is a finetuning or post-training run")
     args, other_args = parser.parse_known_args()
 
     if args.mixture.startswith("single"):
@@ -167,14 +169,18 @@ if __name__ == "__main__":
     # debug = args.checkpoint in ["debug", "debug2"] or args.debug
     debug = args.debug
     if debug:
-        model_cfg = DEBUG_MODEL
-        if args.checkpoint == "debug2":
-            model_cfg.max_crops = 12
-            model_cfg.crop_mode = "overlap-and-resize-c2"
-            model_cfg.tokenizer.identifier = "mm:hf-Qwen/Qwen2-7B"
-            model_cfg.embedding_size = 152064
-            model_cfg.vocab_size = 152064
-            model_cfg.pad_tokenizer = True
+        if exists(join(args.checkpoint, "model.yaml")):
+            model_cfg = ModelConfig.load(join(args.checkpoint, "model.yaml"))
+        else:
+            model_cfg = ModelConfig.load(join(args.checkpoint, "config.yaml"), key="model")
+        # model_cfg = DEBUG_MODEL
+        # if args.checkpoint == "debug2":
+        #     model_cfg.max_crops = 12
+        #     model_cfg.crop_mode = "overlap-and-resize-c2"
+        #     model_cfg.tokenizer.identifier = "mm:hf-Qwen/Qwen2-7B"
+        #     model_cfg.embedding_size = 152064
+        #     model_cfg.vocab_size = 152064
+        #     model_cfg.pad_tokenizer = True
         global_batch_size = 8
         model_init = None
         inf_eval_interval = 20
@@ -186,13 +192,16 @@ if __name__ == "__main__":
         eval_subset_batches = 4
     else:
         # eval_examples = 2048
-        eval_examples = 32
+        eval_examples = 64
         max_inf_examples = args.max_inf_examples
         log_interval = 20
         global_batch_size = args.global_batch_size
         inf_eval_interval = 2000
         eval_interval = 2000
-        duration = 30000
+        if args.finetune:
+            duration = 10000
+        else:
+            duration = 30000
         model_init = args.checkpoint
         if exists(join(args.checkpoint, "model.yaml")):
             model_cfg = ModelConfig.load(join(args.checkpoint, "model.yaml"))

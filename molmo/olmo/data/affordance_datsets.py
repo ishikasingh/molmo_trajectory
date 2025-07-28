@@ -10,6 +10,8 @@ class HandPositioningDataset(Dataset):
         """
         data_path: Path to your dataset
         split: "train", "validation", or "test"
+        note: the order for each keypoint is:
+        [left hand, left thumb, left index, left middle, left ring, left pinky, right hand, right thumb, right index, right middle, right ring, right pinky]
         """
         self.split = split
         self.data_path = data_path

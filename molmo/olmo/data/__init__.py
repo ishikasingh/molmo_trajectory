@@ -322,7 +322,7 @@ def get_dataset_by_name(dataset_name, split):
         data_path = os.environ.get("AFFORDANCE_DATA_PATH")
         return HandPositioningDataset(data_path=data_path, split=split)
     elif dataset_name == "robo_casa_affordance":
-        return RobotCasaHandPositioningDataset(split=split)
+        return RobotCasaHandPositioningDataset()
     elif dataset_name == "affordance_eval":
         assert split == "validation"
         data_path = os.environ.get("AFFORDANCE_DATA_PATH")
