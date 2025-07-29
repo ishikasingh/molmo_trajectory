@@ -110,6 +110,8 @@ if __name__ == "__main__":
     parser.add_argument("--debug", default=False, action="store_true")
     parser.add_argument("--finetune", default=False, action="store_true",
                         help="whether it is a finetuning or post-training run")
+    parser.add_argument("--cotrain", default=False, action="store_true",
+                        help="whether it is a cotraining run")
     args, other_args = parser.parse_known_args()
 
     if args.mixture.startswith("single"):
@@ -157,8 +159,13 @@ if __name__ == "__main__":
             ], 0.35]
         ]
     elif args.mixture == "affordance":
-        eval_tasks = ["affordance_eval"]
-        tasks = [["train", ["affordance"], 1.0]]
+        if args.cotrain:
+            eval_tasks = ["affordance_eval", "pointing_eval:test"]
+            tasks = [["train", ["affordance"], 0.5],
+                     ["pointing", ["pixmo_points"], 0.5]]
+        else:
+            eval_tasks = []
+            tasks = [["train", ["affordance"], 1.0]]
     elif args.mixture == "robo_casa_affordance":
         # eval_tasks = ["robo_casa_affordance"]
         eval_tasks = []
@@ -236,7 +243,7 @@ if __name__ == "__main__":
         )
         evaluation.data.persistent_workers = True
         evaluations.append(evaluation)
-
+    save_interval_unsharded = 10000 if not args.finetune else 3000
     cfg = TrainConfig(
         run_name="multitask_train",
         no_pre_train_checkpoint=True,
@@ -303,7 +310,8 @@ if __name__ == "__main__":
         initial_model_checkpoint=None if "debug" in args.checkpoint else args.checkpoint,
         save_interval=4000,
         save_num_checkpoints_to_keep=1,
-        save_interval_unsharded="${max_duration}",
+        # save_interval_unsharded="${max_duration}",
+        save_interval_unsharded=save_interval_unsharded,
         global_train_batch_size=global_batch_size,
         device_inf_eval_batch_size=args.device_inf_batch_size,
         device_eval_batch_size=args.device_eval_batch_size,

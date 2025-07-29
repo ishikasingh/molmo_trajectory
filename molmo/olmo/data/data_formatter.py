@@ -233,12 +233,12 @@ GENERAL_PROMPTS_V1 = {
     ],
     "affordance": [
         "Predict the hand keypoints for the task: {label}",
-        "Show me where the hands should be positioned for the task: {label}",
-        "Indicate the hand positions for the task: {label}",
-        "Point to where the hands and fingers should be placed for the task: {label}",
+        "Show me where the hands and fingertips should be positioned for the task: {label}",
+        "Indicate the hand and fingertip positions for the task: {label}",
+        "Point to where the hands and fingertips should be placed for the task: {label}",
         "Predict hand keypoints for the task: {label}",
-        "Where should the hands be positioned for the task: {label}",
-        "Show the hand positions needed for the task: {label}",
+        "Where should the hands and fingertops be positioned for the task: {label}",
+        "Show the hand and fingertip positions needed for the task: {label}",
         "Indicate where the hands should be for the task: {label}",
         "Predict the hand keypoints for the task: {label}",
         "Show me the hand keypoints for the task: {label}",
@@ -247,13 +247,13 @@ GENERAL_PROMPTS_V1 = {
         "Where should the hands be placed for the task: {label}?",
         "Show the predicted hand positions for the task: {label}",
         "Point to the hand keypoint locations for the task: {label}",
-        "Predict where the hands should be for the task: {label}",
+        "Predict where the hands and fingertips should be for the task: {label}",
         "Show me the hand affordance for the task: {label}",
         "Indicate the hand placement for the task: {label}",
         "Mark where the hands should be positioned for the task: {label}",
-        "Show the hand keypoints needed for the task: {label}",
-        "I want to {label} please show me the hand keypoints",
-        "please show me how to {label} by outlining the hand keypoints",
+        "Show the hand and fingertip keypoints needed for the task: {label}",
+        "I want to {label} please show me the hand and fingertip keypoints",
+        "please show me how to {label} by outlining the hand and fingertip keypoints",
     ],
 }
 
@@ -281,9 +281,14 @@ STYLE_TO_GENERAL_PROMPT = {
     "count_then_point": "count_then_point",
     "only_count": "only_count",
     "affordance": "affordance",
+    "affordance_new": "affordance",
     "plain": "plain",
 }
 
+AFFORDANCE_KEYPOINTS = [
+    "left_wrist", "left_thumb", "left_index", "left_middle", "left_ring", "left_pinky",
+    "right_wrist", "right_thumb", "right_index", "right_middle", "right_ring", "right_pinky"
+]
 
 def apply_keywords(prompt, example, keywords):
     for keyword in keywords:
@@ -348,6 +353,21 @@ class DataFormatter:
             point_text.append(f"y{ix}=\"{y:0.1f}\"")
         point_text = " ".join(point_text)
         return f"<points {point_text} alt=\"{alt_text}\">{label_text}</points>"
+    
+    def affordance_to_text(self, points, scale, label_text, alt_text):
+        if isinstance(scale, (tuple, list)):
+            points /= np.array(scale)[None, :]
+        else:
+            points *= (100/scale)
+        points = [[round(x, 1), round(y, 1)] for x, y in points]
+        if len(points) == 1:
+            x_str, y_str = points[0]
+            return f"<point x=\"{x_str:0.1f}\" y=\"{y_str:0.1f}\" alt=\"{alt_text}\">{label_text}</point>"
+        point_text = []
+        for ix, (x, y) in enumerate(points, start=1):
+            point_text.append(f"<{AFFORDANCE_KEYPOINTS[ix]} x=\"{x:0.1f}\" y=\"{y:0.1f}\" />")
+        point_text = ", ".join(point_text)
+        return point_text
 
     def format_annotated_text(self, answer, point_annotations):
         for point_annotation in point_annotations:
@@ -368,28 +388,29 @@ class DataFormatter:
         else:
             label = example["question"]
         if len(points) == 0:
-            if style in ["pointing", "point_count", "affordance"]:
+            if style in ["pointing", "point_count", "affordance", "affordance_new"]:
                 return "There are none."
             else:
                 raise NotImplementedError()
-        if "point_scale" in example:
-            # Points are already normalized
-            point_txt = self.points_to_text(
-                points, example["point_scale"], label, label,
-                do_sort=(style != "affordance")
-            )
+        if style == "affordance_new":
+            point_txt = self.affordance_to_text(points, 100, label, label)
         else:
-            # Points are in pixel coordinate
-            h, w = example["image"].shape[:2]
-            point_txt = self.points_to_text(
-                points, [w/100, h/100], label, label,
-                do_sort=(style != "affordance")
-            )
+            if "point_scale" in example:
+                # Points are already normalized
+                point_txt = self.points_to_text(
+                    points, example["point_scale"], label, label,
+                    do_sort=(style != "affordance")
+                )
+            else:
+                # Points are in pixel coordinate
+                h, w = example["image"].shape[:2]
+                point_txt = self.points_to_text(
+                    points, [w/100, h/100], label, label,
+                    do_sort=(style != "affordance")
+                )
 
         if style == "point_count":
             return f"Counting the {point_txt} shows a total of {len(points)}."
-        elif style == "affordance":
-            return point_txt  # Remove the verbose prefix
         else:
             return point_txt
 
@@ -501,7 +522,7 @@ class DataFormatter:
             # Bare-bone prompt with no templating or instructions
             if "prompt" in example:
                 prompt = example["prompt"]
-            elif style in ["pointing", "point_count", "affordance"]:
+            elif style in ["pointing", "point_count", "affordance", "affordance_new"]:
                 if "question" in example:
                     prompt = example["question"]
                 else:
@@ -527,7 +548,7 @@ class DataFormatter:
                 # plain text for everything else
                 if style == "long_caption":
                     prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1["long_caption"], example, rng, dbg=self.debug)
-                elif style in ["pointing", "point_count", "affordance"]:
+                elif style in ["pointing", "point_count", "affordance", "affordance_new"]:
                     # output, prompt, metadata = self.format_points(example)
                     if "question" in example:
                         prompt = example["question"]
@@ -589,12 +610,12 @@ class DataFormatter:
                 messages = [prompt, response]
                 
                 # ADD THIS DEBUG PRINTING - only print every 100th example for affordance
-                # if message.get("style") == "affordance" and self.debug_print_counter % 1== 0:
-                #     print(f"\n=== AFFORDANCE DEBUG (#{self.debug_print_counter}) ===")
-                #     print(f"INPUT:  {prompt}")
-                #     print(f"OUTPUT: {response}")
-                #     print("=" * 50)
-                # self.debug_print_counter += 1
+                if message.get("style") == "affordance_new" and self.debug_print_counter % 1== 0:
+                    print(f"\n=== AFFORDANCE DEBUG (#{self.debug_print_counter}) ===")
+                    print(f"INPUT:  {prompt}")
+                    print(f"OUTPUT: {response}")
+                    print("=" * 50)
+                self.debug_print_counter += 1
                 
             else:
                 messages = [prompt]

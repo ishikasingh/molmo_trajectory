@@ -24,7 +24,7 @@ class RobotCasaHandPositioningDataset(Dataset):
         max_retries: Maximum number of retry attempts for loading dataset
         retry_delay: Base delay between retries (will be randomized with jitter)
         """
-        self.repo_id = "ishika/robocasa_gr1_tabletop_tasks_fingertips"
+        self.repo_id = "ishika/robocasa_gr1_tabletop_tasks_fingertips_corrected"
         
         # Load metadata with retry logic
         self.metadata = LeRobotDatasetMetadata(self.repo_id)
@@ -45,7 +45,7 @@ class RobotCasaHandPositioningDataset(Dataset):
         # Get image dimensions for normalization
         img_h, img_w = image.size[1], image.size[0]  # PIL Image size is (width, height)
 
-        hand_position_2d = example["observation.condition_2D"].reshape(12, 2)  # torch [12, 2]
+        hand_position_2d = example["observation.condition_2D_current_camera_frame"].reshape(12, 2)  # torch [12, 2]
 
         # swap the order of the fingers to match the order in the affordance_datsets.py
         left_fingers = hand_position_2d[5:10]
@@ -61,7 +61,7 @@ class RobotCasaHandPositioningDataset(Dataset):
         hand_positions = (hand_position_2d.numpy() / [img_w, img_h]) * 100.0
 
         language_instruction = example["task"]
-        language_instruction = self.language_mapping(language_instruction)
+        # language_instruction = self.language_mapping(language_instruction)
         
         return {
             "image": image,
