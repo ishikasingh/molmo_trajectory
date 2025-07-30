@@ -6,18 +6,19 @@ from olmo.data.dataset import Dataset
 from pathlib import Path
 
 class HandPositioningDataset(Dataset):
-    def __init__(self, data_path, split="train", keep_in_memory=False):
-        """
+    def __init__(self, data_path, split="train", use_new_output_format=False, ignore_wrist=True):
+        """ 
         data_path: Path to your dataset
         split: "train", "validation", or "test"
         note: the order for each keypoint is:
-        [left hand, left thumb, left index, left middle, left ring, left pinky, right hand, right thumb, right index, right middle, right ring, right pinky]
+        [left wrist, left thumb, left index, left middle, left ring, left pinky, right wrist, right thumb, right index, right middle, right ring, right pinky]
         """
         self.split = split
         self.data_path = data_path
         # Load your data - this depends on your data format
         self.data = self._load_data(data_path, split)
-        
+        self.use_new_output_format = use_new_output_format
+        self.ignore_wrist = ignore_wrist
     def _load_data(self, data_path, split):
         """
         Load your data from whatever format you have.
@@ -59,6 +60,9 @@ class HandPositioningDataset(Dataset):
         
         # Process hand positions
         hand_positions = self._process_hand_positions(example["hand_positions"])
+        if self.ignore_wrist:
+            hand_positions = np.concatenate([hand_positions[1:6], hand_positions[7:12]], axis=0)
+            print(hand_positions.shape)
         
         # Safely get metadata with fallbacks
         try:
@@ -86,7 +90,7 @@ class HandPositioningDataset(Dataset):
                     "label": example["instruction"],
                     "points": hand_positions,
                     "point_scale": 100,  # Our coordinates are already in percentage (0-100)
-                    "style": "affordance"
+                    "style": "affordance" if not self.use_new_output_format else "affordance_new"
                 }
             ],
             "metadata": {

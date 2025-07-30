@@ -289,6 +289,10 @@ AFFORDANCE_KEYPOINTS = [
     "left_wrist", "left_thumb", "left_index", "left_middle", "left_ring", "left_pinky",
     "right_wrist", "right_thumb", "right_index", "right_middle", "right_ring", "right_pinky"
 ]
+AFFORDANCE_KEYPOINTS_WO_WRIST = [
+    "left_thumb", "left_index", "left_middle", "left_ring", "left_pinky",
+    "right_thumb", "right_index", "right_middle", "right_ring", "right_pinky"
+]
 
 def apply_keywords(prompt, example, keywords):
     for keyword in keywords:
@@ -334,7 +338,7 @@ class DataFormatter:
     default_inference_len: int = 65  # Inference len for length-conditioned prompting
     select_answer: str = "best"  # How to select answer for questions with many answers
     debug: bool = False  # deterministic mode for debugging
-    # debug_print_counter: int = 0  # Add this as a class attribute
+    debug_print_counter: int = 0  # Add this as a class attribute
 
     def points_to_text(self, points, scale, label_text, alt_text, do_sort=True):
         if isinstance(scale, (tuple, list)):
@@ -364,8 +368,14 @@ class DataFormatter:
             x_str, y_str = points[0]
             return f"<point x=\"{x_str:0.1f}\" y=\"{y_str:0.1f}\" alt=\"{alt_text}\">{label_text}</point>"
         point_text = []
-        for ix, (x, y) in enumerate(points, start=1):
-            point_text.append(f"<{AFFORDANCE_KEYPOINTS[ix]} x=\"{x:0.1f}\" y=\"{y:0.1f}\" />")
+        if len(points) == 12:
+            affordance_keypoints = AFFORDANCE_KEYPOINTS
+        elif len(points) == 10:
+            affordance_keypoints = AFFORDANCE_KEYPOINTS_WO_WRIST
+        else:
+            raise ValueError(f"Invalid number of points: {len(points)}")
+        for ix, (x, y) in enumerate(points):
+            point_text.append(f"<{affordance_keypoints[ix]} x=\"{x:0.1f}\" y=\"{y:0.1f}\" />")
         point_text = ", ".join(point_text)
         return point_text
 
@@ -557,7 +567,10 @@ class DataFormatter:
                             prompt = example["label"].lower()
                         else:
                             prompt = example["label_cased"]
-                        prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1[style], dict(example, label=prompt), rng, dbg=self.debug)
+                        prompt_style = style
+                        if style == "affordance_new":
+                            prompt_style = "affordance"
+                        prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1[prompt_style], dict(example, label=prompt), rng, dbg=self.debug)
                     output = self.format_points(example)
                 elif "prompt" in example:
                     prompt = example["prompt"]

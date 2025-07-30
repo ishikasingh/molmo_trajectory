@@ -166,6 +166,14 @@ if __name__ == "__main__":
         else:
             eval_tasks = []
             tasks = [["train", ["affordance"], 1.0]]
+    elif args.mixture == "affordance_new":
+        if args.cotrain:
+            eval_tasks = ["affordance_eval", "pointing_eval:test"]
+            tasks = [["train", ["affordance_new"], 0.5],
+                     ["pointing", ["pixmo_points"], 0.5]]
+        else:
+            eval_tasks = []
+            tasks = [["train", ["affordance_new"], 1.0]]
     elif args.mixture == "robo_casa_affordance":
         # eval_tasks = ["robo_casa_affordance"]
         eval_tasks = []

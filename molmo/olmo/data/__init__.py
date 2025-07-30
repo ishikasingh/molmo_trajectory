@@ -318,9 +318,12 @@ def get_dataset_by_name(dataset_name, split):
         if split == "validation":
             split = "testmini"
         return MathVista(split)
-    elif dataset_name == "affordance" or dataset_name == "affordance_new":
+    elif dataset_name == "affordance":
         data_path = os.environ.get("AFFORDANCE_DATA_PATH")
         return HandPositioningDataset(data_path=data_path, split=split)
+    elif dataset_name == "affordance_new":
+        data_path = os.environ.get("AFFORDANCE_DATA_PATH")
+        return HandPositioningDataset(data_path=data_path, split=split, use_new_output_format=True, ignore_wrist=True)
     elif dataset_name == "robo_casa_affordance":
         return RobotCasaHandPositioningDataset()
     elif dataset_name == "affordance_eval":
