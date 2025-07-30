@@ -62,7 +62,6 @@ class HandPositioningDataset(Dataset):
         hand_positions = self._process_hand_positions(example["hand_positions"])
         if self.ignore_wrist:
             hand_positions = np.concatenate([hand_positions[1:6], hand_positions[7:12]], axis=0)
-            print(hand_positions.shape)
         
         # Safely get metadata with fallbacks
         try:
