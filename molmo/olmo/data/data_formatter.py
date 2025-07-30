@@ -338,7 +338,7 @@ class DataFormatter:
     default_inference_len: int = 65  # Inference len for length-conditioned prompting
     select_answer: str = "best"  # How to select answer for questions with many answers
     debug: bool = False  # deterministic mode for debugging
-    debug_print_counter: int = 0  # Add this as a class attribute
+    # debug_print_counter: int = 0  # Add this as a class attribute
 
     def points_to_text(self, points, scale, label_text, alt_text, do_sort=True):
         if isinstance(scale, (tuple, list)):
@@ -623,12 +623,12 @@ class DataFormatter:
                 messages = [prompt, response]
                 
                 # ADD THIS DEBUG PRINTING - only print every 100th example for affordance
-                if message.get("style") == "affordance_new" and self.debug_print_counter % 1== 0:
-                    print(f"\n=== AFFORDANCE DEBUG (#{self.debug_print_counter}) ===")
-                    print(f"INPUT:  {prompt}")
-                    print(f"OUTPUT: {response}")
-                    print("=" * 50)
-                self.debug_print_counter += 1
+                # if message.get("style") == "affordance_new" and self.debug_print_counter % 1== 0:
+                #     print(f"\n=== AFFORDANCE DEBUG (#{self.debug_print_counter}) ===")
+                #     print(f"INPUT:  {prompt}")
+                #     print(f"OUTPUT: {response}")
+                #     print("=" * 50)
+                # self.debug_print_counter += 1
                 
             else:
                 messages = [prompt]
