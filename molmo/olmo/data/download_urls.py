@@ -86,7 +86,8 @@ def _download_images(args):
             # Write response to file so we know the URL failed and won't try it again
             with open(cache_file, 'w') as f:
                 f.write(str(e))
-            return DownloadError(url, e)
+            # Convert exception to string to avoid pickling issues with SSLContext
+            return DownloadError(url, Exception(str(e)))
 
         # Else write the file bytes even though we have not confirmed the result is an image
         # Write to a tmp file and rename to ensure we don't only partially write an image if
@@ -109,7 +110,8 @@ def _download_images(args):
                 if min(img.size) == 0:
                     raise ValueError("Zero dimensional image")
         except Exception as e:
-            return ImageError(url, e)
+            # Convert exception to string to avoid pickling issues
+            return ImageError(url, Exception(str(e)))
 
     return url, cache_file
 

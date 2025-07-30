@@ -316,7 +316,7 @@ if __name__ == "__main__":
         ),
         load_path=None,
         initial_model_checkpoint=None if "debug" in args.checkpoint else args.checkpoint,
-        save_interval=4000,
+        save_interval=5000,
         save_num_checkpoints_to_keep=1,
         # save_interval_unsharded="${max_duration}",
         save_interval_unsharded=save_interval_unsharded,
