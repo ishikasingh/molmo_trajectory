@@ -6,7 +6,7 @@ from olmo.data.dataset import Dataset
 from pathlib import Path
 
 class HandPositioningDataset(Dataset):
-    def __init__(self, data_path, split="train", use_new_output_format=False, ignore_wrist=True):
+    def __init__(self, data_path, split="train", use_new_output_format=False, ignore_wrist=False):
         """ 
         data_path: Path to your dataset
         split: "train", "validation", or "test"
