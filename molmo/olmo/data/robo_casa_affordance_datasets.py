@@ -17,7 +17,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetad
 warnings.filterwarnings("ignore", message=".*video decoding and encoding capabilities.*", category=UserWarning)
 
 class RobotCasaHandPositioningDataset(Dataset):
-    def __init__(self):
+    def __init__(self, use_new_output_format=False, ignore_wrist=False):
         """
         data_path: Path to your dataset
         split: "train", "validation", or "test"
@@ -30,7 +30,9 @@ class RobotCasaHandPositioningDataset(Dataset):
         self.metadata = LeRobotDatasetMetadata(self.repo_id)
         # Load dataset with retry logic
         self.data = LeRobotDataset(self.repo_id, video_backend="pyav")
-    
+        self.use_new_output_format = use_new_output_format
+        self.ignore_wrist = ignore_wrist
+
     def __len__(self):
         return len(self.data)
     
@@ -54,8 +56,14 @@ class RobotCasaHandPositioningDataset(Dataset):
         right_wrist = hand_position_2d[11:12]
         # note: the order for each keypoint is:
         # [left hand, left thumb, left index, left middle, left ring, left pinky, right hand, right thumb, right index, right middle, right ring, right pinky]
-        hand_positions = np.concatenate([left_wrist,left_fingers, right_wrist, right_fingers], axis=0)
-        assert hand_positions.shape == (12, 2)
+        if self.ignore_wrist:
+            hand_positions = np.concatenate([left_fingers, right_fingers], axis=0)
+        else:
+            hand_positions = np.concatenate([left_wrist, left_fingers, right_wrist, right_fingers], axis=0)
+        if self.ignore_wrist:
+            assert hand_positions.shape == (10, 2)
+        else:
+            assert hand_positions.shape == (12, 2)
         
         # Normalize the hand positions to percentage coordinates (vectorized)
         hand_positions = (hand_position_2d.numpy() / [img_w, img_h]) * 100.0
@@ -70,7 +78,7 @@ class RobotCasaHandPositioningDataset(Dataset):
                     "label": language_instruction,
                     "points": hand_positions,
                     "point_scale": 100,  # Our coordinates are already in percentage (0-100)
-                    "style": "affordance"
+                    "style": "affordance" if not self.use_new_output_format else "affordance_new"
                 }
             ],
             "metadata": {

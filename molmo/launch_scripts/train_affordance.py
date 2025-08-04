@@ -251,9 +251,9 @@ if __name__ == "__main__":
         )
         evaluation.data.persistent_workers = True
         evaluations.append(evaluation)
-    save_interval_unsharded = 10000 if not args.finetune else 3000
+    save_interval_unsharded = 10000 if not args.finetune else 2500
     cfg = TrainConfig(
-        run_name="multitask_train",
+        run_name="affordance_train",
         no_pre_train_checkpoint=True,
         save_folder="debug_run" if debug else omegaconf.MISSING,
         seed=6198,
