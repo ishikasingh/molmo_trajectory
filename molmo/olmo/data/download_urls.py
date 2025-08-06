@@ -5,6 +5,7 @@ import logging
 import multiprocessing
 import os
 import warnings
+import signal  # Add this import
 from collections import defaultdict
 from os import rename, makedirs
 from os.path import join, exists
@@ -57,63 +58,108 @@ def compute_hash(string: Union[str, bytes]) -> str:
         return hashlib.sha256(string).hexdigest()
 
 
+class TimeoutError(Exception):  # Add this class
+    pass
+
+
+def timeout_handler(signum, frame):  # Add this function
+    raise TimeoutError("Operation timed out")
+
+
 def _download_images(args):
     url, image_sha, check_sha, cache_only, kwargs = args
     image_id = compute_hash(url)
     cache_file = join(PIXMO_IMAGES, image_id)
 
-    # Create and configure session
-    session = requests.Session()
-    retries = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[429]
-    )
-    session.mount('http://', HTTPAdapter(max_retries=retries))
-    session.mount('https://', HTTPAdapter(max_retries=retries))
+    # Set up timeout for the entire function (30 seconds max per image)
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(30)
+    
+    try:
+        # Create and configure session
+        session = requests.Session()
+        retries = Retry(
+            total=2,  # Reduce retries to avoid hanging
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            connect=2,  # Add connection retries
+            read=2,     # Add read retries
+            redirect=2  # Add redirect retries
+        )
+        session.mount('http://', HTTPAdapter(max_retries=retries))
+        session.mount('https://', HTTPAdapter(max_retries=retries))
 
-    if exists(cache_file):
-        with open(cache_file, "rb") as f:
-            image_bytes = f.read()
-    elif cache_only:
-        return DownloadError(url, ValueError('Not in cache'))
-    else:
-        try:
-            response = session.get(url, timeout=5)
-            response.raise_for_status()
-            image_bytes = response.content
-        except Exception as e:
-            # Write response to file so we know the URL failed and won't try it again
-            with open(cache_file, 'w') as f:
-                f.write(str(e))
-            # Convert exception to string to avoid pickling issues with SSLContext
-            return DownloadError(url, Exception(str(e)))
+        if exists(cache_file):
+            try:
+                with open(cache_file, "rb") as f:
+                    image_bytes = f.read()
+                # Check if this is actually an error file (text instead of binary)
+                if len(image_bytes) < 100 and (image_bytes.startswith(b'<') or b'Error' in image_bytes[:100]):
+                    # This is likely an error file, treat as download error
+                    return DownloadError(url, Exception("Cached error file"))
+            except Exception as e:
+                return DownloadError(url, Exception(f"Error reading cached file: {str(e)}"))
+        elif cache_only:
+            return DownloadError(url, ValueError('Not in cache'))
+        else:
+            try:
+                # Use a shorter timeout to avoid hanging
+                response = session.get(url, timeout=10, stream=True)
+                response.raise_for_status()
+                
+                # Read content with size limit to avoid memory issues
+                image_bytes = b''
+                max_size = 50 * 1024 * 1024  # 50MB limit
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        image_bytes += chunk
+                        if len(image_bytes) > max_size:
+                            raise ValueError(f"Image too large: {len(image_bytes)} bytes")
+                
+            except Exception as e:
+                # Write response to file so we know the URL failed and won't try it again
+                try:
+                    with open(cache_file, 'w') as f:
+                        f.write(f"Error: {str(e)}")
+                except:
+                    pass  # If we can't write the error file, just continue
+                # Convert exception to string to avoid pickling issues with SSLContext
+                return DownloadError(url, Exception(str(e)))
 
-        # Else write the file bytes even though we have not confirmed the result is an image
-        # Write to a tmp file and rename to ensure we don't only partially write an image if
-        # we crash mid-write
-        with open(cache_file + ".tmp", 'wb') as f:
-            f.write(image_bytes)
-        rename(cache_file + ".tmp", cache_file)
+            # Write the file bytes
+            try:
+                with open(cache_file + ".tmp", 'wb') as f:
+                    f.write(image_bytes)
+                rename(cache_file + ".tmp", cache_file)
+            except Exception as e:
+                return DownloadError(url, Exception(f"Error writing file: {str(e)}"))
 
-    if check_sha:
-        downloaded_hash = compute_hash(image_bytes)
-        assert image_sha is not None
-        if downloaded_hash != image_sha:
-            return ImageError(url, ValueError("Mismatched image hash"))
-    else:
-        # Else make sure we actually got an image, and it can be parsed by PIL
-        try:
-            # Avoid annoying palette transparency warnings filling up the logs
-            with warnings.catch_warnings(record=True) as w:
-                img = PIL.Image.open(io.BytesIO(image_bytes))
-                if min(img.size) == 0:
-                    raise ValueError("Zero dimensional image")
-        except Exception as e:
-            # Convert exception to string to avoid pickling issues
-            return ImageError(url, Exception(str(e)))
+        if check_sha:
+            downloaded_hash = compute_hash(image_bytes)
+            assert image_sha is not None
+            if downloaded_hash != image_sha:
+                return ImageError(url, ValueError("Mismatched image hash"))
+        else:
+            # Else make sure we actually got an image, and it can be parsed by PIL
+            try:
+                # Avoid annoying palette transparency warnings filling up the logs
+                with warnings.catch_warnings(record=True) as w:
+                    img = PIL.Image.open(io.BytesIO(image_bytes))
+                    if min(img.size) == 0:
+                        raise ValueError("Zero dimensional image")
+            except Exception as e:
+                # Convert exception to string to avoid pickling issues
+                return ImageError(url, Exception(str(e)))
 
-    return url, cache_file
+        return url, cache_file
+    
+    except TimeoutError:
+        return DownloadError(url, Exception("Download timed out after 30 seconds"))
+    except Exception as e:
+        return DownloadError(url, Exception(f"Unexpected error: {str(e)}"))
+    finally:
+        # Always cancel the alarm
+        signal.alarm(0)
 
 
 def download_pixmo_urls(
@@ -138,7 +184,7 @@ def download_pixmo_urls(
     logging.info(f"Getting files for {len(urls_and_shas)} image URLs")
     makedirs(PIXMO_IMAGES, exist_ok=True)
     if request_kwargs is None:
-        request_kwargs = dict(timeout=60)
+        request_kwargs = dict(timeout=10)  # Reduce timeout from 60 to 10
     if not verify:
         request_kwargs["verify"] = False
         urllib3.disable_warnings()
@@ -151,16 +197,23 @@ def download_pixmo_urls(
     if n_processes != 1:
         def _iter():
             with multiprocessing.Pool(processes=n_processes, initializer=setup_pil) as pool:
-                for val in pool.imap_unordered(_download_images, to_save):
+                result = pool.imap_unordered(_download_images, to_save)
+                for val in result:
                     yield val
     else:
         setup_pil()
         def _iter():
             for val in to_save:
-                yield _download_images(val)
+                result = _download_images(val)
+                if result is None:
+                    # This should never happen now, but just in case
+                    result = DownloadError(val[0], Exception("Function returned None"))
+                yield result
 
     found_urls = {}
+    processed = 0
     for val in _iter():
+        processed += 1
         if isinstance(val, ImageError):
             image_error += 1
         elif isinstance(val, DownloadError):
