@@ -66,7 +66,7 @@ class RobotCasaHandPositioningDataset(Dataset):
             assert hand_positions.shape == (12, 2)
         
         # Normalize the hand positions to percentage coordinates (vectorized)
-        hand_positions = (hand_position_2d.numpy() / [img_w, img_h]) * 100.0
+        hand_positions = (hand_positions / [img_w, img_h]) * 100.0
 
         language_instruction = example["task"]
         # language_instruction = self.language_mapping(language_instruction)
@@ -289,16 +289,17 @@ class RobotCasaHandPositioningDataset(Dataset):
         return mapping_mapping[language_instruction]
 
 if __name__ == "__main__":
-    dataset = RobotCasaHandPositioningDataset()
+    dataset = RobotCasaHandPositioningDataset(ignore_wrist=True, use_new_output_format=True)
+    print(dataset.get(0, None))
     
     # Option 1: Create a video from consecutive frames
-    print("Creating video from consecutive frames...")
-    video_path = dataset.visualize_hand_positions_video(
-        start_idx=0, 
-        num_frames=1000,  # 30 consecutive frames
-        fps=30,         # 10 frames per second
-        save_path="hand_positions_sequence.mp4"
-    )
+    # print("Creating video from consecutive frames...")
+    # video_path = dataset.visualize_hand_positions_video(
+    #     start_idx=0, 
+    #     num_frames=1000,  # 30 consecutive frames
+    #     fps=30,         # 10 frames per second
+    #     save_path="hand_positions_sequence.mp4"
+    # )
     
     # Option 2: Save individual frames as images
     # print("\nSaving individual frames...")
