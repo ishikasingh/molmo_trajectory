@@ -17,6 +17,27 @@ def sanitize_filename(s: str) -> str:
     """Replace any character that is not alphanumeric or underscore with underscore."""
     return re.sub(r'[^a-zA-Z0-9_\-]', '_', s)
 
+def calculate_point_wise_errors(pred_points: List[Tuple[int, int]], gt_points: List[Tuple[int, int]]) -> List[float]:
+    """
+    Calculate individual point errors (Euclidean distance) between predicted and ground truth points.
+    
+    Args:
+        pred_points: List of predicted (x, y) coordinate tuples
+        gt_points: List of ground truth (x, y) coordinate tuples
+    
+    Returns:
+        List of Euclidean distances for each point pair
+    """
+    if len(pred_points) != len(gt_points):
+        raise ValueError(f"Point count mismatch: predicted {len(pred_points)}, ground truth {len(gt_points)}")
+    
+    errors = []
+    for (px, py), (gx, gy) in zip(pred_points, gt_points):
+        error = np.sqrt((px - gx) ** 2 + (py - gy) ** 2)
+        errors.append(error)
+    
+    return errors
+
 def get_finger_colors() -> Dict[str, str]:
     """Get color mapping for different finger types."""
     return {
@@ -128,10 +149,15 @@ def visualize_new_format(draw: ImageDraw.Draw, points: List[Tuple[int, int]],
     outline_width = 2 if is_ground_truth else 3
     
     for i, (x, y) in enumerate(points):
-        finger_type = finger_names[i].replace('left', '').replace('right', '').lower()
-        color = finger_colors[finger_type]
+        # Use red for ground truth points, finger-specific colors for predictions
+        if is_ground_truth:
+            fill_color = 'red'
+        else:
+            finger_type = finger_names[i].replace('left', '').replace('right', '').lower()
+            fill_color = finger_colors[finger_type]
+        
         draw.ellipse((x - point_radius, y - point_radius, x + point_radius, y + point_radius), 
-                    fill=color, outline=outline_color, width=outline_width)
+                    fill=fill_color, outline=outline_color, width=outline_width)
 
 def visualize_original_format(draw: ImageDraw.Draw, points: List[Tuple[int, int]], 
                              finger_colors: Dict[str, str], finger_names: List[str], 
@@ -173,16 +199,20 @@ def visualize_original_format(draw: ImageDraw.Draw, points: List[Tuple[int, int]
     outline_width = 2 if is_ground_truth else 3
     
     for i, (x, y) in enumerate(points):
-        if i == 0:  # leftHand
-            color = finger_colors['wrist']
-        elif i == 6:  # rightHand
-            color = finger_colors['wrist']
+        # Use red for ground truth points, finger-specific colors for predictions
+        if is_ground_truth:
+            fill_color = 'red'
         else:
-            finger_type = finger_names[i].replace('left', '').replace('right', '').lower()
-            color = finger_colors[finger_type]
+            if i == 0:  # leftHand
+                fill_color = finger_colors['wrist']
+            elif i == 6:  # rightHand
+                fill_color = finger_colors['wrist']
+            else:
+                finger_type = finger_names[i].replace('left', '').replace('right', '').lower()
+                fill_color = finger_colors[finger_type]
         
         draw.ellipse((x - point_radius, y - point_radius, x + point_radius, y + point_radius), 
-                    fill=color, outline=outline_color, width=outline_width)
+                    fill=fill_color, outline=outline_color, width=outline_width)
 
 def convert_ground_truth_points(gt_points: np.ndarray, image_width: int, image_height: int, 
                                point_scale: float = 100.0) -> List[Tuple[int, int]]:
@@ -357,11 +387,17 @@ def main():
     parser.add_argument("--affordance_new", action="store_true", help="Use the new affordance output format")
     parser.add_argument("--use_training_data", action="store_true", help="Load examples from training data")
     parser.add_argument("--use_eval_data", action="store_true", help="Load examples from evaluation dataset")
-    parser.add_argument("--training_dataset", type=str, default="affordance", help="Training dataset name (affordance, affordance_new, or affordance_eval)")
     parser.add_argument("--training_split", type=str, default="train", help="Training dataset split (train/validation/test)")
     parser.add_argument("--num_training_examples", type=int, default=15, help="Number of training examples to load")
     parser.add_argument("--training_seed", type=int, default=42, help="Random seed for sampling training examples")
+    parser.add_argument("--max_error_threshold", type=float, default=2000.0, help="Maximum error threshold in pixels - errors above this are considered invalid and excluded from statistics")
     args = parser.parse_args()
+
+    # Initialize error tracking variables
+    point_errors = []
+    valid_examples = 0
+    skipped_examples = 0
+    expected_points = 10 if args.affordance_new else 12
 
     examples = []
     
@@ -376,11 +412,17 @@ def main():
         
         # Determine which dataset to use
         if args.use_eval_data:
-            dataset_name = "affordance_eval"
+            if args.affordance_new:
+                dataset_name = "affordance_eval_new"
+            else:
+                dataset_name = "affordance_eval"
             split_name = "train"  # Evaluation dataset uses "train" split
             print(f"Using evaluation dataset: {dataset_name}")
         else:
-            dataset_name = args.training_dataset
+            if args.affordance_new:
+                dataset_name = "affordance_new"
+            else:
+                dataset_name = "affordance"
             split_name = args.training_split
             print(f"Using training dataset: {dataset_name}")
         
@@ -488,6 +530,40 @@ def main():
             gt_points = convert_ground_truth_points(gt_points_raw, w, h, point_scale)
             print(f"Ground truth: {len(gt_points)} points")
 
+        # 10.5. Calculate pointwise errors if both predictions and ground truth are available with correct point counts
+        if pred_points and gt_points and len(pred_points) == expected_points and len(gt_points) == expected_points:
+            try:
+                errors = calculate_point_wise_errors(pred_points, gt_points)
+                mean_error = np.mean(errors)
+                
+                # Check if the mean error is below the threshold
+                if mean_error <= args.max_error_threshold:
+                    point_errors.extend(errors)
+                    valid_examples += 1
+                    
+                    print(f"Point errors (pixels): {[f'{e:.1f}' for e in errors]}")
+                    print(f"Mean point error: {mean_error:.2f} pixels")
+                    print(f"Max point error: {np.max(errors):.2f} pixels")
+                    print(f"Min point error: {np.min(errors):.2f} pixels")
+                    
+                else:
+                    print(f"Example REJECTED: Mean error {mean_error:.2f} pixels exceeds threshold {args.max_error_threshold:.1f}")
+                    print(f"Point errors (pixels): {[f'{e:.1f}' for e in errors]}")
+                    skipped_examples += 1
+                
+            except Exception as e:
+                print(f"Error calculating pointwise errors: {e}")
+                skipped_examples += 1
+        elif pred_points and gt_points:
+            print(f"Skipping error calculation: pred_points={len(pred_points)}, gt_points={len(gt_points)}, expected={expected_points}")
+            skipped_examples += 1
+        else:
+            if not pred_points:
+                print("No predicted points found")
+            if not gt_points:
+                print("No ground truth points available")
+            skipped_examples += 1
+
         if pred_points or gt_points:
             # 11. Visualize points on the image
             print(f"Found {len(pred_points) if pred_points else 0} prediction points to visualize")
@@ -507,6 +583,29 @@ def main():
         else:
             print("No points found in model output or ground truth.")
     
+    # Print statistical summary
+    print("\n" + "="*60)
+    print("POINTWISE ERROR STATISTICAL SUMMARY")
+    print("="*60)
+    print(f"Total examples processed: {len(examples)}")
+    print(f"Valid examples for error calculation: {valid_examples}")
+    print(f"Skipped examples: {skipped_examples}")
+    print(f"Expected points per example: {expected_points}")
+    print(f"Mean error threshold: {args.max_error_threshold:.1f} pixels")
+    print(f"Total points evaluated: {len(point_errors)}")
+    
+    if point_errors:
+        point_errors_array = np.array(point_errors)
+        
+        print(f"\nPointwise Error Statistics (pixels, valid examples only):")
+        print(f"  Mean error: {np.mean(point_errors_array):.2f}")
+        print(f"  Median error: {np.median(point_errors_array):.2f}")
+        print(f"  Standard deviation: {np.std(point_errors_array):.2f}")
+        print(f"  Min error: {np.min(point_errors_array):.2f}")
+        print(f"  Max error: {np.max(point_errors_array):.2f}")
+    else:
+        print(f"\nNo valid examples found (all mean errors exceeded {args.max_error_threshold:.1f} pixel threshold)")
+
     # Clean up temporary training images
     if args.use_training_data:
         for example in examples:
