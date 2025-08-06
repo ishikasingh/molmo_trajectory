@@ -104,7 +104,7 @@ evaluators:
 
 Set the environment variable:
 ```bash
-export AFFORDANCE_DATA_PATH="path/to/your/affordance/dataset"
+export AFFORDANCE_DATA_DIR="path/to/your/affordance/dataset"
 ```
 
 ## Evaluation
@@ -190,7 +190,7 @@ data:
 
 ## Troubleshooting
 
-1. **Dataset not found**: Make sure `AFFORDANCE_DATA_PATH` is set correctly
+1. **Dataset not found**: Make sure `AFFORDANCE_DATA_DIR` is set correctly
 2. **Wrong data format**: Check that your `_process_hand_positions` method matches your data structure
 3. **Poor performance**: Ensure your keypoint coordinates are in percentage (0-100) format
 4. **Memory issues**: Use `keep_in_memory=False` when loading large datasets

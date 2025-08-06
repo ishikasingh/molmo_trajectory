@@ -404,10 +404,10 @@ def main():
     if args.use_training_data or args.use_eval_data:
         print("Loading examples from dataset...")
         # Set environment variable if not already set
-        if "AFFORDANCE_DATA_PATH" not in os.environ:
-            print("Warning: AFFORDANCE_DATA_PATH environment variable not set.")
+        if "AFFORDANCE_DATA_DIR" not in os.environ:
+            print("Warning: AFFORDANCE_DATA_DIR environment variable not set.")
             print("Please set it to your affordance dataset path:")
-            print("export AFFORDANCE_DATA_PATH=/path/to/your/affordance/dataset")
+            print("export AFFORDANCE_DATA_DIR=/path/to/your/affordance/dataset")
             return
         
         # Determine which dataset to use
