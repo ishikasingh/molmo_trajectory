@@ -939,7 +939,8 @@ def extract_points_no_filter(text, image_w, image_h):
             point = point * np.array([image_w, image_h])
             all_points.append(point)
     
-    for match in re.finditer(r'x\d*="\s*([0-9]+(?:\.[0-9]+)?)"\s+y\d*="\s*([0-9]+(?:\.[0-9]+)?)"', text):
+    # Updated regex to handle negative numbers and XML-style format
+    for match in re.finditer(r'x\d*="\s*([-]?[0-9]+(?:\.[0-9]+)?)"\s+y\d*="\s*([-]?[0-9]+(?:\.[0-9]+)?)"', text):
         try:
             point = [float(match.group(i)) for i in range(1, 3)]
         except ValueError:
