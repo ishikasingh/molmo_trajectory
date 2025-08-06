@@ -251,7 +251,7 @@ if __name__ == "__main__":
         )
         evaluation.data.persistent_workers = True
         evaluations.append(evaluation)
-    save_interval_unsharded = 10000 if not args.finetune else 2500
+    save_interval_unsharded = 10000 if not args.finetune else 3000
     cfg = TrainConfig(
         run_name="affordance_train",
         no_pre_train_checkpoint=True,
