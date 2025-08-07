@@ -630,6 +630,10 @@ def generate_keypoint_projection_video(video_dir, frame_names, keypoint_data, tr
     # Get the final frame index for fallback
     final_frame_idx = len(frame_names) - 1
     
+    # Get transition lists for easy access
+    left_hand_transitions = transitions['left_hand_transitions']
+    right_hand_transitions = transitions['right_hand_transitions']
+    
     try:
         print(f"Generating keypoint projection video for {len(frame_names)} frames...")
         
@@ -640,6 +644,7 @@ def generate_keypoint_projection_video(video_dir, frame_names, keypoint_data, tr
                 'frame_name': frame_names[frame_idx],
                 'has_future_transitions': False,
                 'future_transitions': None,
+                'keypoint_source_transitions': None,  # NEW: transition types at keypoint source frames
                 'keypoints_2d': None,
                 'keypoints_3d_camera': None,
                 'keypoints_3d_world': None
@@ -654,7 +659,6 @@ def generate_keypoint_projection_video(video_dir, frame_names, keypoint_data, tr
             if has_future_transitions:
                 frame_data['has_future_transitions'] = True
                 frame_data['future_transitions'] = future_transitions
-                # print(f"Processing frame {frame_idx}: Left={future_transitions['left_hand']}, Right={future_transitions['right_hand']}")
             
             # Get current camera pose
             if frame_idx >= len(camera_poses):
@@ -669,10 +673,44 @@ def generate_keypoint_projection_video(video_dir, frame_names, keypoint_data, tr
             keypoints_3d_camera = {}
             keypoints_3d_world = {}
             
-            # Determine which hands to process
+            # Determine which hands to process and get transition information for source frames
             hands_to_process = []
-            hands_to_process.append(('left_hand', future_transitions['left_hand']['frame_idx'] if future_transitions['left_hand'] else final_frame_idx))
-            hands_to_process.append(('right_hand', future_transitions['right_hand']['frame_idx'] if future_transitions['right_hand'] else final_frame_idx))
+            keypoint_source_transitions = {}
+            
+            # Left hand
+            left_source_frame_idx = future_transitions['left_hand']['frame_idx'] if future_transitions['left_hand'] else final_frame_idx
+            hands_to_process.append(('left_hand', left_source_frame_idx))
+            
+            # Get transition type at the source frame for left hand
+            if future_transitions['left_hand']:
+                keypoint_source_transitions['left_hand'] = {
+                    'source_frame_idx': left_source_frame_idx,
+                    'transition_type': future_transitions['left_hand']['transition_type']  # Already available!
+                }
+            else:
+                keypoint_source_transitions['left_hand'] = {
+                    'source_frame_idx': final_frame_idx,
+                    'transition_type': 'final_frame'  # No transition, using final frame
+                }
+            
+            # Right hand
+            right_source_frame_idx = future_transitions['right_hand']['frame_idx'] if future_transitions['right_hand'] else final_frame_idx
+            hands_to_process.append(('right_hand', right_source_frame_idx))
+            
+            # Get transition type at the source frame for right hand
+            if future_transitions['right_hand']:
+                keypoint_source_transitions['right_hand'] = {
+                    'source_frame_idx': right_source_frame_idx,
+                    'transition_type': future_transitions['right_hand']['transition_type']  # Already available!
+                }
+            else:
+                keypoint_source_transitions['right_hand'] = {
+                    'source_frame_idx': final_frame_idx,
+                    'transition_type': 'final_frame'  # No transition, using final frame
+                }
+            
+            # Store the source transition information
+            frame_data['keypoint_source_transitions'] = keypoint_source_transitions
             
             # Process each hand
             for hand, source_frame_idx in hands_to_process:
@@ -728,10 +766,8 @@ def generate_keypoint_projection_video(video_dir, frame_names, keypoint_data, tr
                 if future_transitions['left_hand']:
                     render_keypoints_info['left_hand'] = future_transitions['left_hand']
                 if future_transitions['right_hand']:
-                    render_keypoints_info['right_hand'] = future_transitions['right_hand']            # For rendering, only show keypoints if there are actual future transitions
+                    render_keypoints_info['right_hand'] = future_transitions['right_hand']
             
-            
-            # render_keypoints_info = future_transitions if has_future_transitions else {'left_hand': None, 'right_hand': None}
             render_keypoints_on_image(input_image_path, keypoints_2d, render_keypoints_info, output_image_path)
             rendered_frames.append(output_image_path)
         
@@ -747,8 +783,19 @@ def generate_keypoint_projection_video(video_dir, frame_names, keypoint_data, tr
                                     if frame['has_future_transitions'])
         frames_with_keypoints = sum(1 for frame in transition_keypoints_data['frame_keypoints'] 
                                   if frame['keypoints_2d'] is not None)
+        
+        # Count transition types at source frames
+        transition_type_counts = {'0_to_1': 0, '1_to_0': 0, 'final_frame': 0}
+        for frame in transition_keypoints_data['frame_keypoints']:
+            if frame['keypoint_source_transitions']:
+                for hand, trans_info in frame['keypoint_source_transitions'].items():
+                    trans_type = trans_info['transition_type']
+                    if trans_type in transition_type_counts:
+                        transition_type_counts[trans_type] += 1
+        
         print(f"Frames with future transitions: {frames_with_transitions}/{len(frame_names)}")
         print(f"Frames with keypoint data: {frames_with_keypoints}/{len(frame_names)}")
+        print(f"Keypoint source transition types: {transition_type_counts}")
         
         # Create video from rendered frames
         if save_video and rendered_frames:
