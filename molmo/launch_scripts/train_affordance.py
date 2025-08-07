@@ -174,6 +174,31 @@ if __name__ == "__main__":
         else:
             eval_tasks = []
             tasks = [["train", ["affordance_new"], 1.0]]
+    elif args.mixture == "affordance_human_robot":
+        # default to use new affordance format
+        if args.cotrain:
+            eval_tasks = ["affordance_eval", "pointing_eval:test"]
+            tasks = [["egodex", ["affordance_new"], 0.25],
+                     ["robo_casa", ["robo_casa_affordance"], 0.25],
+                    ["demo", [
+                        "pixmo_ask_model_anything",
+                        ("pixmo_cap", 50000),
+                        "pixmo_cap_qa",
+                        "pixmo_pointing_explanations"
+                    ], 0.15],
+                    ["pointing", [
+                        "pixmo_points",
+                        "pixmo_count",
+                        "pixmo_points_high_freq",
+                        "pixmo_points_counting",
+                        "pixmo_points_high_freq_counting",
+                        "pixmo_count_counting",
+                    ], 0.35]
+            ]
+        else:
+            eval_tasks = []
+            tasks = [["egodex", ["affordance_new"], 0.5],
+                     ["robo_casa", ["robo_casa_affordance"], 0.5]]
     elif args.mixture == "robo_casa_affordance":
         # eval_tasks = ["robo_casa_affordance"]
         eval_tasks = []
