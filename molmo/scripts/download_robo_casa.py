@@ -34,8 +34,8 @@ def ensure_git_lfs():
 def dataset_exists_and_valid(repo_id):
     """Check if dataset already exists and can be loaded."""
     try:
-        # Try to load the dataset
-        dataset = LeRobotDataset(repo_id)
+        # Try to load the dataset with pyav backend
+        dataset = LeRobotDataset(repo_id, video_backend="pyav")
         print(f"Dataset already exists and is valid. Total episodes: {len(dataset)}")
         return True, dataset
     except Exception as e:
@@ -93,9 +93,9 @@ def main():
         # Download dataset using git clone
         download_dataset_with_git(repo_id, dataset_path)
         
-        # Load dataset with LeRobotDataset (will use the default path automatically)
+        # Load dataset with LeRobotDataset using pyav backend
         print("Loading dataset with LeRobotDataset...")
-        dataset = LeRobotDataset(repo_id)  # No need to specify root, it will use the default path
+        dataset = LeRobotDataset(repo_id, video_backend="pyav")  # Use pyav backend
         print(f"Dataset loaded successfully. Total episodes: {len(dataset)}")
     
     # Print first example

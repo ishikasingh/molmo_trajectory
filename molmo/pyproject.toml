@@ -27,7 +27,7 @@ dependencies = [
     "packaging",
     "cached_path>=1.6.4",
     "transformers>=v4.37.1",
-    "datasets",
+    "datasets<=3.6.0",
     "huggingface_hub",
     "sentencepiece",
     "requests",
