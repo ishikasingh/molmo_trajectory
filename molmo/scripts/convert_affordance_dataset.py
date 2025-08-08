@@ -131,6 +131,9 @@ def read_file_set(mp4_path: str, keypoint_json_path: str, hdf5_path: str) -> Dic
     # Assuming the JSON contains keypoints for each frame
     keypoints = [keypoints_data['frame_keypoints'][i]['keypoints_2d'] for i in range(len(keypoints_data['frame_keypoints']))]
     
+    # Extract transition information for each frame
+    transitions = [keypoints_data['frame_keypoints'][i].get('keypoint_source_transitions') for i in range(len(keypoints_data['frame_keypoints']))]
+    
     # Ensure keypoints list matches frame count
     assert len(keypoints) == len(frames)
     
@@ -146,6 +149,7 @@ def read_file_set(mp4_path: str, keypoint_json_path: str, hdf5_path: str) -> Dic
     return {
         'frames': frames,
         'keypoints': keypoints,
+        'transitions': transitions,  # NEW: Add transition data
         'language_instruction': language_instruction,
         'fps': fps,
         'duration': duration,
@@ -169,6 +173,7 @@ def process_file_set_worker(file_set: Dict, images_output_path: str, frame_inter
     for frame_idx in range(0, total_frames, frame_interval):
         frame = file_data['frames'][frame_idx]
         keypoints = file_data['keypoints'][frame_idx]
+        transitions = file_data['transitions'][frame_idx]  # NEW: Get transition data
 
         image_filename = f"frame_{frame_idx:06d}.jpg"
         image_path = video_images_dir / image_filename
@@ -186,6 +191,7 @@ def process_file_set_worker(file_set: Dict, images_output_path: str, frame_inter
             "image_path": relative_image_path,
             "instruction": file_data['language_instruction'],
             "hand_positions": hand_positions,
+            "transition_types": extract_transition_types(transitions),  # NEW: Add transition types
             "metadata": {
                 "video_id": file_set['base_number'],
                 "frame_idx": frame_idx,
@@ -205,6 +211,7 @@ def process_file_set_worker(file_set: Dict, images_output_path: str, frame_inter
 def create_huggingface_dataset(folder_path: str, output_path: str, images_output_path: str = None,
                                recursive: bool = True, frame_interval: int = 1, num_workers: Optional[int] = None):
     import datasets
+
 
     if images_output_path is None:
         images_output_path = Path(output_path).parent / "images"
@@ -293,6 +300,42 @@ def process_keypoints_for_dataset(keypoints_data, image_width, image_height):
         "points": points,
         "labels": labels
     }
+
+def extract_transition_types(transitions_data):
+    """
+    Extract transition types from the keypoint_source_transitions data.
+    
+    Args:
+        transitions_data: The keypoint_source_transitions data from the JSON
+        
+    Returns:
+        Dictionary with transition types for left and right hands
+    """
+    def translate_transition_type(transition_type):
+        """Translate transition type codes to meaningful labels"""
+        if transition_type == "0_to_1":
+            return "grasp"
+        elif transition_type == "1_to_0":
+            return "release"
+        elif transition_type == "final_frame":
+            return "final_frame"
+        else:
+            return None
+    
+    if transitions_data is None:
+        return {
+            "left_hand_transition": None,
+            "right_hand_transition": None
+        }
+    
+    left_transition = transitions_data.get('left_hand', {}).get('transition_type')
+    right_transition = transitions_data.get('right_hand', {}).get('transition_type')
+    
+    return {
+        "left_hand_transition": translate_transition_type(left_transition),
+        "right_hand_transition": translate_transition_type(right_transition)
+    }
+
 def create_dataset_splits(dataset, output_path: str, splits: dict = None):
     """
     Split the dataset into train/validation/test splits.
@@ -366,11 +409,11 @@ def create_dataset_example():
     
     # Step 1: Set your paths
     input_folder = "/root/sky_workdir/dataset/egodex/part2"
-    # input_folder = "/root/sky_workdir/dataset/small_test"   
     output_dataset_path = "/root/sky_workdir/dataset/affordance_dataset"
     output_split_path = "/root/sky_workdir/dataset/affordance_dataset_splits"
     images_output_path = "/root/sky_workdir/dataset/affordance_images"  # New: separate images directory
-    
+
+
     # Step 2: Create the dataset
     print("Creating HuggingFace dataset...")
     dataset = create_huggingface_dataset(
