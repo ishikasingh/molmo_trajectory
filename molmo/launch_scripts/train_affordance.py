@@ -178,8 +178,8 @@ if __name__ == "__main__":
         # default to use new affordance format
         if args.cotrain:
             eval_tasks = ["affordance_eval", "pointing_eval:test"]
-            tasks = [["egodex", ["affordance_new"], 0.25],
-                     ["robo_casa", ["robo_casa_affordance"], 0.25],
+            tasks = [["egodex", ["affordance_new"], 0.35],
+                     ["robo_casa", ["robo_casa_affordance"], 0.15],
                     ["demo", [
                         "pixmo_ask_model_anything",
                         ("pixmo_cap", 50000),
