@@ -7,6 +7,7 @@ from PIL import Image
 from pathlib import Path
 from typing import Dict, List, Union, Optional
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 def read_complete_file_sets(folder_path: str, recursive: bool = False) -> Dict:
     """
@@ -152,107 +153,107 @@ def read_file_set(mp4_path: str, keypoint_json_path: str, hdf5_path: str) -> Dic
         'metadata': metadata
     }
 
-def create_huggingface_dataset(folder_path: str, output_path: str, images_output_path: str = None, recursive: bool = True, frame_interval: int = 1):
-    """
-    Create a HuggingFace dataset from the complete file sets.
-    
-    Args:
-        folder_path: Path to the folder containing the data files
-        output_path: Path where to save the HuggingFace dataset
-        images_output_path: Path where to save extracted images. If None, uses output_path/images
-        recursive: Whether to search subdirectories recursively
-        frame_interval: Process every n-th frame (1 = every frame, 2 = every 2nd frame, etc.)
-    """
+def process_file_set_worker(file_set: Dict, images_output_path: str, frame_interval: int) -> List[Dict]:
+    file_data = read_file_set(
+        file_set['mp4_file'],
+        file_set['keypoint_json'],
+        file_set['hdf5_file']
+    )
+
+    video_images_dir = Path(images_output_path) / f"video_{file_set['base_number']}"
+    video_images_dir.mkdir(exist_ok=True)
+
+    dataset_items = []
+    total_frames = len(file_data['frames'])
+
+    for frame_idx in range(0, total_frames, frame_interval):
+        frame = file_data['frames'][frame_idx]
+        keypoints = file_data['keypoints'][frame_idx]
+
+        image_filename = f"frame_{frame_idx:06d}.jpg"
+        image_path = video_images_dir / image_filename
+        frame.save(image_path, "JPEG", quality=95)
+
+        relative_image_path = f"video_{file_set['base_number']}/{image_filename}"
+
+        hand_positions = process_keypoints_for_dataset(
+            keypoints,
+            image_width=frame.width,
+            image_height=frame.height
+        )
+
+        item = {
+            "image_path": relative_image_path,
+            "instruction": file_data['language_instruction'],
+            "hand_positions": hand_positions,
+            "metadata": {
+                "video_id": file_set['base_number'],
+                "frame_idx": frame_idx,
+                "original_frame_idx": frame_idx,
+                "image_size": [frame.width, frame.height],
+                "fps": file_data['fps'],
+                "duration": file_data['duration'],
+                "total_frames": total_frames,
+                "frame_interval": frame_interval,
+                "images_base_path": str(images_output_path),
+            }
+        }
+        dataset_items.append(item)
+
+    return dataset_items
+
+def create_huggingface_dataset(folder_path: str, output_path: str, images_output_path: str = None,
+                               recursive: bool = True, frame_interval: int = 1, num_workers: Optional[int] = None):
     import datasets
-    
-    # Set up images output directory
+
     if images_output_path is None:
         images_output_path = Path(output_path).parent / "images"
     images_output_path = Path(images_output_path)
     images_output_path.mkdir(parents=True, exist_ok=True)
-    
-    # Find all complete file sets
+
     file_sets = read_complete_file_sets(folder_path, recursive=recursive)
-    
+
     print(f"Found {file_sets['total_complete']} complete file sets")
     print(f"Frame interval: {frame_interval} (processing every {frame_interval}{'st' if frame_interval == 1 else 'nd' if frame_interval == 2 else 'rd' if frame_interval == 3 else 'th'} frame)")
     print(f"Images will be saved to: {images_output_path}")
-    
-    # Process each file set
+
     dataset_items = []
-    
-    for file_set in tqdm(file_sets['complete_sets'], desc="Processing file sets", unit="set"):
-        # print(f"Processing set {file_set['base_number']}...")
-        
-        # Read the data from all three files
-        file_data = read_file_set(
-            file_set['mp4_file'], 
-            file_set['keypoint_json'], 
-            file_set['hdf5_file']
-        )
-        
-        # Create directory for this video's frames
-        video_images_dir = images_output_path / f"video_{file_set['base_number']}"
-        video_images_dir.mkdir(exist_ok=True)
-        
-        # Create dataset items for every n-th frame
-        total_frames = len(file_data['frames'])
-        selected_frames = 0
-        
-        for frame_idx in range(0, total_frames, frame_interval):
-            frame = file_data['frames'][frame_idx]
-            keypoints = file_data['keypoints'][frame_idx]
-            
-            # Save frame as image file
-            image_filename = f"frame_{frame_idx:06d}.jpg"
-            image_path = video_images_dir / image_filename
-            
-            # Save the frame as JPEG
-            frame.save(image_path, "JPEG", quality=95)
-            
-            # Create relative path for the dataset
-            relative_image_path = f"video_{file_set['base_number']}/{image_filename}"
-            
-            # Process keypoints to match the expected format
-            hand_positions = process_keypoints_for_dataset(
-                keypoints, 
-                image_width=frame.width, 
-                image_height=frame.height
-            )
-            
-            # Create dataset item
-            item = {
-                "image_path": relative_image_path,  # Store path instead of PIL Image
-                "instruction": file_data['language_instruction'],
-                "hand_positions": hand_positions,
-                "metadata": {
-                    "video_id": file_set['base_number'],
-                    "frame_idx": frame_idx,
-                    "original_frame_idx": frame_idx,  # Keep track of original frame index
-                    "image_size": [frame.width, frame.height],
-                    "fps": file_data['fps'],
-                    "duration": file_data['duration'],
-                    "total_frames": total_frames,
-                    "frame_interval": frame_interval,
-                    "images_base_path": str(images_output_path),  # Store base path for loading images later
-                }
-            }
-            
-            dataset_items.append(item)
-        #     selected_frames += 1
-        
-        # print(f"  Set {file_set['base_number']}: {selected_frames}/{total_frames} frames selected")
-    
+
+    complete_sets = file_sets['complete_sets']
+    if num_workers is None:
+        try:
+            import os as _os
+            num_workers = max(1, min(len(complete_sets), _os.cpu_count() or 1))
+        except Exception:
+            num_workers = 1
+
+    if num_workers <= 1:
+        # Sequential fallback
+        from tqdm import tqdm as _tqdm
+        for file_set in _tqdm(complete_sets, desc="Processing file sets", unit="set"):
+            items = process_file_set_worker(file_set, str(images_output_path), frame_interval)
+            dataset_items.extend(items)
+    else:
+        # Parallel across file sets
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [
+                executor.submit(process_file_set_worker, file_set, str(images_output_path), frame_interval)
+                for file_set in complete_sets
+            ]
+            for fut in tqdm(as_completed(futures), total=len(futures), desc=f"Processing file sets (workers={num_workers})", unit="set"):
+                try:
+                    items = fut.result()
+                    dataset_items.extend(items)
+                except Exception as e:
+                    print(f"Error processing a file set: {e}")
+
     print(f"Created {len(dataset_items)} dataset items")
-    
-    # Create HuggingFace dataset
+
     dataset = datasets.Dataset.from_list(dataset_items)
-    
-    # Save to disk
     dataset.save_to_disk(output_path)
     print(f"Dataset saved to {output_path}")
     print(f"Images saved to {images_output_path}")
-    
+
     return dataset
 
 def process_keypoints_for_dataset(keypoints_data, image_width, image_height):
@@ -375,9 +376,10 @@ def create_dataset_example():
     dataset = create_huggingface_dataset(
         folder_path=input_folder,
         output_path=output_dataset_path,
-        images_output_path=images_output_path,  # New parameter
+        images_output_path=images_output_path,
         recursive=True,
-        frame_interval=5  # Process every 5th frame - adjust this value as needed
+        frame_interval=5,
+        num_workers=None  # or an int like 8
     )
     
     # Step 3: Create train/validation/test splits
@@ -385,7 +387,7 @@ def create_dataset_example():
     split_dataset = create_dataset_splits(
         dataset=dataset,
         output_path=output_split_path,
-        splits={"train": 0.8, "validation": 0.1, "test": 0.1}
+        splits={"train": 0.95, "validation": 0.02, "test": 0.03}
     )
     
     # Step 4: Verify the dataset
@@ -408,4 +410,9 @@ if __name__ == "__main__":
     # Uncomment the function you want to run:
     
     # read_complete_file_sets_example()  # Test reading files
+    import multiprocessing as mp
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass
     create_dataset_example()  # Create the HuggingFace dataset
