@@ -29,6 +29,7 @@ from transformers.image_utils import (
 )
 
 from olmo.data.data_formatter import DataFormatter
+import os
 
 
 def load_image(image_path):
@@ -48,6 +49,10 @@ def load_image(image_path):
         assert image_path.dtype == np.uint8, "Image should have uint8 type"
         return image_path
     else:
+        # PATCH: Map old path to new path using MOLMO_DATA_DIR
+        if isinstance(image_path, str) and image_path.startswith("/root/sky_workdir/molmo_dataset"):
+            image_path = image_path.replace("/root/sky_workdir/molmo_dataset", os.environ.get("MOLMO_DATA_DIR", "/root/sky_workdir/molmo_dataset"))
+        
         with PIL.Image.open(image_path) as image:
             return load_image(image)
 
