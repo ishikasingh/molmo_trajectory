@@ -358,7 +358,7 @@ class DataFormatter:
         point_text = " ".join(point_text)
         return f"<points {point_text} alt=\"{alt_text}\">{label_text}</points>"
     
-    def affordance_to_text(self, points, scale, label_text, alt_text):
+    def affordance_to_text(self, points, scale, label_text, alt_text, transition_types=None):
         if isinstance(scale, (tuple, list)):
             points /= np.array(scale)[None, :]
         else:
@@ -373,11 +373,35 @@ class DataFormatter:
         elif len(points) == 10:
             affordance_keypoints = AFFORDANCE_KEYPOINTS_WO_WRIST
         else:
-            raise ValueError(f"Invalid number of points: {len(points)}")
+            raise ValueError(f"Invalid number of points: {len(points)}")        
         for ix, (x, y) in enumerate(points):
             point_text.append(f"<{affordance_keypoints[ix]} x=\"{x:0.1f}\" y=\"{y:0.1f}\" />")
-        point_text = ", ".join(point_text)
-        return point_text
+
+        if transition_types:
+            # Split keypoints between left and right hands
+            # First half are left hand, second half are right hand
+            mid_point = len(affordance_keypoints) // 2
+            left_point_text = point_text[:mid_point]
+            right_point_text = point_text[mid_point:]
+            
+            left_transition = transition_types.get("left_hand_transition", "unknown")
+            right_transition = transition_types.get("right_hand_transition", "unknown")
+            
+            # Build output with transition types before the points
+            output_parts = []
+            
+            if left_point_text:
+                left_output = f"left hand: {left_transition}: " + ", ".join(left_point_text)
+                output_parts.append(left_output)
+            
+            if right_point_text:
+                right_output = f"right hand: {right_transition}: " + ", ".join(right_point_text)
+                output_parts.append(right_output)
+            
+            return ", ".join(output_parts)
+        else:
+            # Fall back to existing format
+            return ", ".join(point_text)
 
     def format_annotated_text(self, answer, point_annotations):
         for point_annotation in point_annotations:
@@ -403,7 +427,7 @@ class DataFormatter:
             else:
                 raise NotImplementedError()
         if style == "affordance_new":
-            point_txt = self.affordance_to_text(points, 100, label, label)
+            point_txt = self.affordance_to_text(points, 100, label, label, transition_types=example.get("transition_types"))
         else:
             if "point_scale" in example:
                 # Points are already normalized

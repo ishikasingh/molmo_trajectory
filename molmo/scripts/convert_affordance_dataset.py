@@ -320,7 +320,7 @@ def extract_transition_types(transitions_data):
         elif transition_type == "final_frame":
             return "final_frame"
         else:
-            return None
+            raise ValueError(f"Unknown transition type: {transition_type}")
     
     if transitions_data is None:
         return {

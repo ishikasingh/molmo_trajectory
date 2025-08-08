@@ -6,7 +6,7 @@ from olmo.data.dataset import Dataset
 from pathlib import Path
 
 class HandPositioningDataset(Dataset):
-    def __init__(self, data_path, split="train", use_new_output_format=False, ignore_wrist=False):
+    def __init__(self, data_path, split="train", use_new_output_format=False, ignore_wrist=False, use_transitions=False):
         """ 
         data_path: Path to your dataset
         split: "train", "validation", or "test"
@@ -19,6 +19,7 @@ class HandPositioningDataset(Dataset):
         self.data = self._load_data(data_path, split)
         self.use_new_output_format = use_new_output_format
         self.ignore_wrist = ignore_wrist
+        self.use_transitions = use_transitions
     def _load_data(self, data_path, split):
         """
         Load your data from whatever format you have.
@@ -89,7 +90,8 @@ class HandPositioningDataset(Dataset):
                     "label": example["instruction"],
                     "points": hand_positions,
                     "point_scale": 100,  # Our coordinates are already in percentage (0-100)
-                    "style": "affordance" if not self.use_new_output_format else "affordance_new"
+                    "style": "affordance" if not self.use_new_output_format else "affordance_new",
+                    "transition_types": example['transition_types'] if self.use_transitions else None
                 }
             ],
             "metadata": {

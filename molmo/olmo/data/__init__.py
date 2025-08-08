@@ -324,6 +324,9 @@ def get_dataset_by_name(dataset_name, split):
     elif dataset_name == "affordance_new":
         data_path = os.environ.get("AFFORDANCE_DATA_DIR")
         return HandPositioningDataset(data_path=data_path, split=split, use_new_output_format=True, ignore_wrist=True)
+    elif dataset_name == "affordance_with_transitions":
+        data_path = os.environ.get("AFFORDANCE_DATA_DIR")
+        return HandPositioningDataset(data_path=data_path, split=split, use_new_output_format=True, ignore_wrist=True, use_transitions=True)
     elif dataset_name == "robo_casa_affordance":
         return RobotCasaHandPositioningDataset(use_new_output_format=True, ignore_wrist=True)
     elif dataset_name == "affordance_eval": # only used in the evaluation after training, not the evaluation during training

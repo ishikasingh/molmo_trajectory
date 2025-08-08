@@ -112,6 +112,8 @@ if __name__ == "__main__":
                         help="whether it is a finetuning or post-training run")
     parser.add_argument("--cotrain", default=False, action="store_true",
                         help="whether it is a cotraining run")
+    parser.add_argument("--use_transitions", default=False, action="store_true",
+                        help="whether to use transitions in the affordance dataset")
     args, other_args = parser.parse_known_args()
 
     if args.mixture.startswith("single"):
@@ -169,17 +171,25 @@ if __name__ == "__main__":
     elif args.mixture == "affordance_new":
         if args.cotrain:
             eval_tasks = ["affordance_eval", "pointing_eval:test"]
-            tasks = [["train", ["affordance_new"], 0.5],
-                     ["pointing", ["pixmo_points"], 0.5]]
+            if args.use_transitions:
+                tasks = [["train", ["affordance_with_transitions"], 0.5],
+                         ["pointing", ["pixmo_points"], 0.5]]
+            else:   
+                tasks = [["train", ["affordance_new"], 0.5],
+                        ["pointing", ["pixmo_points"], 0.5]]
         else:
             eval_tasks = []
-            tasks = [["train", ["affordance_new"], 1.0]]
+            if args.use_transitions:
+                tasks = [["train", ["affordance_with_transitions"], 1.0]]
+            else:
+                tasks = [["train", ["affordance_new"], 1.0]]
     elif args.mixture == "affordance_human_robot":
         # default to use new affordance format
         if args.cotrain:
             eval_tasks = ["affordance_eval", "pointing_eval:test"]
-            tasks = [["egodex", ["affordance_new"], 0.35],
-                     ["robo_casa", ["robo_casa_affordance"], 0.15],
+            if args.use_transitions:
+                tasks = [["egodex", ["affordance_with_transitions"], 0.35],
+                         ["robo_casa", ["robo_casa_affordance"], 0.15],
                     ["demo", [
                         "pixmo_ask_model_anything",
                         ("pixmo_cap", 50000),
@@ -194,11 +204,33 @@ if __name__ == "__main__":
                         "pixmo_points_high_freq_counting",
                         "pixmo_count_counting",
                     ], 0.35]
-            ]
+                ]
+            else:
+                tasks = [["egodex", ["affordance_new"], 0.35],
+                         ["robo_casa", ["robo_casa_affordance"], 0.15],
+                    ["demo", [
+                        "pixmo_ask_model_anything",
+                        ("pixmo_cap", 50000),
+                        "pixmo_cap_qa",
+                        "pixmo_pointing_explanations"
+                    ], 0.15],
+                    ["pointing", [
+                        "pixmo_points",
+                        "pixmo_count",
+                        "pixmo_points_high_freq",
+                        "pixmo_points_counting",
+                        "pixmo_points_high_freq_counting",
+                        "pixmo_count_counting",
+                    ], 0.35]
+                ]
         else:
-            eval_tasks = []
-            tasks = [["egodex", ["affordance_new"], 0.5],
-                     ["robo_casa", ["robo_casa_affordance"], 0.5]]
+            eval_tasks = [] 
+            if args.use_transitions:
+                tasks = [["egodex", ["affordance_with_transitions"], 0.5],
+                         ["robo_casa", ["robo_casa_affordance"], 0.5]]
+            else:
+                tasks = [["egodex", ["affordance_new"], 0.5],
+                         ["robo_casa", ["robo_casa_affordance"], 0.5]]
     elif args.mixture == "robo_casa_affordance":
         # eval_tasks = ["robo_casa_affordance"]
         eval_tasks = []
