@@ -505,7 +505,7 @@ def main():
                 image_masks=image_masks,
                 image_input_idx=image_input_idx,
                 max_steps=args.max_new_tokens,
-                beam_size=1,
+                beam_size=3,
                 is_distributed=False
             )
         

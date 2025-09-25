@@ -30,6 +30,9 @@ def main():
         {"image_path": "./temp_test_image/test_1.jpeg", "prompt": "point to the yellow die"},
         {"image_path": "./temp_test_image/casa_test_5.png", "prompt": "point to the lemon"},
         {"image_path": "./temp_test_image/casa_test_1.png", "prompt": "point to the water bottle"},
+        {"image_path": "./temp_test_image/casa_test_2.png", "prompt": "point to the water bottle"},
+        {"image_path": "./temp_test_image/casa_test_3.png", "prompt": "point to the water bottle"},
+        {"image_path": "./temp_test_image/casa_test_4.png", "prompt": "point to the water bottle"},
         # Add more examples as needed
     ]
 
