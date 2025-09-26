@@ -42,6 +42,9 @@ class EgoDexVLADataset(Dataset):
         use_confidence_filter: Whether to filter out low-confidence poses
         confidence_threshold: Minimum confidence threshold (0-1)
         cache_frames: Whether to cache loaded frames in memory
+        transform: Optional transforms to apply to the image
+        output_2d_trajectory: Whether to output 2D or 3D trajectory
+        normalize_2d_coordinates: Whether to normalize 2D coordinates to 0-100 scale
     """
     
     def __init__(
@@ -55,7 +58,8 @@ class EgoDexVLADataset(Dataset):
         confidence_threshold: float = 0.5,
         cache_frames: bool = False,
         transform: Optional[transforms.Compose] = None,
-        output_2d_trajectory: bool = False  # New parameter
+        output_2d_trajectory: bool = False,
+        normalize_2d_coordinates: bool = True,  # New parameter
     ):
         self.data_dir = Path(data_dir)
         self.split = split
@@ -65,7 +69,8 @@ class EgoDexVLADataset(Dataset):
         self.confidence_threshold = confidence_threshold
         self.cache_frames = cache_frames
         self.transform = transform
-        self.output_2d_trajectory = output_2d_trajectory  # New parameter
+        self.output_2d_trajectory = output_2d_trajectory
+        self.normalize_2d_coordinates = normalize_2d_coordinates  # New parameter
         
         # Default joint names for VLA training
         if joint_names is None:
@@ -232,7 +237,7 @@ class EgoDexVLADataset(Dataset):
                 'frame_idx': mapping['frame_idx'],
                 'video_path': mapping['video_path'],
                 'hdf5_path': mapping['hdf5_path'],
-                'output_2d_trajectory': self.output_2d_trajectory
+                'output_2d_trajectory': self.output_2d_trajectory,
             }
         }
     
@@ -396,11 +401,16 @@ class EgoDexVLADataset(Dataset):
             
         Returns:
             2D projected trajectory tensor of shape [num_steps, num_joints, 2]
+            - If normalize_2d_coordinates=True: normalized to 0-100 scale
+            - If normalize_2d_coordinates=False: in pixel coordinates
         """
         with h5py.File(hdf5_path, 'r') as f:
             # Get camera intrinsics
             if 'camera/intrinsic' in f and f['camera/intrinsic'][()].shape == (3, 3):
                 intrinsic = f['camera/intrinsic'][()]  # Shape: [3, 3]
+                # Extract image dimensions from intrinsics (principal point should be near image center)
+                img_width = intrinsic[0, 2] * 2  # cx * 2 approximates width
+                img_height = intrinsic[1, 2] * 2  # cy * 2 approximates height
             else:
                 # Use default intrinsics if not available
                 intrinsic = np.array([
@@ -408,6 +418,8 @@ class EgoDexVLADataset(Dataset):
                     [0., 736.6339, 540.], 
                     [0., 0., 1.]
                 ])
+                img_width = 1920  # Default 1080p width
+                img_height = 1080  # Default 1080p height
             
             intrinsic = torch.from_numpy(intrinsic).float()
             
@@ -439,10 +451,23 @@ class EgoDexVLADataset(Dataset):
             w = points_2d_homo[:, 2:3]
             w = torch.where(w == 0, torch.ones_like(w), w)  # Replace zeros with 1
             
-            points_2d = points_2d_homo[:, :2] / w  # Shape: [num_steps * num_joints, 2]
+            points_2d_pixel = points_2d_homo[:, :2] / w  # Shape: [num_steps * num_joints, 2]
+            
+            # Apply normalization if requested
+            if self.normalize_2d_coordinates:
+                # Normalize to 0-100 scale like molmo data processing
+                # X-axis: 0 = left edge, 100 = right edge
+                # Y-axis: 0 = top edge, 100 = bottom edge
+                points_2d_normalized = torch.zeros_like(points_2d_pixel)
+                points_2d_normalized[:, 0] = (points_2d_pixel[:, 0] / img_width) * 100.0   # X normalization
+                points_2d_normalized[:, 1] = (points_2d_pixel[:, 1] / img_height) * 100.0  # Y normalization
+                points_2d_final = points_2d_normalized
+            else:
+                # Keep in pixel coordinates
+                points_2d_final = points_2d_pixel
             
             # Reshape back to original shape
-            points_2d = points_2d.view(num_steps, num_joints, 2)
+            points_2d = points_2d_final.view(num_steps, num_joints, 2)
             
             return points_2d
 
@@ -701,6 +726,57 @@ class EgoDexVLADataset(Dataset):
             print(f"  Visible joints: {', '.join(visible_joints)}")
 
 
+def trajectory_to_xml_text(trajectory: torch.Tensor, keypoint_names: Optional[List[str]] = None) -> str:
+    """
+    Convert trajectory tensor to XML-based text format.
+    
+    Args:
+        trajectory: Trajectory tensor of shape [num_steps, num_joints, 2] for 2D or [num_steps, num_joints, 3] for 3D
+        keypoint_names: Optional list of keypoint names. If None, uses default names
+        
+    Returns:
+        XML-formatted string with trajectory data for each keypoint
+    """
+    if keypoint_names is None:
+        keypoint_names = ['leftThumbTip', 'leftIndexFingerTip', 'rightThumbTip', 'rightIndexFingerTip']
+        
+    num_steps, num_joints, num_dims = trajectory.shape
+    
+    # Round coordinates to 1 decimal place
+    trajectory = torch.round(trajectory * 10) / 10
+    
+    xml_parts = []
+    
+    for joint_idx in range(num_joints):
+        joint_name = keypoint_names[joint_idx] if joint_idx < len(keypoint_names) else f"joint_{joint_idx}"
+        
+        # Get trajectory for this joint across all time steps
+        joint_trajectory = trajectory[:, joint_idx, :]  # Shape: [num_steps, num_dims]
+        
+        # Build coordinate attributes for this keypoint
+        coord_attrs = []
+        for t in range(num_steps):
+            if num_dims == 3:
+                # 3D trajectory: include x, y, z coordinates
+                x, y, z = joint_trajectory[t, 0].item(), joint_trajectory[t, 1].item(), joint_trajectory[t, 2].item()
+                coord_attrs.append(f"x{t+1}=\"{x:0.1f}\"")
+                coord_attrs.append(f"y{t+1}=\"{y:0.1f}\"")
+                coord_attrs.append(f"z{t+1}=\"{z:0.1f}\"")
+            else:
+                # 2D trajectory: include x, y coordinates
+                x, y = joint_trajectory[t, 0].item(), joint_trajectory[t, 1].item()
+                coord_attrs.append(f"x{t+1}=\"{x:0.1f}\"")
+                coord_attrs.append(f"y{t+1}=\"{y:0.1f}\"")
+        
+        # Combine all coordinates for this keypoint
+        coord_text = " ".join(coord_attrs)
+        
+        # Create XML element for this keypoint
+        xml_element = f"<{joint_name} {coord_text} />"
+        xml_parts.append(xml_element)
+    
+    return ", ".join(xml_parts)
+
 
 def create_data_transforms(image_size: Tuple[int, int] = (256, 256), augment: bool = True):
     """Create data transforms for training."""
@@ -724,6 +800,7 @@ def create_data_transforms(image_size: Tuple[int, int] = (256, 256), augment: bo
     return transform
 
 
+
 def create_dataloader(
     data_dir: str,
     split: str = "train",
@@ -733,7 +810,8 @@ def create_dataloader(
     action_chunking_horizon: int = 10,
     image_size: Tuple[int, int] = (256, 256),
     augment: bool = True,
-    output_2d_trajectory: bool = False, # New parameter
+    output_2d_trajectory: bool = False,
+    normalize_2d_coordinates: bool = True,  # New parameter
     **kwargs
 ) -> DataLoader:
     """Create a DataLoader for EgoDex VLA training."""
@@ -748,7 +826,8 @@ def create_dataloader(
         action_chunking_horizon=action_chunking_horizon,
         image_size=image_size,
         transform=transform,
-        output_2d_trajectory=output_2d_trajectory, # Pass the new parameter
+        output_2d_trajectory=output_2d_trajectory,
+        normalize_2d_coordinates=normalize_2d_coordinates,  # Pass the new parameter
         **kwargs
     )
     
@@ -795,24 +874,49 @@ if __name__ == "__main__":
     #     print(f"Episode info: {info}")
     
     # Create dataloader
+    # For normalized coordinates (0-100 scale, like molmo)
+    # dataloader = create_dataloader(
+    #     data_dir=data_dir,
+    #     split="test",
+    #     output_2d_trajectory=True,
+    #     action_chunking_horizon=30,
+    #     batch_size=4,
+    #     normalize_2d_coordinates=True,  # Default, coordinates from 0-100
+    #     output_xml_trajectory=True  # Enable XML output
+    # )
+
+    # For pixel coordinates
     dataloader = create_dataloader(
         data_dir=data_dir,
-        split="test",
-        batch_size=4,
-        action_chunking_horizon=30,
-        output_2d_trajectory=True
+        split="test", 
+        output_2d_trajectory=True,
+        normalize_2d_coordinates=True,  # Raw pixel coordinates
+        batch_size=2
     )
+    
+    # Create dataloader - simple tensor output
+    # dataloader = create_dataloader(
+    #     data_dir=data_dir,
+    #     split="test",
+    #     output_2d_trajectory=True,
+    #     action_chunking_horizon=10,
+    #     batch_size=2
+    # )
     
     print(f"Dataloader created with {len(dataloader)} batches")
     
-    dataloader.dataset.debug_trajectory_projection(5000, num_samples=1)
-    
-    print("Trajectory projection debug complete")
-    # # Test batch loading
-    # for i, batch in enumerate(dataloader):
-    #     print(f"Batch {i}:")
-    #     print(f"  Images: {batch['image'].shape}")
-    #     print(f"  Trajectories: {batch['trajectory'].shape}")
-    #     print(f"  Instructions: {len(batch['instruction'])}")
-    #     if i >= 2:  # Test first few batches
-    #         break
+    # Test batch loading
+    for i, batch in enumerate(dataloader):
+        print(f"Batch {i}:")
+        print(f"  Images: {batch['image'].shape}")
+        print(f"  Trajectories: {batch['trajectory'].shape}")
+        print(f"  Instructions: {len(batch['instruction'])}")
+        
+        # Convert first trajectory to XML using utility function
+        if batch['trajectory'].shape[0] > 0:
+            first_trajectory = batch['trajectory'][0]  # Shape: [num_steps, num_joints, 2/3]
+            xml_output = trajectory_to_xml_text(first_trajectory)
+            print(f"  XML Trajectory (first sample): {xml_output[:200]}...")
+        
+        if i >= 1:  # Test first few batches
+            break
