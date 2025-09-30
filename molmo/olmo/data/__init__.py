@@ -18,6 +18,7 @@ from olmo.data.pixmo_datasets import PixMoPointExplanations as PixMoPointExplana
 from olmo.data.affordance_datsets import HandPositioningDataset
 from olmo.data.robo_casa_affordance_datasets import RobotCasaHandPositioningDataset
 from olmo.torch_util import get_global_rank, get_world_size
+from olmo.data.trajectory_datasets import TrajectoryDataset
 
 log = logging.getLogger(__name__)
 
@@ -335,5 +336,22 @@ def get_dataset_by_name(dataset_name, split):
     elif dataset_name == "affordance_eval_new":
         data_path = os.environ.get("AFFORDANCE_EVAL_DATA_DIR")
         return HandPositioningDataset(data_path=data_path, split=split, use_new_output_format=True, ignore_wrist=True)
-
+    elif dataset_name == "trajectory_2d":
+        data_dir = os.environ.get("EGODEX_DATA_DIR")
+        return TrajectoryDataset(
+            data_dir=data_dir,
+            split=split,
+            action_chunking_horizon=30,
+            output_2d_trajectory=True,
+            normalize_2d_coordinates=True
+        )
+    elif dataset_name == "trajectory_3d":
+        data_dir = os.environ.get("EGODEX_DATA_DIR")
+        return TrajectoryDataset(
+            data_dir=data_dir,
+            split=split,
+            action_chunking_horizon=30,
+            output_2d_trajectory=False,
+            normalize_2d_coordinates=False
+        )
     raise NotImplementedError(dataset_name, split)

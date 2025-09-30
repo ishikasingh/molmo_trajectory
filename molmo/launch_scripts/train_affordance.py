@@ -231,6 +231,12 @@ if __name__ == "__main__":
             else:
                 tasks = [["egodex", ["affordance_new"], 0.5],
                          ["robo_casa", ["robo_casa_affordance"], 0.5]]
+    elif args.mixture == "trajectory_2d":
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_2d"], 1.0]]
+    elif args.mixture == "trajectory_3d":
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_3d"], 1.0]]
     elif args.mixture == "robo_casa_affordance":
         # eval_tasks = ["robo_casa_affordance"]
         eval_tasks = []

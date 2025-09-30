@@ -255,6 +255,29 @@ GENERAL_PROMPTS_V1 = {
         "I want to {label} please show me the hand and fingertip keypoints",
         "please show me how to {label} by outlining the hand and fingertip keypoints",
     ],
+    "trajectory": [
+        "Show me the trajectory of hands and fingertips during the task: {label}",
+        "Predict the motion path of hand keypoints for the task: {label}",
+        "Trace the hand and fingertip movements for the task: {label}",
+        "Show the temporal sequence of hand positions for the task: {label}",
+        "Display the hand keypoint trajectory during the task: {label}",
+        "Track how the hands and fingertips move during the task: {label}",
+        "Show the motion trajectory of hand keypoints for the task: {label}",
+        "Predict the sequence of hand positions over time for the task: {label}",
+        "Trace the path of hand and fingertip movements for the task: {label}",
+        "Show me how the hand keypoints move during the task: {label}",
+        "Display the temporal progression of hand positions for the task: {label}",
+        "Track the hand keypoint motion sequence for the task: {label}",
+        "Show the trajectory path of hands and fingertips for the task: {label}",
+        "Predict the movement pattern of hand keypoints during the task: {label}",
+        "Trace the hand motion trajectory for the task: {label}",
+        "Show how the hand positions change over time for the task: {label}",
+        "Display the hand keypoint movement sequence for the task: {label}",
+        "Track the temporal hand motion for the task: {label}",
+        "Show the hand and fingertip trajectory progression for the task: {label}",
+        "I want to {label}, show me the hand trajectory",
+        "Please trace the hand keypoint movements for {label}",
+    ],
 }
 
 
@@ -282,6 +305,7 @@ STYLE_TO_GENERAL_PROMPT = {
     "only_count": "only_count",
     "affordance": "affordance",
     "affordance_new": "affordance",
+    "trajectory": "trajectory",
     "plain": "plain",
 }
 
@@ -290,6 +314,12 @@ AFFORDANCE_KEYPOINTS = [
     "right_wrist", "right_thumb", "right_index", "right_middle", "right_ring", "right_pinky"
 ]
 AFFORDANCE_KEYPOINTS_WO_WRIST = [
+    "left_thumb", "left_index", "left_middle", "left_ring", "left_pinky",
+    "right_thumb", "right_index", "right_middle", "right_ring", "right_pinky"
+]
+
+# Trajectory keypoints based on egodex_loader default joint names
+TRAJECTORY_KEYPOINTS = [
     "left_thumb", "left_index", "left_middle", "left_ring", "left_pinky",
     "right_thumb", "right_index", "right_middle", "right_ring", "right_pinky"
 ]
@@ -325,6 +355,7 @@ DEMO_STYLES = [
     "pointing",
     "user_qa",
     "long_caption",
+    "trajectory",
 ]
 
 
@@ -403,6 +434,73 @@ class DataFormatter:
             # Fall back to existing format
             return ", ".join(point_text)
 
+    def trajectory_to_text(self, trajectory, scale, label_text, alt_text, keypoint_names=None):
+        """
+        Convert trajectory tensor to XML-based text format similar to egodex_loader.
+        
+        Args:
+            trajectory: Trajectory array of shape [num_steps, num_joints, 2] for 2D or [num_steps, num_joints, 3] for 3D
+            scale: Scale factor for coordinate normalization (only applied to 2D trajectories)
+            label_text: Label text for the trajectory
+            alt_text: Alt text for accessibility
+            keypoint_names: Optional list of keypoint names. If None, uses default trajectory keypoints
+            
+        Returns:
+            XML-formatted string with trajectory data for each keypoint
+        """
+        if keypoint_names is None:
+            keypoint_names = TRAJECTORY_KEYPOINTS
+            
+        # Handle numpy array or torch tensor
+        if hasattr(trajectory, 'numpy'):
+            trajectory = trajectory.numpy()
+        trajectory = np.array(trajectory)
+        
+        num_steps, num_joints, num_dims = trajectory.shape
+        
+        # Apply scale normalization ONLY for 2D trajectories
+        # 3D trajectories are in camera frame coordinates and should not be normalized
+        if num_dims == 2:
+            if isinstance(scale, (tuple, list)):
+                trajectory /= np.array(scale)[None, None, :]
+            else:
+                trajectory *= (100/scale)
+        
+        # Round coordinates to 1 decimal place
+        trajectory = np.round(trajectory * 10) / 10
+        
+        xml_parts = []
+        
+        for joint_idx in range(num_joints):
+            joint_name = keypoint_names[joint_idx] if joint_idx < len(keypoint_names) else f"joint_{joint_idx}"
+            
+            # Get trajectory for this joint across all time steps
+            joint_trajectory = trajectory[:, joint_idx, :]  # Shape: [num_steps, num_dims]
+            
+            # Build coordinate attributes for this keypoint
+            coord_attrs = []
+            for t in range(num_steps):
+                if num_dims == 3:
+                    # 3D trajectory: include x, y, z coordinates
+                    x, y, z = joint_trajectory[t, 0], joint_trajectory[t, 1], joint_trajectory[t, 2]
+                    coord_attrs.append(f"x{t+1}=\"{x:0.1f}\"")
+                    coord_attrs.append(f"y{t+1}=\"{y:0.1f}\"")
+                    coord_attrs.append(f"z{t+1}=\"{z:0.1f}\"")
+                else:
+                    # 2D trajectory: include x, y coordinates
+                    x, y = joint_trajectory[t, 0], joint_trajectory[t, 1]
+                    coord_attrs.append(f"x{t+1}=\"{x:0.1f}\"")
+                    coord_attrs.append(f"y{t+1}=\"{y:0.1f}\"")
+            
+            # Combine all coordinates for this keypoint
+            coord_text = " ".join(coord_attrs)
+            
+            # Create XML element for this keypoint
+            xml_element = f"<{joint_name} {coord_text} />"
+            xml_parts.append(xml_element)
+        
+        return ", ".join(xml_parts)
+
     def format_annotated_text(self, answer, point_annotations):
         for point_annotation in point_annotations:
             parts = answer.split("<|POINT|>", maxsplit=1)
@@ -415,19 +513,33 @@ class DataFormatter:
     def format_points(self, example):
         if "points" not in example:
             return None
-        points = example["points"]
+        points = example["points"] # TODO: check if we can still use points in trajectory data
         style = example["style"]
         if "label" in example:
             label = example["label"].lower()
         else:
             label = example["question"]
         if len(points) == 0:
-            if style in ["pointing", "point_count", "affordance", "affordance_new"]:
+            if style in ["pointing", "point_count", "affordance", "affordance_new", "trajectory"]:
                 return "There are none."
             else:
                 raise NotImplementedError()
         if style == "affordance_new":
             point_txt = self.affordance_to_text(points, 100, label, label, transition_types=example.get("transition_types"))
+        elif style == "trajectory":
+            # Handle trajectory data - points should be a trajectory tensor of shape [num_steps, num_joints, 2/3]
+            # For now, assume points contain the trajectory data
+            if "trajectory" in example:
+                trajectory_data = example["trajectory"] # TODO: check if this is the correct key
+            else:
+                trajectory_data = points
+            
+            if "point_scale" in example:
+                point_txt = self.trajectory_to_text(trajectory_data, example["point_scale"], label, label)
+            else:
+                # Points are in pixel coordinates - convert using image dimensions
+                h, w = example["image"].shape[:2] if "image" in example else (1080, 1920)  # Default resolution
+                point_txt = self.trajectory_to_text(trajectory_data, [w/100, h/100], label, label)
         else:
             if "point_scale" in example:
                 # Points are already normalized
@@ -556,7 +668,7 @@ class DataFormatter:
             # Bare-bone prompt with no templating or instructions
             if "prompt" in example:
                 prompt = example["prompt"]
-            elif style in ["pointing", "point_count", "affordance", "affordance_new"]:
+            elif style in ["pointing", "point_count", "affordance", "affordance_new", "trajectory"]:
                 if "question" in example:
                     prompt = example["question"]
                 else:
@@ -582,7 +694,7 @@ class DataFormatter:
                 # plain text for everything else
                 if style == "long_caption":
                     prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1["long_caption"], example, rng, dbg=self.debug)
-                elif style in ["pointing", "point_count", "affordance", "affordance_new"]:
+                elif style in ["pointing", "point_count", "affordance", "affordance_new", "trajectory"]:
                     # output, prompt, metadata = self.format_points(example)
                     if "question" in example:
                         prompt = example["question"]
