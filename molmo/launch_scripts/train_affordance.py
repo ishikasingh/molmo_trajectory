@@ -264,7 +264,7 @@ if __name__ == "__main__":
         inf_eval_interval = 20
         eval_interval = 20
         log_interval = 5
-        eval_examples = 16
+        eval_examples = 8
         max_inf_examples = 16
         duration = 1000
         eval_subset_batches = 4

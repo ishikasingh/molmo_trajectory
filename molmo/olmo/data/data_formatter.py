@@ -281,33 +281,34 @@ GENERAL_PROMPTS_V1 = {
 }
 
 
-STYLE_TO_GENERAL_PROMPT = {
-    "vqa2": "short_answer",
-    "coco_captioning": "short_caption",
-    "gqa": "short_answer",
-    "ocr_vqa": "short_answer",
-    "tally_qa": "short_answer",
-    "text_vqa": "short_answer",
-    "okvqa": "short_answer",
-    "chart_qa": "short_answer",
-    "doc_qa": "short_answer",
-    "info_qa": "short_answer",
-    "science_qa": "multiple_choice",
-    "ai2_diagram": "multiple_choice",
-    "a_okvqa_mc": "multiple_choice",
-    "a_okvqa_da": "short_answer",
-    "long_caption": "long_caption",
-    "scifi_charts": "short_answer",
-    "scifi_charts_qa": "short_answer",
-    "pointing": "pointing",
-    "point_count": "point_count",
-    "count_then_point": "count_then_point",
-    "only_count": "only_count",
-    "affordance": "affordance",
-    "affordance_new": "affordance",
-    "trajectory": "trajectory",
-    "plain": "plain",
-}
+# STYLE_TO_GENERAL_PROMPT = {
+#     "vqa2": "short_answer",
+#     "coco_captioning": "short_caption",
+#     "gqa": "short_answer",
+#     "ocr_vqa": "short_answer",
+#     "tally_qa": "short_answer",
+#     "text_vqa": "short_answer",
+#     "okvqa": "short_answer",
+#     "chart_qa": "short_answer",
+#     "doc_qa": "short_answer",
+#     "info_qa": "short_answer",
+#     "science_qa": "multiple_choice",
+#     "ai2_diagram": "multiple_choice",
+#     "a_okvqa_mc": "multiple_choice",
+#     "a_okvqa_da": "short_answer",
+#     "long_caption": "long_caption",
+#     "scifi_charts": "short_answer",
+#     "scifi_charts_qa": "short_answer",
+#     "pointing": "pointing",
+#     "point_count": "point_count",
+#     "count_then_point": "count_then_point",
+#     "only_count": "only_count",
+#     "affordance": "affordance",
+#     "affordance_new": "affordance",
+#     "trajectory_2d": "trajectory",
+#     "trajectory_3d": "trajectory",
+#     "plain": "plain",
+# }
 
 AFFORDANCE_KEYPOINTS = [
     "left_wrist", "left_thumb", "left_index", "left_middle", "left_ring", "left_pinky",
@@ -467,7 +468,7 @@ class DataFormatter:
                 trajectory *= (100/scale)
         
         # Round coordinates to 1 decimal place
-        trajectory = np.round(trajectory * 10) / 10
+        trajectory = np.round(trajectory, 1)
         
         xml_parts = []
         
@@ -513,7 +514,7 @@ class DataFormatter:
     def format_points(self, example):
         if "points" not in example:
             return None
-        points = example["points"] # TODO: check if we can still use points in trajectory data
+        points = example["points"]
         style = example["style"]
         if "label" in example:
             label = example["label"].lower()
@@ -526,20 +527,12 @@ class DataFormatter:
                 raise NotImplementedError()
         if style == "affordance_new":
             point_txt = self.affordance_to_text(points, 100, label, label, transition_types=example.get("transition_types"))
-        elif style == "trajectory":
+        elif style == "trajectory_2d" or style == "trajectory_3d":
             # Handle trajectory data - points should be a trajectory tensor of shape [num_steps, num_joints, 2/3]
             # For now, assume points contain the trajectory data
-            if "trajectory" in example:
-                trajectory_data = example["trajectory"] # TODO: check if this is the correct key
-            else:
-                trajectory_data = points
-            
-            if "point_scale" in example:
-                point_txt = self.trajectory_to_text(trajectory_data, example["point_scale"], label, label)
-            else:
-                # Points are in pixel coordinates - convert using image dimensions
-                h, w = example["image"].shape[:2] if "image" in example else (1080, 1920)  # Default resolution
-                point_txt = self.trajectory_to_text(trajectory_data, [w/100, h/100], label, label)
+            trajectory_data = points
+            point_txt = self.trajectory_to_text(trajectory_data, 100, label, label)
+
         else:
             if "point_scale" in example:
                 # Points are already normalized
@@ -694,7 +687,7 @@ class DataFormatter:
                 # plain text for everything else
                 if style == "long_caption":
                     prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1["long_caption"], example, rng, dbg=self.debug)
-                elif style in ["pointing", "point_count", "affordance", "affordance_new", "trajectory"]:
+                elif style in ["pointing", "point_count", "affordance", "affordance_new", "trajectory_2d", "trajectory_3d"]:
                     # output, prompt, metadata = self.format_points(example)
                     if "question" in example:
                         prompt = example["question"]
@@ -706,6 +699,8 @@ class DataFormatter:
                         prompt_style = style
                         if style == "affordance_new":
                             prompt_style = "affordance"
+                        if style == "trajectory_2d" or style == "trajectory_3d":
+                            prompt_style = "trajectory"
                         prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1[prompt_style], dict(example, label=prompt), rng, dbg=self.debug)
                     output = self.format_points(example)
                 elif "prompt" in example:
@@ -718,7 +713,6 @@ class DataFormatter:
                     prompt = ""
         else:
             raise NotImplementedError(self.prompt_templates)
-
         if output is None and not for_inference:
             if "answers" in example:
                 output = self.select_vqa_answer(example["answers"], rng)

@@ -11,6 +11,7 @@ import torch
 from pathlib import Path
 from typing import Dict, List, Optional
 from PIL import Image
+from tqdm import tqdm
 from olmo.data.dataset import Dataset
 
 
@@ -62,6 +63,7 @@ class TrajectoryDataset(Dataset):
         if self.split == "train":
             split_dirs = []
             for part in ["part1", "part2", "part3", "part4", "part5"]:
+            # for part in ["small_test"]: # NOTE: debug only
                 part_dir = self.data_dir / part
                 if part_dir.exists():
                     split_dirs.append(part_dir)
@@ -70,6 +72,8 @@ class TrajectoryDataset(Dataset):
         else:
             raise ValueError(f"Invalid split: {self.split}")
         
+        # First, collect all video files to get total count for progress bar
+        all_video_files = []
         for split_dir in split_dirs:
             if not split_dir.exists():
                 continue
@@ -77,44 +81,49 @@ class TrajectoryDataset(Dataset):
             task_dirs = [d for d in split_dir.iterdir() if d.is_dir()]
             
             for task_dir in task_dirs:
-                task_name = task_dir.name
                 video_files = list(task_dir.glob("*.mp4"))
+                all_video_files.extend(video_files)
+        
+        # Process video files with progress bar
+        for video_file in tqdm(all_video_files, desc="Building index mapping", unit="video"):
+            hdf5_file = video_file.with_suffix('.hdf5')
+            if not hdf5_file.exists():
+                continue
+            
+            # cap = cv2.VideoCapture(str(video_file))
+            # if not cap.isOpened():
+            #     continue
                 
-                for video_file in video_files:
-                    hdf5_file = video_file.with_suffix('.hdf5')
-                    if not hdf5_file.exists():
-                        continue
-                    
-                    cap = cv2.VideoCapture(str(video_file))
-                    if not cap.isOpened():
-                        continue
+            # frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            # cap.release()
+            
+            # if frame_count < self.action_chunking_horizon:
+            #     continue
+            
+            # Get task name from parent directory
+            task_name = video_file.parent.name
+            
+            try:
+                with h5py.File(hdf5_file, 'r') as f:
+                    # missing_joints = [j for j in self.joint_names if f'transforms/{j}' not in f]
+                    # if missing_joints:
+                    #     continue
                         
-                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    cap.release()
-                    
-                    if frame_count < self.action_chunking_horizon:
-                        continue
-                    
-                    try:
-                        with h5py.File(hdf5_file, 'r') as f:
-                            missing_joints = [j for j in self.joint_names if f'transforms/{j}' not in f]
-                            if missing_joints:
-                                continue
-                                
-                            trajectory_length = f[f'transforms/{self.joint_names[0]}'].shape[0]
-                            
-                            for frame_idx in range(trajectory_length - self.action_chunking_horizon):
-                                index_mapping.append({
-                                    'video_path': str(video_file),
-                                    'hdf5_path': str(hdf5_file),
-                                    'frame_idx': frame_idx,
-                                    'task_name': task_name,
-                                    'episode_id': video_file.stem,
-                                    'total_frames': frame_count,
-                                    'trajectory_length': trajectory_length
-                                })
-                    except Exception as e:
-                        continue
+                    trajectory_length = f[f'transforms/{self.joint_names[0]}'].shape[0]
+                for frame_idx in range(trajectory_length - self.action_chunking_horizon):
+                    index_mapping.append({
+                        'video_path': str(video_file),
+                        'hdf5_path': str(hdf5_file),
+                        'frame_idx': frame_idx,
+                        'task_name': task_name,
+                        # 'episode_id': video_file.stem,
+                        # 'total_frames': frame_count,
+                        # 'trajectory_length': trajectory_length
+                    })
+            except Exception as e:
+                print(f"    Error processing {hdf5_file}: {e}")
+                continue
+            # time.sleep(0.05)
         
         return index_mapping
     
@@ -143,15 +152,15 @@ class TrajectoryDataset(Dataset):
             'message_list': [
                 {
                     'label': instruction,
-                    'trajectory': final_trajectory,
+                    'points': final_trajectory, # to make it compatible with the data formatter, points means trajectory
                     'point_scale': 100 if self.normalize_2d_coordinates and self.output_2d_trajectory else None,
-                    'style': 'trajectory',
+                    'style': 'trajectory_2d' if self.output_2d_trajectory else 'trajectory_3d',
                 }
             ],
             'metadata': {
                 'image': image,
                 'task_name': mapping['task_name'],
-                'episode_id': mapping['episode_id'],
+                # 'episode_id': mapping['episode_id'],
                 'frame_idx': mapping['frame_idx'],
                 'output_2d_trajectory': self.output_2d_trajectory,
             }
@@ -206,7 +215,7 @@ class TrajectoryDataset(Dataset):
 
     def _project_trajectory_to_2d(self, hdf5_path: str, current_frame: int, trajectory: torch.Tensor) -> torch.Tensor:
         with h5py.File(hdf5_path, 'r') as f:
-            if 'camera/intrinsic' in f:
+            if 'camera/intrinsic' in f and f['camera/intrinsic'][()].shape == (3, 3):
                 intrinsic = f['camera/intrinsic'][()]
                 img_width = intrinsic[0, 2] * 2
                 img_height = intrinsic[1, 2] * 2
