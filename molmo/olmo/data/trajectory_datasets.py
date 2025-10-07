@@ -8,6 +8,7 @@ import h5py
 import cv2
 import numpy as np
 import torch
+import pickle
 from pathlib import Path
 from typing import Dict, List, Optional
 from PIL import Image
@@ -52,12 +53,57 @@ class TrajectoryDataset(Dataset):
         else:
             self.joint_names = joint_names
         
-        print(f"Building index mapping for {split} split...")
+        print(f"Loading index mapping for {split} split...")
         self.index_mapping = self._build_index_mapping()
         print(f"Loaded {len(self.index_mapping)} samples from {split} split")
         
+    def _get_cache_filepath(self) -> Path:
+        """Get the path to the cached index mapping file."""
+        cache_filename = f"index_mapping_{self.split}_horizon{self.action_chunking_horizon}.pkl"
+        return self.data_dir / cache_filename
+    
+    def _load_index_from_cache(self) -> Optional[List[Dict]]:
+        """Load index mapping from cache file if it exists."""
+        cache_file = self._get_cache_filepath()
+        if cache_file.exists():
+            print(f"Loading cached index mapping from {cache_file}...")
+            with open(cache_file, 'rb') as f:
+                cached_data = pickle.load(f)
+            
+            # Validate that cache matches current configuration
+            if (cached_data.get('split') == self.split and
+                cached_data.get('action_chunking_horizon') == self.action_chunking_horizon and
+                cached_data.get('joint_names') == self.joint_names):
+                print(f"Successfully loaded {len(cached_data['index_mapping'])} samples from cache")
+                return cached_data['index_mapping']
+            else:
+                print("Cache configuration mismatch, rebuilding index...")
+        return None
+    
+    def _save_index_to_cache(self, index_mapping: List[Dict]) -> None:
+        """Save index mapping to cache file."""
+        cache_file = self._get_cache_filepath()
+        cache_data = {
+            'split': self.split,
+            'action_chunking_horizon': self.action_chunking_horizon,
+            'joint_names': self.joint_names,
+            'index_mapping': index_mapping,
+        }
+        
+        print(f"Saving index mapping to cache: {cache_file}...")
+        with open(cache_file, 'wb') as f:
+            pickle.dump(cache_data, f)
+        print(f"Successfully saved {len(index_mapping)} samples to cache")
+
     def _build_index_mapping(self) -> List[Dict]:
         """Build a flat index mapping across all videos and frames."""
+        # Try to load from cache first
+        cached_index = self._load_index_from_cache()
+        if cached_index is not None:
+            return cached_index
+        
+        # Build index from scratch if cache doesn't exist
+        print("Building index mapping from scratch...")
         index_mapping = []
         
         if self.split == "train":
@@ -124,6 +170,9 @@ class TrajectoryDataset(Dataset):
                 print(f"    Error processing {hdf5_file}: {e}")
                 continue
             # time.sleep(0.05)
+        
+        # Save to cache for future use
+        self._save_index_to_cache(index_mapping)
         
         return index_mapping
     
@@ -243,3 +292,118 @@ class TrajectoryDataset(Dataset):
                 points_2d_final = points_2d_pixel
             
             return points_2d_final.view(num_steps, num_joints, 2)
+
+
+def build_and_save_index_offline(
+    data_dir: str,
+    split: str = "train",
+    action_chunking_horizon: int = 30,
+    joint_names: Optional[List[str]] = None,
+    force_rebuild: bool = False,
+):
+    """
+    Build and save index mapping offline for faster dataset loading.
+    
+    Args:
+        data_dir: Path to the data directory
+        split: Dataset split ('train' or 'test')
+        action_chunking_horizon: Number of frames in action chunks
+        joint_names: Optional list of joint names to use
+        force_rebuild: If True, rebuild index even if cache exists
+    """
+    print(f"\n{'='*80}")
+    print(f"Building index mapping offline for {split} split")
+    print(f"Data directory: {data_dir}")
+    print(f"Action chunking horizon: {action_chunking_horizon}")
+    print(f"{'='*80}\n")
+    
+    # Create a temporary dataset instance to trigger index building
+    dataset = TrajectoryDataset(
+        data_dir=data_dir,
+        split=split,
+        action_chunking_horizon=action_chunking_horizon,
+        joint_names=joint_names,
+    )
+    
+    if force_rebuild:
+        cache_file = dataset._get_cache_filepath()
+        if cache_file.exists():
+            print(f"Removing existing cache file: {cache_file}")
+            cache_file.unlink()
+            # Rebuild by creating a new instance
+            dataset = TrajectoryDataset(
+                data_dir=data_dir,
+                split=split,
+                action_chunking_horizon=action_chunking_horizon,
+                joint_names=joint_names,
+            )
+    
+    print(f"\n{'='*80}")
+    print(f"Index building complete!")
+    print(f"Total samples: {len(dataset.index_mapping)}")
+    print(f"Cache saved to: {dataset._get_cache_filepath()}")
+    print(f"{'='*80}\n")
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Build and save trajectory dataset index mapping offline")
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=None,
+        help="Path to data directory (defaults to EGODEX_DATA_DIR env variable)"
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        choices=["train", "test"],
+        help="Dataset split to build index for"
+    )
+    parser.add_argument(
+        "--action_chunking_horizon",
+        type=int,
+        default=30,
+        help="Number of frames in action chunks"
+    )
+    parser.add_argument(
+        "--force_rebuild",
+        action="store_true",
+        default=False,
+        help="Force rebuild index even if cache exists"
+    )
+    parser.add_argument(
+        "--build_all",
+        action="store_true",
+        default=False,
+        help="Build index for both train and test splits"
+    )
+    
+    args = parser.parse_args()
+    
+    # Get data directory
+    data_dir = args.data_dir
+    if data_dir is None:
+        data_dir = os.environ.get("EGODEX_DATA_DIR")
+        if data_dir is None:
+            raise ValueError("--data_dir must be provided or EGODEX_DATA_DIR environment variable must be set")
+    
+    if args.build_all:
+        # Build both train and test splits
+        for split in ["train", "test"]:
+            build_and_save_index_offline(
+                data_dir=data_dir,
+                split=split,
+                action_chunking_horizon=args.action_chunking_horizon,
+                force_rebuild=args.force_rebuild,
+            )
+    else:
+        # Build only the specified split
+        build_and_save_index_offline(
+            data_dir=data_dir,
+            split=args.split,
+            action_chunking_horizon=args.action_chunking_horizon,
+            force_rebuild=args.force_rebuild,
+        )
