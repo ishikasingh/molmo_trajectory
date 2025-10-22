@@ -23,7 +23,7 @@ class TrajectoryDataset(Dataset):
         self,
         data_dir: str = None,
         split: str = "train",
-        action_chunking_horizon: int = 10,
+        action_chunking_horizon: int = 30,
         joint_names: Optional[List[str]] = None,
         output_2d_trajectory: bool = True,
         normalize_2d_coordinates: bool = True,
@@ -114,7 +114,8 @@ class TrajectoryDataset(Dataset):
                 if part_dir.exists():
                     split_dirs.append(part_dir)
         elif self.split == "test":
-            split_dirs = [self.data_dir / "test"]
+            # split_dirs = [self.data_dir / "test"]
+            split_dirs = [self.data_dir / "small_test"]
         else:
             raise ValueError(f"Invalid split: {self.split}")
         
