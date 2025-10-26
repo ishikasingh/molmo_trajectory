@@ -517,6 +517,67 @@ class DataFormatter:
         """
         return "<trajectory>"
 
+    def state_to_text(self, state, scale, keypoint_names=None):
+        """
+        Convert robot state (single timestep) to XML-based text format.
+        
+        Similar to trajectory_to_text but for a single state, not multiple steps.
+        
+        Args:
+            state: State array of shape [num_joints] for 1D, [num_joints, 2] for 2D, or [num_joints, 3] for 3D
+            scale: Scale factor for coordinate normalization (only applied to 2D states)
+            keypoint_names: Optional list of keypoint names. If None, uses default trajectory keypoints
+            
+        Returns:
+            XML-formatted string with state data for each keypoint
+        """
+        if keypoint_names is None:
+            keypoint_names = TRAJECTORY_KEYPOINTS
+            
+        # Handle numpy array or torch tensor
+        if hasattr(state, 'numpy'):
+            state = state.numpy()
+        state = np.array(state)
+        
+        num_joints, num_dims = state.shape
+        
+        # Apply scale normalization ONLY for 2D states
+        if num_dims == 2:
+            if isinstance(scale, (tuple, list)):
+                state /= np.array(scale)[None, :]
+            else:
+                state *= (100/scale)
+            # Round coordinates to 1 decimal place
+            state = np.round(state, 1)
+        elif num_dims == 3:
+            state = np.round(state, 2)
+        
+        xml_parts = []
+        
+        for joint_idx in range(num_joints):
+            joint_name = keypoint_names[joint_idx] if joint_idx < len(keypoint_names) else f"joint_{joint_idx}"
+            
+            # Get state values for this joint
+            joint_state = state[joint_idx, :]
+            
+            # Build coordinate attributes for this keypoint
+            if num_dims == 3:
+                # 3D state: include x, y, z coordinates
+                x, y, z = joint_state[0], joint_state[1], joint_state[2]
+                coord_text = f"x=\"{x:0.2f}\" y=\"{y:0.2f}\" z=\"{z:0.2f}\""
+            elif num_dims == 2:
+                # 2D state: include x, y coordinates
+                x, y = joint_state[0], joint_state[1]
+                coord_text = f"x=\"{x:0.1f}\" y=\"{y:0.1f}\""
+            else:
+                raise ValueError(f"Invalid number of dimensions: {num_dims}")
+            
+            # Create XML element for this keypoint
+            xml_element = f"<{joint_name} {coord_text} />"
+            xml_parts.append(xml_element)
+        
+        return ", ".join(xml_parts)
+
     def format_annotated_text(self, answer, point_annotations):
         for point_annotation in point_annotations:
             parts = answer.split("<|POINT|>", maxsplit=1)
@@ -721,6 +782,16 @@ class DataFormatter:
                         if style in ["trajectory_2d_text", "trajectory_3d_text", "trajectory_2d_fm", "trajectory_3d_fm"]:
                             prompt_style = "trajectory"
                         prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1[prompt_style], dict(example, label=prompt), rng, dbg=self.debug)
+                    
+                    # Add robot state information to the prompt for trajectory tasks
+                    if style in ["trajectory_2d_text", "trajectory_3d_text", "trajectory_2d_fm", "trajectory_3d_fm"] and "state" in example:
+                        # Transform the robot state to text format and prepend to the prompt
+                        state_scale = example.get("point_scale", 100)
+                        state_text = self.state_to_text(example["state"], state_scale)
+                        # Add state prefix text
+                        state_prefix = f"Current finger positions: {state_text}\n"
+                        prompt = state_prefix + prompt
+                    
                     output = self.format_points(example)
                 elif "prompt" in example:
                     prompt = example["prompt"]
@@ -746,7 +817,8 @@ class DataFormatter:
             else:
                 print(example)
                 raise ValueError("No output in example, if this is an inference-only task make sure `for_inference` is True")
-
+        print(f"Prompt: {prompt}")
+        print(f"Output: {output}")
         return prompt, output, metadata
 
     def _format_example(self, message, example, is_training, for_inference, rng):

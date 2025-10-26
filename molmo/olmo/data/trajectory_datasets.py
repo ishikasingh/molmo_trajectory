@@ -215,12 +215,14 @@ class TrajectoryDataset(Dataset):
         
         return {
             'image': image,
+            'state': final_trajectory[0],
             'message_list': [
                 {
                     'label': instruction,
                     'points': final_trajectory, # to make it compatible with the data formatter, points means trajectory
                     'point_scale': 100 if self.normalize_2d_coordinates and self.output_2d_trajectory else None,
                     'style': style,
+                    'state': final_trajectory[0],  # Include the initial robot state so it can be formatted in the prompt
                 }
             ],
             'trajectory_target': trajectory_flattened_joints,  # For flow matching: shape (num_steps, num_joints*coords) = (action_horizon, action_dim)
