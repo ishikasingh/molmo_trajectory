@@ -181,7 +181,7 @@ def main(cfg: TrainConfig) -> None:
                 olmo_model.to_empty(device="cpu")
             if cfg.initial_model_checkpoint:
                 state_dict = torch.load(join(cfg.initial_model_checkpoint, "model.pt"), map_location="cpu")
-                olmo_model.load_state_dict(state_dict)
+                olmo_model.load_state_dict(state_dict, strict=False)
                 del state_dict
             else:
                 olmo_model.reset_with_pretrained_weights()

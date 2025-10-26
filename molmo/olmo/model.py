@@ -1744,6 +1744,7 @@ class Molmo(nn.Module):
                 "vision_backbone.cls_projector",
                 "vision_backbone.pad_embed",
                 "transformer.wte.new_embedding",
+                "flow_matching_head",
             ]
         )
 
