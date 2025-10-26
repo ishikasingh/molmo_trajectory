@@ -502,6 +502,21 @@ class DataFormatter:
         
         return ", ".join(xml_parts)
 
+    def trajectory_to_dummy_text(self, trajectory_shape):
+        """
+        Return a dummy trajectory marker token for flow matching.
+        
+        This replaces the full text trajectory output with a simple signal token.
+        The actual trajectory prediction happens in the flow matching head, not via text tokens.
+        
+        Args:
+            trajectory_shape: Original shape of trajectory (not used, kept for API consistency)
+            
+        Returns:
+            String containing the dummy trajectory token
+        """
+        return "<trajectory>"
+
     def format_annotated_text(self, answer, point_annotations):
         for point_annotation in point_annotations:
             parts = answer.split("<|POINT|>", maxsplit=1)
@@ -521,18 +536,21 @@ class DataFormatter:
         else:
             label = example["question"]
         if len(points) == 0:
-            if style in ["pointing", "point_count", "affordance", "affordance_new", "trajectory"]:
+            if style in ["pointing", "point_count", "affordance", "affordance_new", "trajectory", 
+                        "trajectory_2d_text", "trajectory_3d_text"]:
                 return "There are none."
             else:
                 raise NotImplementedError()
         if style == "affordance_new":
             point_txt = self.affordance_to_text(points, 100, label, label, transition_types=example.get("transition_types"))
-        elif style == "trajectory_2d" or style == "trajectory_3d":
-            # Handle trajectory data - points should be a trajectory tensor of shape [num_steps, num_joints, 2/3]
-            # For now, assume points contain the trajectory data
+        elif style in ["trajectory_2d_text", "trajectory_3d_text"]:
+            # Text-based trajectory output (legacy format)
             trajectory_data = points
             point_txt = self.trajectory_to_text(trajectory_data, 100, label, label)
-
+        elif style in ["trajectory_2d_fm", "trajectory_3d_fm"]:
+            # Flow matching trajectory output (dummy marker token)
+            trajectory_data = points
+            point_txt = self.trajectory_to_dummy_text(trajectory_data.shape if hasattr(trajectory_data, 'shape') else None)
         else:
             if "point_scale" in example:
                 # Points are already normalized
@@ -687,7 +705,8 @@ class DataFormatter:
                 # plain text for everything else
                 if style == "long_caption":
                     prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1["long_caption"], example, rng, dbg=self.debug)
-                elif style in ["pointing", "point_count", "affordance", "affordance_new", "trajectory_2d", "trajectory_3d"]:
+                elif style in ["pointing", "point_count", "affordance", "affordance_new", "trajectory_2d_text", "trajectory_3d_text",
+                "trajectory_2d_fm", "trajectory_3d_fm"]:
                     # output, prompt, metadata = self.format_points(example)
                     if "question" in example:
                         prompt = example["question"]
@@ -699,7 +718,7 @@ class DataFormatter:
                         prompt_style = style
                         if style == "affordance_new":
                             prompt_style = "affordance"
-                        if style == "trajectory_2d" or style == "trajectory_3d":
+                        if style in ["trajectory_2d_text", "trajectory_3d_text", "trajectory_2d_fm", "trajectory_3d_fm"]:
                             prompt_style = "trajectory"
                         prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1[prompt_style], dict(example, label=prompt), rng, dbg=self.debug)
                     output = self.format_points(example)

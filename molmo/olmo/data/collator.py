@@ -45,6 +45,7 @@ class MMCollator:
 
     TEXT_KEYS = ["input_tokens", "target_tokens", "loss_masks", "subsegment_ids", "position_ids"]
     IMAGE_KEYS = ["images", "image_masks", "image_input_idx",]
+    TRAJECTORY_KEYS = ["trajectory_target"]
 
     def __init__(self, max_sequence_length=None, include_metadata=True, pad=None,
                  max_crops=None):
@@ -81,6 +82,21 @@ class MMCollator:
         for key in self.IMAGE_KEYS:
             if any(key in ex for ex in batch):
                 out[key] = _collate([ex.get(key) for ex in batch], self.max_crops, pad=self.pad)
+        
+        # Handle trajectory targets (no padding needed, all same size)
+        for key in self.TRAJECTORY_KEYS:
+            if any(key in ex for ex in batch):
+                # Stack trajectory targets - they should all be 1D arrays of same size
+                trajectory_tensors = []
+                for ex in batch:
+                    if key in ex:
+                        traj = ex[key]
+                        if isinstance(traj, np.ndarray):
+                            traj = torch.from_numpy(traj)
+                        trajectory_tensors.append(traj)
+                if trajectory_tensors:
+                    out[key] = torch.stack(trajectory_tensors)
+        
         out["input_ids"] = out.pop("input_tokens")
         if "target_tokens" in out:
             out["labels"] = out.pop("target_tokens")

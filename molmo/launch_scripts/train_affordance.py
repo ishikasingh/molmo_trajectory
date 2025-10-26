@@ -231,12 +231,20 @@ if __name__ == "__main__":
             else:
                 tasks = [["egodex", ["affordance_new"], 0.5],
                          ["robo_casa", ["robo_casa_affordance"], 0.5]]
-    elif args.mixture == "trajectory_2d":
+    elif args.mixture == "trajectory_2d_text":
         eval_tasks = []
-        tasks = [["egodex", ["trajectory_2d"], 1.0]]
-    elif args.mixture == "trajectory_3d":
+        tasks = [["egodex", ["trajectory_2d_text"], 1.0]]
+    elif args.mixture == "trajectory_3d_text":
         eval_tasks = []
-        tasks = [["egodex", ["trajectory_3d"], 1.0]]
+        tasks = [["egodex", ["trajectory_3d_text"], 1.0]]
+    elif args.mixture == "trajectory_2d_fm":
+        # Flow matching based 2D trajectory prediction
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_2d_fm"], 1.0]]
+    elif args.mixture == "trajectory_3d_fm":
+        # Flow matching based 3D trajectory prediction
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
     elif args.mixture == "robo_casa_affordance":
         # eval_tasks = ["robo_casa_affordance"]
         eval_tasks = []
@@ -297,6 +305,21 @@ if __name__ == "__main__":
     model_cfg.message_formatting = "role"
     model_cfg.system_prompt_kind = "demo_or_style"
     model_cfg.multi_annotation_weighting = "root_subsegments"
+
+    # Enable flow matching for trajectory prediction tasks
+    if args.mixture.endswith("_fm"):
+        model_cfg.use_flow_matching_head = True
+        # Configure action dimensions based on task
+        # Default: 10 action steps (horizon), 8 dims per action (7 joints + 1 gripper)
+        model_cfg.action_horizon = 30
+        model_cfg.action_dim = 30
+        model_cfg.use_adarms_flow_matching = False  # Use Pi0-style MLP conditioning
+        model_cfg.flow_matching_loss_weight = 1.0
+        model_cfg.flow_matching_num_steps = 10  # ODE integration steps during inference
+        log.info("Flow matching trajectory head enabled with action_horizon=%d, action_dim=%d", 
+                 model_cfg.action_horizon, model_cfg.action_dim)
+    else:
+        model_cfg.use_flow_matching_head = False
 
     root_size_mixture: List[RootSizeMixture] = []
     for name, submixture, rate in tasks:

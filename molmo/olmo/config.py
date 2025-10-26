@@ -763,6 +763,39 @@ class ModelConfig(BaseConfig):
     """
     The capacity factor to use in the MoE block. Only applies if not using dMoE.
     """
+    # Flow matching trajectory prediction parameters
+    use_flow_matching_head: bool = False
+    """
+    Enable flow matching head for continuous trajectory prediction.
+    When True, the model can process action tokens for flow matching.
+    """
+
+    action_dim: int = 30
+    """
+    Dimension of each action vector (e.g., 7 joint velocities + 1 gripper).
+    """
+
+    action_horizon: int = 30
+    """
+    Number of action steps to predict.
+    """
+
+    use_adarms_flow_matching: bool = False
+    """
+    Whether to use adaRMS-style timestep conditioning (Pi0.5) or MLP-style (Pi0).
+    """
+
+    flow_matching_loss_weight: float = 1.0
+    """
+    Weight for the flow matching loss when co-training with other tasks.
+    Total loss = ce_loss + flow_matching_loss_weight * fm_loss
+    """
+    
+    flow_matching_num_steps: int = 10
+    """
+    Number of ODE integration steps during inference.
+    """
+
 
     def get_tokenizer(self):
         tokenizer_cfg = self.tokenizer

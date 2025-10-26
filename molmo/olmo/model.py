@@ -58,6 +58,7 @@ from .initialization import ModuleType, init_weights, init_normal
 from .safetensors_util import safetensors_file_to_state_dict
 from .torch_util import ensure_finite_
 from .util import resource_path
+from .losses import FlowMatchingHead, make_flow_matching_attention_mask
 
 if sys.version_info.minor > 8:
     from collections.abc import MutableMapping
@@ -1241,6 +1242,22 @@ class OLMoOutput(NamedTuple):
     Hidden states from each block.
     """
 
+    velocity_output: Optional[torch.FloatTensor] = None
+    """
+    VELOCITY PREDICTIONS for flow matching (NOT the trajectory itself).
+    
+    Shape: (batch_size, action_horizon, action_dim)
+    
+    During training: Predicted velocity field, used to compute flow matching loss.
+                     Regressed against (noise - target) via MSE loss.
+    
+    During inference: Predicted velocity at current denoising step.
+                      Integrated via ODE to obtain clean trajectory.
+                      See sample_actions_flow_matching() for ODE integration.
+    
+    Only populated if `use_flow_matching_head` is enabled.
+    """
+
 
 class OLMoGenerateOutput(NamedTuple):
     token_ids: torch.LongTensor
@@ -1666,6 +1683,16 @@ class Molmo(nn.Module):
         if config.vision_backbone is not None:
             self.vision_backbone = MolmoVisionBackbone.build(config)
 
+        # Flow matching trajectory head (optional)
+        self.flow_matching_head: Optional[FlowMatchingHead] = None
+        if config.use_flow_matching_head:
+            self.flow_matching_head = FlowMatchingHead(
+                d_model=config.d_model,
+                action_dim=config.action_dim,
+                action_horizon=config.action_horizon,
+                use_adarms=config.use_adarms_flow_matching,
+            )
+
         self.__num_fwd_flops: Optional[int] = None
 
     def reset_with_pretrained_weights(self):
@@ -1815,6 +1842,9 @@ class Molmo(nn.Module):
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
         append_last_valid_logits: Optional[torch.Tensor] = None,
+        # Flow matching specific inputs
+        noisy_actions: Optional[torch.Tensor] = None,
+        action_timestep: Optional[torch.Tensor] = None,
     ) -> OLMoOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1869,6 +1899,9 @@ class Molmo(nn.Module):
         if self.config.use_position_ids and attention_mask is None:
             attention_mask = input_ids != -1
         
+        # Store the original attention mask for trajectory head (will need it later)
+        original_attention_mask = attention_mask
+
         if subsegment_ids is not None:
             assert not use_cache, "Subsegment_ids cannot be used with cache."
             subsegment_mask = subsegment_ids.unsqueeze(2) <= subsegment_ids.unsqueeze(1)
@@ -1927,6 +1960,56 @@ class Molmo(nn.Module):
         # normalized
         if self.config.normalize_input_embeds:
             x = x * (self.config.d_model ** 0.5)
+
+        # Flow matching: Add action tokens if provided
+        has_action_tokens = noisy_actions is not None and self.flow_matching_head is not None
+        action_hidden_states_indices = None
+        
+        if has_action_tokens:
+            # Embed noisy actions with timestep conditioning
+            # noisy_actions: (batch_size, action_horizon, action_dim)
+            # action_timestep: (batch_size,)
+            action_embeddings = self.flow_matching_head.embed_actions_with_time(
+                noisy_actions, action_timestep
+            )  # (batch_size, action_horizon, d_model)
+            
+            # Track where action tokens are in the sequence
+            prefix_seq_len = x.shape[1]
+            action_seq_len = action_embeddings.shape[1]
+            action_hidden_states_indices = (prefix_seq_len, prefix_seq_len + action_seq_len)
+            
+            # Concatenate action embeddings after text/image embeddings
+            x = torch.cat([x, action_embeddings], dim=1)  # (batch_size, prefix_len + action_len, d_model)
+            
+            # Update sequence length
+            seq_len = x.shape[1]
+            
+            # Create flow matching attention mask
+            # Prefix (text/images): can attend to each other (bidirectional)
+            # Actions: first token prevents prefix attention, rest allow causal
+            if attention_mask is not None:
+                # TODO: check if the attention_mask is None
+                prefix_mask = attention_mask  # (batch_size, prefix_len)
+                action_mask = torch.ones(
+                    batch_size, action_seq_len, 
+                    dtype=torch.bool, device=x.device
+                )  # (batch_size, action_len)
+                
+                # Create attention bias using flow matching pattern
+                # This creates a 2D attention mask where actions can attend to prefix but not vice versa
+                attention_bias_fm = make_flow_matching_attention_mask(
+                    prefix_mask=prefix_mask,
+                    suffix_mask=action_mask,
+                )  # (batch_size, total_len, total_len)
+                
+                # Convert to additive attention bias format (0 = attend, -inf = mask)
+                attention_bias = torch.zeros_like(attention_bias_fm, dtype=torch.float)
+                attention_bias.masked_fill_(~attention_bias_fm, torch.finfo(torch.float).min)
+                attention_bias = attention_bias.unsqueeze(1)  # (batch_size, 1, total_len, total_len)
+                
+                # For flow matching, we override the standard attention mask
+                # so set attention_mask to None to avoid double-processing
+                attention_mask = None
 
         # Transform the attention mask into what the blocks expect.
         if attention_mask is not None:
@@ -2044,7 +2127,123 @@ class Molmo(nn.Module):
                 torch.arange(logits.shape[0], device=logits.device), append_last_valid_logits]
             logits = torch.cat([logits[:, :-1], last_valid_logit[:, None]], dim=1)
 
-        return OLMoOutput(logits=logits, attn_key_values=attn_key_values, hidden_states=tuple(all_hidden_states) if output_hidden_states else None)  # type: ignore[arg-type]
+        # Flow matching: Extract action hidden states and predict velocity
+        velocity_output = None
+        if has_action_tokens and action_hidden_states_indices is not None:
+            # Extract action token hidden states from the transformer output (after final layer norm)
+            start_idx, end_idx = action_hidden_states_indices
+            action_hidden_states = x[:, start_idx:end_idx, :]  # (batch_size, action_horizon, d_model)
+            
+            # Project to velocity predictions (not the trajectory itself!)
+            # During training: used to compute FM loss
+            # During inference: integrated via ODE to get actual trajectory
+            velocity_output = self.flow_matching_head.predict_velocity(action_hidden_states)
+            # velocity_output: (batch_size, action_horizon, action_dim)
+
+        return OLMoOutput(
+            logits=logits,
+            attn_key_values=attn_key_values,
+            hidden_states=tuple(all_hidden_states) if output_hidden_states else None,
+            velocity_output=velocity_output
+        )  # type: ignore[arg-type]
+    
+    @torch.no_grad()
+    def sample_actions_flow_matching(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        images: Optional[torch.Tensor] = None,
+        image_masks: Optional[torch.Tensor] = None,
+        image_input_idx: Optional[torch.Tensor] = None,
+        num_steps: Optional[int] = None,
+        initial_noise: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Sample actions using flow matching with ODE integration.
+        
+        This implements the inference procedure from openpi's Pi0:
+        1. Cache the prefix (text/image) keys and values
+        2. Start from noise at t=1
+        3. Integrate ODE with Euler steps: x_t = x_t + dt * v_t
+        4. Return denoised actions at t=0
+        
+        Args:
+            input_ids: Text input token IDs (batch_size, seq_len)
+            attention_mask: Attention mask for text
+            images: Image inputs
+            image_masks: Image attention masks
+            image_input_idx: Image input indices
+            num_steps: Number of ODE integration steps (default: config.flow_matching_num_steps)
+            initial_noise: Optional initial noise (default: sample from N(0,1))
+            
+        Returns:
+            actions: Predicted actions (batch_size, action_horizon, action_dim)
+        """
+        if self.flow_matching_head is None:
+            raise ValueError("Flow matching head not enabled. Set use_flow_matching_head=True in config.")
+        
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+        num_steps = num_steps or self.config.flow_matching_num_steps
+        
+        # Initialize from noise at t=1
+        if initial_noise is None:
+            x_t = torch.randn(
+                batch_size, 
+                self.config.action_horizon, 
+                self.config.action_dim,
+                device=device
+            )
+        else:
+            x_t = initial_noise
+        
+        # Time step: integrate from t=1 to t=0
+        # Using the diffusion convention: t=1 is noise, t=0 is data
+        dt = -1.0 / num_steps
+        time = 1.0
+        
+        # First, cache the prefix (text/image) by running forward pass without actions
+        # This computes and caches K, V for text/image tokens
+        with torch.autocast("cuda", enabled=True, dtype=self.config.precision):
+            prefix_output = self.forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                images=images,
+                image_masks=image_masks,
+                image_input_idx=image_input_idx,
+                use_cache=True,  # Enable KV caching
+                noisy_actions=None,  # No actions yet - just cache prefix
+                action_timestep=None,
+            )
+            prefix_cache = prefix_output.attn_key_values
+        
+        # ODE integration loop
+        for step in range(num_steps):
+            # Current time
+            t = torch.full((batch_size,), time, device=device)
+            
+            # Forward pass with cached prefix and current noisy actions
+            with torch.autocast("cuda", enabled=True, dtype=self.config.precision):
+                output = self.forward(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    images=images,
+                    image_masks=image_masks,
+                    image_input_idx=image_input_idx,
+                    past_key_values=prefix_cache,  # Use cached prefix K, V
+                    use_cache=False,  # Don't update cache during integration
+                    noisy_actions=x_t,
+                    action_timestep=t,
+                )
+            
+            # Get predicted velocity
+            v_t = output.velocity_output  # (batch_size, action_horizon, action_dim)
+            
+            # Euler step: x_t = x_t + dt * v_t
+            x_t = x_t + dt * v_t
+            time = time + dt
+        
+        return x_t
 
     def get_fsdp_wrap_policy(self, wrap_strategy: Optional[FSDPWrapStrategy] = None):
         if wrap_strategy is None:
@@ -2400,7 +2599,10 @@ class Molmo(nn.Module):
             state_dict = torch.load(state_dict_path, map_location="cpu")
             dtype = state_dict[list(state_dict.keys())[0]].dtype
             log.info(f"Checkpoint weight dtype: {dtype}")
-            model.load_state_dict(model._make_state_dict_compatible(state_dict)[0])
+            model.load_state_dict(
+                model._make_state_dict_compatible(state_dict)[0],
+                strict=False  # Allow missing keys (e.g., new trajectory_head parameters)
+            )
             model = model.to(torch.device(device))
         else:
             from .checkpoint import load_model_state

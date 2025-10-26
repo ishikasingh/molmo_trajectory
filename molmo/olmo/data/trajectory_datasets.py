@@ -29,6 +29,7 @@ class TrajectoryDataset(Dataset):
         normalize_2d_coordinates: bool = True,
         use_confidence_filter: bool = False,
         confidence_threshold: float = 0.5,
+        output_format: str = "text",  # "text" or "flow_matching"
     ):
         # Get data directory from environment variable if not provided
         if data_dir is None:
@@ -43,6 +44,9 @@ class TrajectoryDataset(Dataset):
         self.confidence_threshold = confidence_threshold
         self.output_2d_trajectory = output_2d_trajectory
         self.normalize_2d_coordinates = normalize_2d_coordinates
+        self.output_format = output_format  # "text" or "flow_matching"
+        
+        assert output_format in ["text", "flow_matching"], f"output_format must be 'text' or 'flow_matching', got {output_format}"
         
         # Default joint names matching data_formatter.py TRAJECTORY_KEYPOINTS
         if joint_names is None:
@@ -197,6 +201,15 @@ class TrajectoryDataset(Dataset):
         if isinstance(final_trajectory, torch.Tensor):
             final_trajectory = final_trajectory.numpy()
         
+        # Flatten trajectory for flow matching: [num_steps, num_joints, coords] -> [num_steps*num_joints*coords]
+        trajectory_flat = final_trajectory.reshape(-1).astype(np.float32)
+        
+        # Determine style based on output format
+        if self.output_2d_trajectory:
+            style = 'trajectory_2d_text' if self.output_format == "text" else 'trajectory_2d_fm'
+        else:
+            style = 'trajectory_3d_text' if self.output_format == "text" else 'trajectory_3d_fm'
+        
         return {
             'image': image,
             'message_list': [
@@ -204,9 +217,11 @@ class TrajectoryDataset(Dataset):
                     'label': instruction,
                     'points': final_trajectory, # to make it compatible with the data formatter, points means trajectory
                     'point_scale': 100 if self.normalize_2d_coordinates and self.output_2d_trajectory else None,
-                    'style': 'trajectory_2d' if self.output_2d_trajectory else 'trajectory_3d',
+                    'style': style,
                 }
             ],
+            'trajectory_target': trajectory_flat,  # For flow matching: flattened trajectory
+            'trajectory_shape': final_trajectory.shape,  # Store original shape for potential reshaping later
             'metadata': {
                 'image': image,
                 'task_name': mapping['task_name'],

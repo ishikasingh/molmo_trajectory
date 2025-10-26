@@ -336,22 +336,45 @@ def get_dataset_by_name(dataset_name, split):
     elif dataset_name == "affordance_eval_new":
         data_path = os.environ.get("AFFORDANCE_EVAL_DATA_DIR")
         return HandPositioningDataset(data_path=data_path, split=split, use_new_output_format=True, ignore_wrist=True)
-    elif dataset_name == "trajectory_2d":
+
+    elif dataset_name == "trajectory_2d_text":
         data_dir = os.environ.get("EGODEX_DATA_DIR")
         return TrajectoryDataset(
             data_dir=data_dir,
             split=split,
             action_chunking_horizon=30,
             output_2d_trajectory=True,
-            normalize_2d_coordinates=True
+            normalize_2d_coordinates=True,
+            output_format="text"
         )
-    elif dataset_name == "trajectory_3d":
+    elif dataset_name == "trajectory_2d_fm":
+        data_dir = os.environ.get("EGODEX_DATA_DIR")
+        return TrajectoryDataset(
+            data_dir=data_dir,
+            split=split,
+            action_chunking_horizon=30,
+            output_2d_trajectory=True,
+            normalize_2d_coordinates=True,
+            output_format="flow_matching"
+        )
+    elif dataset_name == "trajectory_3d_text":
         data_dir = os.environ.get("EGODEX_DATA_DIR")
         return TrajectoryDataset(
             data_dir=data_dir,
             split=split,
             action_chunking_horizon=30,
             output_2d_trajectory=False,
-            normalize_2d_coordinates=False
+            normalize_2d_coordinates=False,
+            output_format="text"
+        )
+    elif dataset_name == "trajectory_3d_fm":
+        data_dir = os.environ.get("EGODEX_DATA_DIR")
+        return TrajectoryDataset(
+            data_dir=data_dir,
+            split=split,
+            action_chunking_horizon=30,
+            output_2d_trajectory=False,
+            normalize_2d_coordinates=False,
+            output_format="flow_matching"
         )
     raise NotImplementedError(dataset_name, split)

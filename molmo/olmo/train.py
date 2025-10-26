@@ -40,6 +40,7 @@ from .config import (
 from .data.iterable_dataset_mixture import IterableDatasetMixture
 from .eval.inf_evaluator import InfDatasetEvaluator
 from .exceptions import OLMoConfigurationError
+from .losses import FlowMatchingTrajectoryLoss
 from .model import Molmo
 from .optim import Optimizer, Scheduler
 from .torch_util import (
@@ -292,7 +293,13 @@ class Trainer:
         if self.model.config.block_type == BlockType.moe:
             from .config import config_to_moe_args
 
-            self.moe_args = config_to_moe_args(self.cfg.model)            
+            self.moe_args = config_to_moe_args(self.cfg.model)
+
+        # Initialize flow matching trajectory loss if enabled
+        self.trajectory_loss_fn: Optional[FlowMatchingTrajectoryLoss] = None
+        if self.model.config.use_flow_matching_head:
+            self.trajectory_loss_fn = FlowMatchingTrajectoryLoss(velocity_weighting="none")
+            self.trajectory_loss_fn = self.trajectory_loss_fn.to(self.device)
 
     @property
     def dataset(self) -> IterableDataset:
@@ -756,9 +763,40 @@ class Trainer:
     def model_forward(
         self, batch: Dict[str, Any], loss_reduction: str = "mean", compute_z_loss: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        # Check if this batch has trajectory targets
+        has_trajectory = 'trajectory_target' in batch
+        
+        # Prepare flow matching inputs if needed
+        noisy_actions = None
+        action_timestep = None
+        if has_trajectory:
+            trajectory_target = batch['trajectory_target']  # (batch_size, action_horizon, action_dim)
+            batch_size = trajectory_target.shape[0]
+            device = trajectory_target.device
+            
+            # Sample time from Beta(1.5, 1) distribution and clip to [0.001, 0.999]
+            # This follows openpi's approach for stable training
+            t = torch.distributions.Beta(1.5, 1.0).sample((batch_size,)).to(device)
+            t = t * 0.999 + 0.001
+            
+            # Sample noise from standard normal
+            noise = torch.randn_like(trajectory_target)
+            
+            # Interpolate: x_t = t * noise + (1 - t) * target
+            # Expand t for broadcasting: (batch_size,) -> (batch_size, 1, 1)
+            t_expanded = t.view(batch_size, 1, 1)
+            noisy_actions = t_expanded * noise + (1 - t_expanded) * trajectory_target
+            action_timestep = t
+            
+            # Store for loss computation
+            batch['flow_matching_time'] = t
+            batch['flow_matching_noise'] = noise
+        
         # shape: (batch_size, seq_len, vocab_size)
+        # Note: Like OpenPI, we compute BOTH text logits (from prefix tokens) and velocity output (from action tokens)
+        # But we only supervise on one or the other depending on the task type (see below)
         with torch.autocast("cuda", enabled=True, dtype=self.cfg.autocast_precision):
-            logits = self.fsdp_model(
+            output = self.fsdp_model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch.get("attention_mask"),
                 attention_bias=batch.get("attention_bias"),
@@ -768,8 +806,24 @@ class Trainer:
                 image_input_idx=batch.get("image_input_idx"),
                 subsegment_ids=batch.get("subsegment_ids"),
                 position_ids=batch.get("position_ids"),
-            ).logits
-        if "labels" in batch:
+                noisy_actions=noisy_actions,
+                action_timestep=action_timestep,
+            )
+            logits = output.logits
+        
+        # Compute text loss (CE loss)
+        # We compute this for all batches, but only use it for VLM tasks
+        ce_loss = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
+        z_loss = None
+        accuracy = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
+        
+        # Handle CE loss based on batch type
+        if has_trajectory:
+            # Trajectory batches: we have velocity_output, but skip CE loss supervision
+            # (logits are still computed but not supervised, like OpenPI)
+            pass
+        elif "labels" in batch:
+            # VLM tasks with labeled targets: compute CE loss
             assert "loss_masks" in batch
             assert loss_reduction == "none"
             loss_masks = batch["loss_masks"] * (batch["loss_masks"] > 0)
@@ -777,7 +831,25 @@ class Trainer:
             labels.masked_fill_(~(loss_masks > 0), -100)
             labels = labels.view(-1)
             logits_for_loss = logits.to(torch.float32).view(-1, logits.size(-1)) # for numerical stability
+            ce_loss, z_loss = self.loss_fn(
+                logits_for_loss, labels, ignore_index=-100, reduction=loss_reduction,
+                compute_z_loss=compute_z_loss, z_loss_scale=self.cfg.softmax_auxiliary_loss_scale,
+            )
+            bs = batch["input_ids"].shape[0]
+            if loss_reduction == "none":
+                # Reshape (batch_size * seq_len,) -> (batch_size, seq_len)
+                ce_loss = ce_loss.view(bs, -1)
+                if z_loss is not None:
+                    z_loss = z_loss.view(bs, -1)
+
+            accuracy = torch.argmax(logits_for_loss, dim=-1) == labels
+            ce_loss = ce_loss * loss_masks
+            if z_loss is not None:
+                z_loss = z_loss * loss_masks
+            accuracy = accuracy.view(bs, -1)
+            accuracy = accuracy * loss_masks
         else:
+            # Text generation without labeled targets (auto-regressive mode)
             logits_for_loss = logits[..., :-1, :].contiguous()
             # shape: (batch_size * seq_len, vocab_size)
             logits_for_loss = logits_for_loss.view(-1, logits_for_loss.size(-1))
@@ -785,28 +857,56 @@ class Trainer:
             labels = self.get_labels(batch)
             # shape: (batch_size * seq_len,)
             labels = labels.view(-1)
-        ce_loss, z_loss = self.loss_fn(
-            logits_for_loss, labels, ignore_index=-100, reduction=loss_reduction,
-            compute_z_loss=compute_z_loss, z_loss_scale=self.cfg.softmax_auxiliary_loss_scale,
-        )
-        bs = batch["input_ids"].shape[0]
-        if loss_reduction == "none":
-            # Reshape (batch_size * seq_len,) -> (batch_size, seq_len)
-            ce_loss = ce_loss.view(bs, -1)
-            if z_loss is not None:
-                z_loss = z_loss.view(bs, -1)
+            ce_loss, z_loss = self.loss_fn(
+                logits_for_loss, labels, ignore_index=-100, reduction=loss_reduction,
+                compute_z_loss=compute_z_loss, z_loss_scale=self.cfg.softmax_auxiliary_loss_scale,
+            )
+            bs = batch["input_ids"].shape[0]
+            if loss_reduction == "none":
+                # Reshape (batch_size * seq_len,) -> (batch_size, seq_len)
+                ce_loss = ce_loss.view(bs, -1)
+                if z_loss is not None:
+                    z_loss = z_loss.view(bs, -1)
 
-        accuracy = torch.argmax(logits_for_loss, dim=-1) == labels
-        if "labels" in batch:
-            ce_loss = ce_loss * loss_masks
-            if z_loss is not None:
-                z_loss = z_loss * loss_masks
-            accuracy = accuracy.view(bs, -1)
-            accuracy = accuracy * loss_masks
-        else:
+            accuracy = torch.argmax(logits_for_loss, dim=-1) == labels
             accuracy = (accuracy * (labels >= 0))
             accuracy = accuracy.view(bs, -1)
-        return accuracy, ce_loss, z_loss, logits
+        
+        # Compute trajectory flow matching loss if applicable
+        trajectory_loss = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
+        if has_trajectory and self.trajectory_loss_fn is not None and output.velocity_output is not None:
+            # For flow matching, the forward pass computed the predicted VELOCITY from noisy actions
+            # Note: output.velocity_output contains the predicted VELOCITY, NOT the trajectory itself!
+            # The actual trajectory is only computed during inference via ODE integration (sample_actions_flow_matching)
+            # During training, we only predict and regress the velocity field
+            velocity_pred = output.velocity_output
+            
+            # Get the ground truth actions and the time/noise used during forward pass
+            # These should have been passed to the forward method
+            trajectory_target = batch['trajectory_target']  # (batch_size, action_horizon, action_dim)
+            t = batch['flow_matching_time']  # (batch_size,) - sampled in model_forward
+            noise = batch['flow_matching_noise']  # (batch_size, action_horizon, action_dim)
+            
+            # Compute flow matching loss (on velocity predictions)
+            trajectory_loss = self.trajectory_loss_fn(
+                predicted_velocity=velocity_pred,
+                trajectory_target=trajectory_target,
+                t=t,
+                noise=noise
+            )
+        
+        # Combine losses: selectively supervise based on task type
+        # This matches OpenPI's approach: compute all outputs but only supervise on the relevant ones
+        if has_trajectory:
+            # Trajectory tasks: supervise only on velocity_output (from action tokens)
+            # Logits are still computed (from text tokens) but not supervised
+            total_loss = self.cfg.model.flow_matching_loss_weight * trajectory_loss
+        else:
+            # VLM tasks: supervise only on logits (from text tokens)
+            # velocity_output is None (flow_matching_head not enabled for VLM tasks)
+            total_loss = ce_loss
+        
+        return accuracy, total_loss, z_loss, logits
 
     def train_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         # Split into micro-batches.
