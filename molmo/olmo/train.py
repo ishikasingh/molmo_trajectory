@@ -774,6 +774,43 @@ class Trainer:
             batch_size = trajectory_target.shape[0]
             device = trajectory_target.device
             
+            # Validate trajectory shape matches config
+            # After collator fix, should be 3D: (batch_size, action_horizon, action_dim)
+            if trajectory_target.dim() == 3:
+                # Proper 3D tensor from fixed collator - validate dimensions
+                if trajectory_target.shape[1] != self.cfg.model.action_horizon:
+                    raise ValueError(
+                        f"trajectory_target action_horizon {trajectory_target.shape[1]} "
+                        f"does not match config action_horizon {self.cfg.model.action_horizon}"
+                    )
+                if trajectory_target.shape[2] != self.cfg.model.action_dim:
+                    raise ValueError(
+                        f"trajectory_target action_dim {trajectory_target.shape[2]} "
+                        f"does not match config action_dim {self.cfg.model.action_dim}"
+                    )
+            elif trajectory_target.dim() == 2:
+                # Backward compatibility: old 2D format (batch_size, action_horizon*action_dim)
+                # Try to reshape to (batch_size, action_horizon, action_dim)
+                total_dim = trajectory_target.shape[1]
+                expected_total = self.cfg.model.action_horizon * self.cfg.model.action_dim
+                if total_dim == expected_total:
+                    trajectory_target = trajectory_target.reshape(
+                        batch_size, 
+                        self.cfg.model.action_horizon, 
+                        self.cfg.model.action_dim
+                    )
+                else:
+                    raise ValueError(
+                        f"trajectory_target 2D shape {trajectory_target.shape} cannot be reshaped to "
+                        f"({batch_size}, {self.cfg.model.action_horizon}, {self.cfg.model.action_dim}). "
+                        f"Expected total dimension {expected_total}, got {total_dim}"
+                    )
+            else:
+                raise ValueError(
+                    f"trajectory_target expected 2D or 3D tensor, got {trajectory_target.dim()}D "
+                    f"with shape {trajectory_target.shape}"
+                )
+            
             # Sample time from Beta(1.5, 1) distribution and clip to [0.001, 0.999]
             # This follows openpi's approach for stable training
             t = torch.distributions.Beta(1.5, 1.0).sample((batch_size,)).to(device)

@@ -83,10 +83,10 @@ class MMCollator:
             if any(key in ex for ex in batch):
                 out[key] = _collate([ex.get(key) for ex in batch], self.max_crops, pad=self.pad)
         
-        # Handle trajectory targets (no padding needed, all same size)
+        # Handle trajectory targets (now 2D: action_horizon x action_dim)
         for key in self.TRAJECTORY_KEYS:
             if any(key in ex for ex in batch):
-                # Stack trajectory targets - they should all be 1D arrays of same size
+                # Stack trajectory targets - they should all be (action_horizon, action_dim)
                 trajectory_tensors = []
                 for ex in batch:
                     if key in ex:
@@ -95,7 +95,8 @@ class MMCollator:
                             traj = torch.from_numpy(traj)
                         trajectory_tensors.append(traj)
                 if trajectory_tensors:
-                    out[key] = torch.stack(trajectory_tensors)
+                    # Stack along batch dimension: (batch_size, action_horizon, action_dim)
+                    out[key] = torch.stack(trajectory_tensors, dim=0)
         
         out["input_ids"] = out.pop("input_tokens")
         if "target_tokens" in out:

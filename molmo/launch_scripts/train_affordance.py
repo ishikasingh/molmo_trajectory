@@ -310,9 +310,14 @@ if __name__ == "__main__":
     if args.mixture.endswith("_fm"):
         model_cfg.use_flow_matching_head = True
         # Configure action dimensions based on task
-        # Default: 10 action steps (horizon), 8 dims per action (7 joints + 1 gripper)
-        model_cfg.action_horizon = 30
-        model_cfg.action_dim = 30
+        # action_horizon: number of timesteps to predict (e.g., 30)
+        # action_dim: flattened coordinate dimension = num_joints * num_coordinates
+        #   For 2D trajectories: num_joints * 2
+        #   For 3D trajectories: num_joints * 3
+        # Example: 10 joints * 3 coords = 30 dimensions
+        # NOTE: Verify these values match your actual trajectory data!
+        model_cfg.action_horizon = 30  # Number of timesteps
+        model_cfg.action_dim = 30      # num_joints * coordinates (currently assuming 10 joints * 3 for 3D)
         model_cfg.use_adarms_flow_matching = False  # Use Pi0-style MLP conditioning
         model_cfg.flow_matching_loss_weight = 1.0
         model_cfg.flow_matching_num_steps = 10  # ODE integration steps during inference

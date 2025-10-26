@@ -201,8 +201,11 @@ class TrajectoryDataset(Dataset):
         if isinstance(final_trajectory, torch.Tensor):
             final_trajectory = final_trajectory.numpy()
         
-        # Flatten trajectory for flow matching: [num_steps, num_joints, coords] -> [num_steps*num_joints*coords]
-        trajectory_flat = final_trajectory.reshape(-1).astype(np.float32)
+        # Reshape trajectory from [num_steps, num_joints, coords] -> [num_steps, num_joints*coords]
+        # This maintains 2D array shape (num_steps as first dim) for proper batching
+        # instead of fully flattening to 1D
+        num_steps = final_trajectory.shape[0]
+        trajectory_flattened_joints = final_trajectory.reshape(num_steps, -1).astype(np.float32)
         
         # Determine style based on output format
         if self.output_2d_trajectory:
@@ -220,7 +223,7 @@ class TrajectoryDataset(Dataset):
                     'style': style,
                 }
             ],
-            'trajectory_target': trajectory_flat,  # For flow matching: flattened trajectory
+            'trajectory_target': trajectory_flattened_joints,  # For flow matching: shape (num_steps, num_joints*coords) = (action_horizon, action_dim)
             'trajectory_shape': final_trajectory.shape,  # Store original shape for potential reshaping later
             'metadata': {
                 'image': image,
