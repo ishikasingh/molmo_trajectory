@@ -817,8 +817,6 @@ class DataFormatter:
             else:
                 print(example)
                 raise ValueError("No output in example, if this is an inference-only task make sure `for_inference` is True")
-        print(f"Prompt: {prompt}")
-        print(f"Output: {output}")
         return prompt, output, metadata
 
     def _format_example(self, message, example, is_training, for_inference, rng):
