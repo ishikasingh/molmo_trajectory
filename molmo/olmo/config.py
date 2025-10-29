@@ -796,6 +796,11 @@ class ModelConfig(BaseConfig):
     Number of ODE integration steps during inference.
     """
 
+    precision: Optional[str] = "amp_bf16"
+    """
+    Precision for inference (e.g. "amp_bf16", "amp_fp16", or "fp32").
+    """
+
 
     def get_tokenizer(self):
         tokenizer_cfg = self.tokenizer
@@ -939,6 +944,18 @@ class ModelConfig(BaseConfig):
             return 1 + self.max_crops
         else:
             return self.max_crops
+
+    @property
+    def autocast_precision(self) -> torch.dtype:
+        """Convert precision string to torch.dtype for use with torch.autocast."""
+        if self.precision == "amp_bf16":
+            return torch.bfloat16
+        elif self.precision == "amp_fp16":
+            return torch.float16
+        elif self.precision == "fp32" or self.precision is None:
+            return torch.float32
+        else:
+            raise ValueError(f"Unexpected precision type '{self.precision}'")
 
 
 class OptimizerType(StrEnum):

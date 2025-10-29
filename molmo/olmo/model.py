@@ -2205,15 +2205,15 @@ class Molmo(nn.Module):
         
         # First, cache the prefix (text/image) by running forward pass without actions
         # This computes and caches K, V for text/image tokens
-        with torch.autocast("cuda", enabled=True, dtype=self.config.precision):
+        with torch.autocast("cuda", enabled=True, dtype=self.config.autocast_precision):
             prefix_output = self.forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 images=images,
                 image_masks=image_masks,
                 image_input_idx=image_input_idx,
-                use_cache=True,  # Enable KV caching
-                noisy_actions=None,  # No actions yet - just cache prefix
+                use_cache=False,  # Disable KV caching - causes excessive memory usage
+                noisy_actions=None,  # No actions yet - just prefix
                 action_timestep=None,
             )
             prefix_cache = prefix_output.attn_key_values
@@ -2223,16 +2223,16 @@ class Molmo(nn.Module):
             # Current time
             t = torch.full((batch_size,), time, device=device)
             
-            # Forward pass with cached prefix and current noisy actions
-            with torch.autocast("cuda", enabled=True, dtype=self.config.precision):
+            # Forward pass - process full sequence each time (no KV cache)
+            with torch.autocast("cuda", enabled=True, dtype=self.config.autocast_precision):
                 output = self.forward(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     images=images,
                     image_masks=image_masks,
                     image_input_idx=image_input_idx,
-                    past_key_values=prefix_cache,  # Use cached prefix K, V
-                    use_cache=False,  # Don't update cache during integration
+                    past_key_values=None,  # Don't use KV cache - recompute each step
+                    use_cache=False,  # Disable KV caching - causes excessive memory usage
                     noisy_actions=x_t,
                     action_timestep=t,
                 )
