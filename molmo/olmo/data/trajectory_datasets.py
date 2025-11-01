@@ -9,11 +9,31 @@ import cv2
 import numpy as np
 import torch
 import pickle
+import time
+import random
+import contextlib
 from pathlib import Path
 from typing import Dict, List, Optional
 from PIL import Image
 from tqdm import tqdm
 from olmo.data.dataset import Dataset
+
+
+@contextlib.contextmanager
+def video_capture_context(video_path: str):
+    """Context manager to ensure VideoCapture is always released, even on errors."""
+    cap = None
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Could not open video file: {video_path}")
+        yield cap
+    finally:
+        if cap is not None:
+            try:
+                cap.release()
+            except:
+                pass  # Ignore errors during cleanup
 
 
 class TrajectoryDataset(Dataset):
@@ -236,17 +256,69 @@ class TrajectoryDataset(Dataset):
             }
         }
     
-    def _load_frame(self, video_path: str, frame_idx: int) -> Image.Image:
-        cap = cv2.VideoCapture(video_path)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, frame = cap.read()
-        cap.release()
+    def _load_frame(self, video_path: str, frame_idx: int, max_retries: int = 3) -> Image.Image:
+        """
+        Load a single frame from a video file with retry logic and proper resource cleanup.
         
-        if not ret:
-            raise ValueError(f"Could not load frame {frame_idx} from {video_path}")
+        Args:
+            video_path: Path to the video file
+            frame_idx: Frame index to load
+            max_retries: Maximum number of retry attempts
+            
+        Returns:
+            PIL Image of the requested frame
+            
+        Raises:
+            ValueError: If frame cannot be loaded after max_retries attempts
+        """
+        last_exception = None
         
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(frame)
+        for attempt in range(max_retries):
+            try:
+                with video_capture_context(video_path) as cap:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    ret, frame = cap.read()
+                    
+                    if ret and frame is not None:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        return Image.fromarray(frame)
+                    else:
+                        # Read failed, retry with exponential backoff
+                        if attempt < max_retries - 1:
+                            wait_time = (2 ** attempt) * 0.1 + random.uniform(0, 0.1)
+                            print(f"Warning: Failed to read frame {frame_idx} from {video_path} "
+                                  f"(attempt {attempt + 1}/{max_retries}), retrying in {wait_time:.2f}s...")
+                            time.sleep(wait_time)
+                            last_exception = ValueError(
+                                f"Could not read frame {frame_idx} from {video_path} "
+                                f"(attempt {attempt + 1}/{max_retries})"
+                            )
+                            continue
+                        else:
+                            raise ValueError(
+                                f"Could not load frame {frame_idx} from {video_path} "
+                                f"after {max_retries} attempts"
+                            )
+            except Exception as e:
+                # Handle any other exceptions (e.g., file not found, corrupted file)
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 0.1 + random.uniform(0, 0.1)
+                    print(f"Warning: Exception loading frame {frame_idx} from {video_path}: {str(e)} "
+                          f"(attempt {attempt + 1}/{max_retries}), retrying in {wait_time:.2f}s...")
+                    time.sleep(wait_time)
+                    last_exception = e
+                    continue
+                else:
+                    raise ValueError(
+                        f"Could not load frame {frame_idx} from {video_path} "
+                        f"after {max_retries} attempts: {str(e)}"
+                    ) from last_exception
+        
+        # Should not reach here, but just in case
+        raise ValueError(
+            f"Could not load frame {frame_idx} from {video_path} "
+            f"after {max_retries} attempts"
+        )
     
     def _load_trajectory(self, hdf5_path: str, start_frame: int, num_steps: int) -> torch.Tensor:
         with h5py.File(hdf5_path, 'r') as f:
