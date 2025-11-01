@@ -477,11 +477,8 @@ def main():
     print("Loading model...")
     model = Molmo.from_checkpoint(args.checkpoint, device=args.device)
     model.eval()
-    
-    # CRITICAL: Cast model to bf16 to match training precision and reduce memory
-    # This is essential for inference with large models - reduces memory by ~50%
-    print("Casting model to bfloat16 for memory efficiency...")
-    model = model.to(torch.bfloat16)
+    model.config.action_horizon = args.action_chunking_horizon
+    model.flow_matching_head.action_horizon = args.action_chunking_horizon
     
     # Build preprocessor
     print("Building preprocessor...")
@@ -532,6 +529,7 @@ def main():
         # Move tensors to device
         device = torch.device(args.device)
         input_ids = torch.tensor(batch["input_tokens"], dtype=torch.long).unsqueeze(0).to(device)
+        attention_mask = (input_ids != -1).to(device)
         images = torch.tensor(batch["images"], dtype=torch.float32).unsqueeze(0).to(device)
         image_input_idx = torch.tensor(batch["image_input_idx"], dtype=torch.long).unsqueeze(0).to(device)
         image_masks = None
@@ -544,7 +542,7 @@ def main():
         with torch.no_grad():
             pred_trajectory = model.sample_actions_flow_matching(
                 input_ids=input_ids,
-                attention_mask=None,
+                attention_mask=attention_mask,
                 images=images,
                 image_masks=image_masks,
                 image_input_idx=image_input_idx,
@@ -558,7 +556,27 @@ def main():
         if isinstance(pred_trajectory, torch.Tensor):
             pred_trajectory = pred_trajectory.cpu().numpy()
         
-        print(f"Predicted trajectory shape: {pred_trajectory.shape}")
+        print(f"Predicted trajectory shape (raw): {pred_trajectory.shape}")
+        
+        # Reshape from (batch_size, action_horizon, action_dim) to (action_horizon, num_joints, coords_per_joint)
+        # Remove batch dimension and reshape flattened coordinates
+        batch_size, action_horizon, action_dim = pred_trajectory.shape
+        pred_trajectory = pred_trajectory.squeeze(0)  # Remove batch dimension: (action_horizon, action_dim)
+        
+        if args.task_type == '3d':
+            # For 3D: action_dim = num_joints * 3
+            num_joints = action_dim // 3
+            if action_dim % 3 != 0:
+                raise ValueError(f"action_dim ({action_dim}) must be divisible by 3 for 3D trajectories")
+            pred_trajectory = pred_trajectory.reshape(action_horizon, num_joints, 3)
+        else:
+            # For 2D: action_dim = num_joints * 2
+            num_joints = action_dim // 2
+            if action_dim % 2 != 0:
+                raise ValueError(f"action_dim ({action_dim}) must be divisible by 2 for 2D trajectories")
+            pred_trajectory = pred_trajectory.reshape(action_horizon, num_joints, 2)
+        
+        print(f"Predicted trajectory shape (reshaped): {pred_trajectory.shape}")
                 
         # Process ground truth trajectory
         gt_trajectory_2d = None
@@ -574,6 +592,26 @@ def main():
             
             print(f"Ground truth trajectory shape: {gt_trajectory_raw.shape}")
             
+            # Reshape GT trajectory if needed (it might also be flattened)
+            if len(gt_trajectory_raw.shape) == 3 and gt_trajectory_raw.shape[0] == 1:
+                # Remove batch dimension
+                gt_trajectory_raw = gt_trajectory_raw.squeeze(0)
+            
+            # Check if GT needs reshaping
+            if len(gt_trajectory_raw.shape) == 2:
+                # Flattened format: (action_horizon, action_dim)
+                gt_action_horizon, gt_action_dim = gt_trajectory_raw.shape
+                if args.task_type == '3d':
+                    gt_num_joints = gt_action_dim // 3
+                    if gt_action_dim % 3 != 0:
+                        raise ValueError(f"GT action_dim ({gt_action_dim}) must be divisible by 3 for 3D trajectories")
+                    gt_trajectory_raw = gt_trajectory_raw.reshape(gt_action_horizon, gt_num_joints, 3)
+                else:
+                    gt_num_joints = gt_action_dim // 2
+                    if gt_action_dim % 2 != 0:
+                        raise ValueError(f"GT action_dim ({gt_action_dim}) must be divisible by 2 for 2D trajectories")
+                    gt_trajectory_raw = gt_trajectory_raw.reshape(gt_action_horizon, gt_num_joints, 2)
+            
             # Ground truth is already in 2D normalized coordinates for 2D tasks
             # For 3D tasks, we need to project to 2D
             if args.task_type == '2d':
@@ -584,24 +622,6 @@ def main():
                     gt_trajectory_raw, intrinsic, w, h, normalize=True
                 )
                 print(f"Projected GT trajectory to 2D: {gt_trajectory_2d.shape}")
-            
-            # Compute metrics if requested
-            if args.save_metrics:
-                # MSE
-                mse = np.mean((pred_trajectory - gt_trajectory_2d) ** 2)
-                metrics["mse"] = float(mse)
-                
-                # ADE (Average Displacement Error)
-                ade = np.mean(np.linalg.norm(pred_trajectory - gt_trajectory_2d, axis=-1))
-                metrics["ade"] = float(ade)
-                
-                # FDE (Final Displacement Error)
-                fde = np.linalg.norm(pred_trajectory[-1] - gt_trajectory_2d[-1], axis=-1).mean()
-                metrics["fde"] = float(fde)
-                
-                print(f"MSE: {mse:.6f}")
-                print(f"ADE: {ade:.6f}")
-                print(f"FDE: {fde:.6f}")
         
         # Convert prediction trajectory to 2D if needed
         pred_trajectory_2d = None
@@ -613,6 +633,24 @@ def main():
                 pred_trajectory, intrinsic, w, h, normalize=True
             )
             print(f"Projected prediction trajectory to 2D: {pred_trajectory_2d.shape}")
+        
+        # Compute metrics if requested (after both trajectories are in 2D)
+        if gt_trajectory_2d is not None and args.save_metrics:
+            # MSE
+            mse = np.mean((pred_trajectory_2d - gt_trajectory_2d) ** 2)
+            metrics["mse"] = float(mse)
+            
+            # ADE (Average Displacement Error)
+            ade = np.mean(np.linalg.norm(pred_trajectory_2d - gt_trajectory_2d, axis=-1))
+            metrics["ade"] = float(ade)
+            
+            # FDE (Final Displacement Error)
+            fde = np.linalg.norm(pred_trajectory_2d[-1] - gt_trajectory_2d[-1], axis=-1).mean()
+            metrics["fde"] = float(fde)
+            
+            print(f"MSE: {mse:.6f}")
+            print(f"ADE: {ade:.6f}")
+            print(f"FDE: {fde:.6f}")
         
         # Visualize trajectories
         print("Creating visualization...")
