@@ -863,6 +863,11 @@ class Preprocessor:
             if formatter_metadata:
                 metadata.update(formatter_metadata)
             batch["metadata"] = metadata
+        
+        # Preserve trajectory_target for flow matching training
+        if "trajectory_target" in example:
+            batch["trajectory_target"] = example["trajectory_target"]
+        
         return batch
 
     @property
