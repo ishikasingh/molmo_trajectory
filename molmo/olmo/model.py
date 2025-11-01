@@ -1985,6 +1985,21 @@ class Molmo(nn.Module):
             # Update sequence length
             seq_len = x.shape[1]
             
+            # Update position_ids to include action tokens
+            if self.config.use_position_ids and position_ids is not None:
+                # Create position IDs for action tokens (continue from where prefix ended)
+                # Action tokens get sequential positions starting from max_prefix_pos + 1
+                max_prefix_pos = position_ids.max()
+                action_position_ids = torch.arange(
+                    max_prefix_pos + 1,
+                    max_prefix_pos + 1 + action_seq_len,
+                    dtype=torch.long,
+                    device=x.device
+                ).unsqueeze(0).expand(batch_size, -1)
+                
+                # Concatenate position IDs
+                position_ids = torch.cat([position_ids, action_position_ids], dim=1)
+            
             # Create flow matching attention mask
             # Prefix (text/images): can attend to each other (bidirectional)
             # Actions: first token prevents prefix attention, rest allow causal
@@ -2203,36 +2218,25 @@ class Molmo(nn.Module):
         dt = -1.0 / num_steps
         time = 1.0
         
-        # First, cache the prefix (text/image) by running forward pass without actions
-        # This computes and caches K, V for text/image tokens
-        with torch.autocast("cuda", enabled=True, dtype=self.config.autocast_precision):
-            prefix_output = self.forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                images=images,
-                image_masks=image_masks,
-                image_input_idx=image_input_idx,
-                use_cache=False,  # Disable KV caching - causes excessive memory usage
-                noisy_actions=None,  # No actions yet - just prefix
-                action_timestep=None,
-            )
-            prefix_cache = prefix_output.attn_key_values
-        
         # ODE integration loop
+        # NOTE: We don't use KV caching here because it would require storing
+        # keys/values for ~2000-3000 tokens (text + image patches) across all layers,
+        # which consumes 2-3GB of memory. Instead, we re-process the prefix each step,
+        # which trades computation for memory efficiency.
         for step in range(num_steps):
             # Current time
             t = torch.full((batch_size,), time, device=device)
             
-            # Forward pass - process full sequence each time (no KV cache)
-            with torch.autocast("cuda", enabled=True, dtype=self.config.autocast_precision):
-                output = self.forward(
+            # Forward pass with current noisy actions
+            # The prefix (text/images) is re-processed each step for memory efficiency
+            with torch.autocast("cuda", enabled=False):
+                output = self(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     images=images,
                     image_masks=image_masks,
                     image_input_idx=image_input_idx,
-                    past_key_values=None,  # Don't use KV cache - recompute each step
-                    use_cache=False,  # Disable KV caching - causes excessive memory usage
+                    use_cache=False,  # No caching to save memory
                     noisy_actions=x_t,
                     action_timestep=t,
                 )
