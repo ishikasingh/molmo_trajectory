@@ -58,7 +58,7 @@ from .initialization import ModuleType, init_weights, init_normal
 from .safetensors_util import safetensors_file_to_state_dict
 from .torch_util import ensure_finite_
 from .util import resource_path
-from .losses import FlowMatchingHead, make_flow_matching_attention_mask
+from .losses import FlowMatchingHead
 
 if sys.version_info.minor > 8:
     from collections.abc import MutableMapping
@@ -1691,6 +1691,7 @@ class Molmo(nn.Module):
                 action_dim=config.action_dim,
                 action_horizon=config.action_horizon,
                 use_adarms=config.use_adarms_flow_matching,
+                config=config,  # Pass config for proper weight initialization
             )
 
         self.__num_fwd_flops: Optional[int] = None
@@ -2000,32 +2001,13 @@ class Molmo(nn.Module):
                 # Concatenate position IDs
                 position_ids = torch.cat([position_ids, action_position_ids], dim=1)
             
-            # Create flow matching attention mask
-            # Prefix (text/images): can attend to each other (bidirectional)
-            # Actions: first token prevents prefix attention, rest allow causal
+            # Extend attention_mask to include action tokens (all valid, no padding)
             if attention_mask is not None:
-                # TODO: check if the attention_mask is None
-                prefix_mask = attention_mask  # (batch_size, prefix_len)
-                action_mask = torch.ones(
-                    batch_size, action_seq_len, 
-                    dtype=torch.bool, device=x.device
-                )  # (batch_size, action_len)
-                
-                # Create attention bias using flow matching pattern
-                # This creates a 2D attention mask where actions can attend to prefix but not vice versa
-                attention_bias_fm = make_flow_matching_attention_mask(
-                    prefix_mask=prefix_mask,
-                    suffix_mask=action_mask,
-                )  # (batch_size, total_len, total_len)
-                
-                # Convert to additive attention bias format (0 = attend, -inf = mask)
-                attention_bias = torch.zeros_like(attention_bias_fm, dtype=torch.float)
-                attention_bias.masked_fill_(~attention_bias_fm, torch.finfo(torch.float).min)
-                attention_bias = attention_bias.unsqueeze(1)  # (batch_size, 1, total_len, total_len)
-                
-                # For flow matching, we override the standard attention mask
-                # so set attention_mask to None to avoid double-processing
-                attention_mask = None
+                action_attention_mask = torch.ones(
+                    batch_size, action_seq_len,
+                    dtype=attention_mask.dtype, device=attention_mask.device
+                )
+                attention_mask = torch.cat([attention_mask, action_attention_mask], dim=1)
 
         # Transform the attention mask into what the blocks expect.
         if attention_mask is not None:
@@ -2067,6 +2049,17 @@ class Molmo(nn.Module):
                 # `F.scaled_dot_product_attention()` doesn't handle -inf like you'd expect, instead
                 # it can produce NaNs.
                 ensure_finite_(attention_bias, check_neg_inf=True, check_pos_inf=False)
+            
+            # Flow matching: Modify attention pattern for action tokens
+            # Standard causal mask already gives us:
+            # - Prefix tokens: causal among themselves ✓
+            # - Prefix→Actions: -inf (can't attend forward) ✓
+            # - Actions→Prefix: 0 (can attend backward) ✓
+            # - Actions→Actions: triangular (need to make bidirectional)
+            if has_action_tokens:
+                prefix_len = action_hidden_states_indices[0]
+                # Make action→action bidirectional by removing causal mask
+                attention_bias[:, :, prefix_len:, prefix_len:] = 0
 
         attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
 
