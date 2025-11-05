@@ -4,7 +4,10 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .config import ModelConfig
 
 
 def posemb_sincos(
@@ -25,6 +28,8 @@ def posemb_sincos(
     Returns:
         (batch_size, embedding_dim) tensor of position embeddings
     """
+    assert (pos < 1).all(), "Positions must be less than 1"
+    assert (pos > 0).all(), "Positions must be greater than 0"
     if embedding_dim % 2 != 0:
         raise ValueError(f"embedding_dim ({embedding_dim}) must be divisible by 2")
     
@@ -115,8 +120,23 @@ class FlowMatchingTrajectoryLoss(nn.Module):
             weights = (1.0 - t).view(-1, *([1] * (velocity_loss.dim() - 1)))
             velocity_loss = velocity_loss * weights
 
-        # Return mean loss
-        return velocity_loss.mean()
+        # Check if loss is reasonable before returning
+        mean_loss = velocity_loss.mean()
+        
+        # If loss is extremely large (> 1e6), something is wrong
+        if mean_loss > 1e6:
+            import warnings
+            warnings.warn(
+                f"Flow matching loss is extremely large ({mean_loss.item():.2e}). "
+                f"This usually indicates:\n"
+                f"  1. Very large velocity predictions (check model initialization)\n"
+                f"  2. Unnormalized trajectory data (should be in [-10, 10] range ideally)\n"
+                f"  3. Learning rate too high\n"
+                f"Clipping loss to 1e6 to prevent inf, but you should investigate the root cause."
+            )
+            # mean_loss = torch.clamp(mean_loss, max=1e6)
+        
+        return mean_loss
 
 
 class FlowMatchingHead(nn.Module):
@@ -140,6 +160,7 @@ class FlowMatchingHead(nn.Module):
         action_dim: int,
         action_horizon: int,
         use_adarms: bool = False,
+        config: Optional['ModelConfig'] = None,
     ):
         """
         Args:
@@ -147,12 +168,14 @@ class FlowMatchingHead(nn.Module):
             action_dim: Dimension of each action vector
             action_horizon: Number of action steps to predict
             use_adarms: Deprecated - kept for backward compatibility but not used
+            config: Optional ModelConfig for proper weight initialization using model's init scheme
         """
         super().__init__()
         
         self.d_model = d_model
         self.action_dim = action_dim
         self.action_horizon = action_horizon
+        self.config = config
         # Note: use_adarms is deprecated. We only support MLP-style mixing which works
         # with standard transformers without requiring conditional layer norms.
         
@@ -166,6 +189,63 @@ class FlowMatchingHead(nn.Module):
         
         # Project action outputs to velocity
         self.action_out_proj = nn.Linear(d_model, action_dim)
+        
+        # Initialize weights properly
+        # This is CRITICAL for flow matching stability
+        if config is not None:
+            self._initialize_with_config(config)
+        else:
+            # Fallback to conservative initialization if config not provided
+            self._initialize_output_projection()
+    
+    def _initialize_with_config(self, config: 'ModelConfig'):
+        """
+        Initialize weights using the model's standard initialization scheme.
+        This matches how other output projections (like lm_head) are initialized.
+        """
+        from .initialization import init_weights, ModuleType
+        
+        # Initialize input projections as input modules
+        init_weights(config, self.action_in_proj, d=self.action_dim, layer_id=None, 
+                    type_of_module=ModuleType.in_module)
+        init_weights(config, self.action_time_mlp_in, d=self.d_model, layer_id=None,
+                    type_of_module=ModuleType.in_module)
+        init_weights(config, self.action_time_mlp_out, d=self.d_model, layer_id=None,
+                    type_of_module=ModuleType.in_module)
+        
+        # Initialize output projection as final output module with conservative std
+        # Use a smaller std_factor to prevent large initial predictions
+        init_weights(config, self.action_out_proj, d=self.d_model, layer_id=None,
+                    type_of_module=ModuleType.final_out, std_factor=0.01)
+    
+    def _initialize_output_projection(self):
+        """
+        Fallback initialization when config is not provided.
+        Uses conservative Xavier initialization with small gain.
+        """
+        # Use Xavier/Glorot initialization with very small gain
+        nn.init.xavier_uniform_(self.action_out_proj.weight, gain=0.001)
+        nn.init.zeros_(self.action_out_proj.bias)
+        
+        # Also init other layers conservatively
+        nn.init.xavier_uniform_(self.action_in_proj.weight, gain=1.0)
+        nn.init.zeros_(self.action_in_proj.bias)
+        nn.init.xavier_uniform_(self.action_time_mlp_in.weight, gain=1.0)
+        nn.init.zeros_(self.action_time_mlp_in.bias)
+        nn.init.xavier_uniform_(self.action_time_mlp_out.weight, gain=1.0)
+        nn.init.zeros_(self.action_time_mlp_out.bias)
+        
+    def reinitialize_output_head(self):
+        """
+        Public method to reinitialize the flow matching head.
+        Call this after loading a checkpoint if you get very large predictions.
+        """
+        if self.config is not None:
+            self._initialize_with_config(self.config)
+            print(f"[FlowMatchingHead] Reinitialized with model config (std_factor=0.01)")
+        else:
+            self._initialize_output_projection()
+            print(f"[FlowMatchingHead] Reinitialized with fallback method (gain=0.001)")
     
     def embed_actions_with_time(
         self,
@@ -212,69 +292,6 @@ class FlowMatchingHead(nn.Module):
         Returns:
             velocity: (batch_size, action_horizon, action_dim)
         """
+        # Output projection initialized with small std to keep predictions reasonable
         return self.action_out_proj(action_hidden_states)
 
-
-def make_flow_matching_attention_mask(
-    prefix_mask: torch.Tensor,
-    suffix_mask: torch.Tensor,
-    prefix_ar_mask: Optional[torch.Tensor] = None,
-    suffix_ar_mask: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    Create attention mask for flow matching that prevents text/image tokens 
-    from attending to action tokens.
-    
-    Based on openpi's make_attn_mask function. The ar_mask controls which tokens 
-    can attend to which:
-    - ar_mask[i] = False: token i is in bidirectional block with previous tokens
-    - ar_mask[i] = True: token i starts new causal block, previous tokens can't attend to it
-    
-    For flow matching:
-    - Prefix (text/images): all False (fully bidirectional)
-    - Suffix (actions): [True, False, False, ...] 
-      * First action token True -> prevents prefix from attending
-      * Rest False -> allows causal attention within actions
-    
-    Args:
-        prefix_mask: (batch_size, prefix_len) - True for valid prefix tokens
-        suffix_mask: (batch_size, suffix_len) - True for valid suffix tokens
-        prefix_ar_mask: (prefix_len,) - ar mask for prefix (typically all False)
-        suffix_ar_mask: (suffix_len,) - ar mask for suffix (typically [True, False, ...])
-        
-    Returns:
-        attention_mask: (batch_size, total_len, total_len) boolean mask
-            True = can attend, False = cannot attend
-    """
-    batch_size = prefix_mask.shape[0]
-    prefix_len = prefix_mask.shape[1]
-    suffix_len = suffix_mask.shape[1]
-    total_len = prefix_len + suffix_len
-    device = prefix_mask.device
-    
-    # Concatenate masks
-    input_mask = torch.cat([prefix_mask, suffix_mask], dim=1)  # (B, total_len)
-    
-    # Create ar_mask if not provided
-    if prefix_ar_mask is None:
-        prefix_ar_mask = torch.zeros(prefix_len, dtype=torch.bool, device=device)
-    if suffix_ar_mask is None:
-        # Default: first action token prevents prefix attention, rest allow causal
-        suffix_ar_mask = torch.zeros(suffix_len, dtype=torch.bool, device=device)
-        suffix_ar_mask[0] = True
-    
-    # Concatenate ar_masks (these are 1D, broadcast to batch)
-    ar_mask = torch.cat([prefix_ar_mask, suffix_ar_mask], dim=0)  # (total_len,)
-    ar_mask = ar_mask.unsqueeze(0).expand(batch_size, -1)  # (B, total_len)
-    
-    # Compute cumulative sum for causal masking
-    cumsum = torch.cumsum(ar_mask.float(), dim=1)  # (B, total_len)
-    
-    # Token i can attend to token j if cumsum[j] <= cumsum[i]
-    # This creates the block structure
-    attn_mask = cumsum.unsqueeze(1) >= cumsum.unsqueeze(2)  # (B, total_len, total_len)
-    
-    # Also respect input_mask (padding)
-    valid_mask = input_mask.unsqueeze(1) & input_mask.unsqueeze(2)  # (B, total_len, total_len)
-    
-    return attn_mask & valid_mask

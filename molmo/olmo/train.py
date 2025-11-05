@@ -300,6 +300,14 @@ class Trainer:
         if self.model.config.use_flow_matching_head:
             self.trajectory_loss_fn = FlowMatchingTrajectoryLoss(velocity_weighting="none")
             self.trajectory_loss_fn = self.trajectory_loss_fn.to(self.device)
+            
+            # CRITICAL: Reinitialize the flow matching head
+            # This is necessary in case the model was loaded from a checkpoint with
+            # uninitialized or poorly initialized flow matching weights
+            if hasattr(self.model, 'flow_matching_head') and self.model.flow_matching_head is not None:
+                log.info("[FLOW MATCHING INIT] Reinitializing flow matching head...")
+                self.model.flow_matching_head.reinitialize_output_head()
+                log.info("[FLOW MATCHING INIT] Flow matching head reinitialized with model's init scheme")
 
     @property
     def dataset(self) -> IterableDataset:
@@ -819,11 +827,22 @@ class Trainer:
             # Sample noise from standard normal
             noise = torch.randn_like(trajectory_target)
             
+            # IMPORTANT: If trajectory values are very large (e.g., > 10 in magnitude), 
+            # consider normalizing them before training. You can track statistics here:
+            traj_abs_max = trajectory_target.abs().max().item()
+            if traj_abs_max > 100:
+                log.warning(
+                    f"[FLOW MATCHING WARNING] trajectory_target has very large values (max abs: {traj_abs_max:.2f}). "
+                    f"Consider normalizing trajectory data to [-1, 1] or similar range for better numerical stability."
+                )
+            
             # Interpolate: x_t = t * noise + (1 - t) * target
             # Expand t for broadcasting: (batch_size,) -> (batch_size, 1, 1)
             t_expanded = t.view(batch_size, 1, 1)
             noisy_actions = t_expanded * noise + (1 - t_expanded) * trajectory_target
             action_timestep = t
+
+            # log.info(f"[FLOW MATCHING DEBUG] Prepared noisy actions: t_mean={t.mean():.3f}, noise_std={noise.std():.3f}")
             
             # Store for loss computation
             batch['flow_matching_time'] = t
@@ -916,21 +935,29 @@ class Trainer:
             # Note: output.velocity_output contains the predicted VELOCITY, NOT the trajectory itself!
             # The actual trajectory is only computed during inference via ODE integration (sample_actions_flow_matching)
             # During training, we only predict and regress the velocity field
-            velocity_pred = output.velocity_output
+            
+            # Cast to float32 for numerical stability (like we do for logits in VLM tasks)
+            # velocity_output is in autocast dtype (bfloat16), but loss computation happens outside autocast
+            velocity_pred = output.velocity_output.to(torch.float32)
             
             # Get the ground truth actions and the time/noise used during forward pass
             # These should have been passed to the forward method
-            trajectory_target = batch['trajectory_target']  # (batch_size, action_horizon, action_dim)
-            t = batch['flow_matching_time']  # (batch_size,) - sampled in model_forward
-            noise = batch['flow_matching_noise']  # (batch_size, action_horizon, action_dim)
+            # Ensure all tensors are in float32 for consistent dtype in loss computation
+            trajectory_target = batch['trajectory_target'].to(torch.float32)  # (batch_size, action_horizon, action_dim)
+            t = batch['flow_matching_time'].to(torch.float32)  # (batch_size,) - sampled in model_forward
+            noise = batch['flow_matching_noise'].to(torch.float32)  # (batch_size, action_horizon, action_dim)
             
-            # Compute flow matching loss (on velocity predictions)
+            # Check for NaN/Inf before loss computation
+            if torch.isnan(velocity_pred).any() or torch.isinf(velocity_pred).any():
+                log.error(f"[FLOW MATCHING ERROR] velocity_pred contains NaN or Inf! NaN: {torch.isnan(velocity_pred).sum().item()}, Inf: {torch.isinf(velocity_pred).sum().item()}")
             trajectory_loss = self.trajectory_loss_fn(
                 predicted_velocity=velocity_pred,
                 trajectory_target=trajectory_target,
                 t=t,
                 noise=noise
             )
+
+            # log.info(f"[FLOW MATCHING DEBUG] Flow matching loss computed: {trajectory_loss.item():.6f}")
         
         # Combine losses: selectively supervise based on task type
         # This matches OpenPI's approach: compute all outputs but only supervise on the relevant ones
@@ -943,7 +970,7 @@ class Trainer:
             # velocity_output is None (flow_matching_head not enabled for VLM tasks)
             total_loss = ce_loss
         
-        return accuracy, total_loss, z_loss, logits
+        return accuracy, total_loss, z_loss, logits, trajectory_loss
 
     def train_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         # Split into micro-batches.
@@ -968,6 +995,7 @@ class Trainer:
         ce_batch_loss = torch.tensor(0.0, device=self.device)
         batch_accuracy = torch.tensor(0.0, device=self.device)
         z_batch_loss = None if not self.cfg.softmax_auxiliary_loss else torch.tensor(0.0, device=self.device)
+        trajectory_batch_loss = torch.tensor(0.0, device=self.device)  # Track flow matching loss
         lb_batch_loss = (
             None if self.model.config.block_type != BlockType.moe else torch.tensor(0.0, device=self.device)
         )
@@ -983,37 +1011,43 @@ class Trainer:
             else torch.zeros((self.model.config.n_layers, self.model.config.moe_num_experts))
         )
         for micro_batch in micro_batches:
-            accuracy, ce_loss, z_loss, logits = self.model_forward(
+            # Note: model_forward returns total_loss as 2nd value, which is:
+            # - For trajectory tasks: weighted trajectory_loss
+            # - For VLM tasks: ce_loss
+            # The 5th return value (trajectory_loss) is only for logging/metrics
+            accuracy, total_loss, z_loss, logits, trajectory_loss = self.model_forward(
                 micro_batch, compute_z_loss=self.cfg.softmax_auxiliary_loss, loss_reduction="none" if has_labels else "sum"
             )
             if has_labels:
                 accuracy = accuracy.sum()
-                ce_loss = ce_loss.sum()
+                total_loss = total_loss.sum()
                 if z_loss is not None:
                     z_loss = z_loss.sum()
 
-            ce_loss = ce_loss / batch_size_in_tokens
+            total_loss = total_loss / batch_size_in_tokens
             accuracy = accuracy / batch_size_in_tokens
 
             # In case this helps with memory utilization.
             del micro_batch
 
-            # Update overall CE batch loss.
-            ce_batch_loss += ce_loss.detach()
+            # Update overall batch loss (contains CE loss for VLM, trajectory loss for trajectory tasks).
+            ce_batch_loss += total_loss.detach()
             batch_accuracy += accuracy.detach()
+            trajectory_batch_loss += trajectory_loss.detach()
 
             # Get loss to optimize for.
-            if self.cfg.softmax_auxiliary_loss:
-                assert z_loss is not None
+            # Note: For trajectory tasks, total_loss already contains the weighted trajectory loss
+            # For VLM tasks, total_loss contains CE loss, and we may add z_loss
+            if self.cfg.softmax_auxiliary_loss and z_loss is not None:
+                # VLM tasks with z_loss
                 assert z_batch_loss is not None
                 z_loss = z_loss / batch_size_in_tokens
-
-                loss = ce_loss + z_loss
-
+                loss = total_loss + z_loss
                 # Update overall Z batch loss.
                 z_batch_loss += z_loss.detach()
             else:
-                loss = ce_loss
+                # Trajectory tasks or VLM tasks without z_loss
+                loss = total_loss
 
             del logits
 
@@ -1041,7 +1075,7 @@ class Trainer:
             # Run backward pass.
             loss.backward()
 
-        return ce_batch_loss, z_batch_loss, batch_accuracy, lb_batch_loss, moe_z_batch_loss, expert_assignments
+        return ce_batch_loss, z_batch_loss, batch_accuracy, lb_batch_loss, moe_z_batch_loss, expert_assignments, trajectory_batch_loss
 
     def train_step(self, batch: Dict[str, Any], reduce_global_loss: bool = True) -> Dict[str, float]:
         metrics: Dict[str, float] = {}
@@ -1057,7 +1091,7 @@ class Trainer:
         batch = self.move_to_device(batch, self.device)
 
         # Run forward-backward pass.
-        ce_batch_loss, z_batch_loss, batch_accuracy, lb_batch_loss, moe_z_batch_loss, expert_assignments = self.train_batch(batch)
+        ce_batch_loss, z_batch_loss, batch_accuracy, lb_batch_loss, moe_z_batch_loss, expert_assignments, trajectory_batch_loss = self.train_batch(batch)
 
         # Collect loss, potentially reducing over all ranks.
         if reduce_global_loss:
@@ -1075,6 +1109,9 @@ class Trainer:
             if moe_z_batch_loss is not None:
                 dist.reduce(moe_z_batch_loss, 0)
                 moe_z_batch_loss.div_(get_world_size())
+            if trajectory_batch_loss is not None:
+                dist.reduce(trajectory_batch_loss, 0)
+                trajectory_batch_loss.div_(get_world_size())
 
         # Clip gradient norms and collect param/gradient/optim metrics.
         should_log_optim_metrics_this_step = self.should_log_optim_metrics_this_step()
@@ -1142,6 +1179,8 @@ class Trainer:
         metrics["train/Accuracy"] = batch_accuracy.item()
         if z_batch_loss is not None:
             metrics["train/ZLoss"] = z_batch_loss.item()
+        if trajectory_batch_loss is not None and trajectory_batch_loss.item() > 0:
+            metrics["train/FlowMatchingLoss"] = trajectory_batch_loss.item()
         if lb_batch_loss is not None:
             metrics["train/LoadBalancingLoss"] = lb_batch_loss.item()
             # Log assignment metrics.
