@@ -375,6 +375,7 @@ def get_dataset_by_name(dataset_name, split):
             action_chunking_horizon=30,
             output_2d_trajectory=False,
             normalize_2d_coordinates=False,
-            output_format="flow_matching"
+            output_format="flow_matching",
+            frame_downsampling_ratio=15,
         )
     raise NotImplementedError(dataset_name, split)

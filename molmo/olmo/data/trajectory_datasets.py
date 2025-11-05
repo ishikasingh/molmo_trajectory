@@ -36,6 +36,52 @@ def video_capture_context(video_path: str):
                 pass  # Ignore errors during cleanup
 
 
+@contextlib.contextmanager
+def hdf5_file_with_retry(hdf5_path: str, max_retries: int = 3):
+    """
+    Context manager for opening HDF5 files with retry logic for NFS I/O errors.
+    
+    Args:
+        hdf5_path: Path to the HDF5 file
+        max_retries: Maximum number of retry attempts
+        
+    Yields:
+        h5py.File object
+        
+    Raises:
+        OSError: If file cannot be opened after max_retries attempts
+    """
+    last_exception = None
+    file_opened = False
+    
+    for attempt in range(max_retries):
+        try:
+            f = h5py.File(hdf5_path, 'r')
+            file_opened = True
+            try:
+                yield f
+                return
+            finally:
+                f.close()
+        except (OSError, IOError) as e:
+            # Only retry if file opening failed, not if error occurred during usage
+            if not file_opened and attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 0.1 + random.uniform(0, 0.1)
+                print(f"Warning: Failed to open HDF5 file {hdf5_path} (attempt {attempt + 1}/{max_retries}): {str(e)}, retrying in {wait_time:.2f}s...")
+                time.sleep(wait_time)
+                last_exception = e
+                continue
+            else:
+                # If file was opened but error occurred during usage, don't retry
+                raise
+        except Exception as e:
+            # For other exceptions, don't retry
+            raise
+    
+    # Should not reach here, but just in case
+    raise OSError(f"Could not open HDF5 file {hdf5_path} after {max_retries} attempts")
+
+
 class TrajectoryDataset(Dataset):
     """PyTorch Dataset for trajectory prediction training."""
     
@@ -50,6 +96,7 @@ class TrajectoryDataset(Dataset):
         use_confidence_filter: bool = False,
         confidence_threshold: float = 0.5,
         output_format: str = "text",  # "text" or "flow_matching"
+        frame_downsampling_ratio: int = 15,  # Sample every n frames (1 = no downsampling, 10 = every 10 frames)
     ):
         # Get data directory from environment variable if not provided
         if data_dir is None:
@@ -65,8 +112,10 @@ class TrajectoryDataset(Dataset):
         self.output_2d_trajectory = output_2d_trajectory
         self.normalize_2d_coordinates = normalize_2d_coordinates
         self.output_format = output_format  # "text" or "flow_matching"
+        self.frame_downsampling_ratio = frame_downsampling_ratio
         
         assert output_format in ["text", "flow_matching"], f"output_format must be 'text' or 'flow_matching', got {output_format}"
+        assert frame_downsampling_ratio >= 1, f"frame_downsampling_ratio must be >= 1, got {frame_downsampling_ratio}"
         
         # Default joint names matching data_formatter.py TRAJECTORY_KEYPOINTS
         if joint_names is None:
@@ -98,8 +147,15 @@ class TrajectoryDataset(Dataset):
             if (cached_data.get('split') == self.split and
                 cached_data.get('action_chunking_horizon') == self.action_chunking_horizon and
                 cached_data.get('joint_names') == self.joint_names):
-                print(f"Successfully loaded {len(cached_data['index_mapping'])} samples from cache")
-                return cached_data['index_mapping']
+                full_index = cached_data['index_mapping']
+                print(f"Successfully loaded {len(full_index)} samples from cache")
+                
+                # Apply downsampling filter if needed (only for training split)
+                if self.frame_downsampling_ratio > 1 and self.split == "train":
+                    filtered_index = self._apply_downsampling_filter(full_index)
+                    print(f"Applied downsampling ratio {self.frame_downsampling_ratio}: {len(full_index)} -> {len(filtered_index)} samples")
+                    return filtered_index
+                return full_index
             else:
                 print("Cache configuration mismatch, rebuilding index...")
         return None
@@ -118,6 +174,29 @@ class TrajectoryDataset(Dataset):
         with open(cache_file, 'wb') as f:
             pickle.dump(cache_data, f)
         print(f"Successfully saved {len(index_mapping)} samples to cache")
+    
+    def _apply_downsampling_filter(self, index_mapping: List[Dict]) -> List[Dict]:
+        """
+        Filter index mapping to keep only frames that match the downsampling pattern.
+        
+        For each video/hdf5 file, keep frames 0, n, 2n, 3n, ... where n is the downsampling ratio.
+        
+        Args:
+            index_mapping: Full index mapping with all frames
+            
+        Returns:
+            Filtered index mapping with downsampled frames
+        """
+        if self.frame_downsampling_ratio == 1:
+            return index_mapping
+        
+        filtered = []
+        for entry in index_mapping:
+            # Keep frame if frame_idx is divisible by downsampling ratio
+            if entry['frame_idx'] % self.frame_downsampling_ratio == 0:
+                filtered.append(entry)
+        
+        return filtered
 
     def _build_index_mapping(self) -> List[Dict]:
         """Build a flat index mapping across all videos and frames."""
@@ -181,6 +260,7 @@ class TrajectoryDataset(Dataset):
                     #     continue
                         
                     trajectory_length = f[f'transforms/{self.joint_names[0]}'].shape[0]
+                # Always build full index with all frames (ratio=1)
                 for frame_idx in range(trajectory_length - self.action_chunking_horizon):
                     index_mapping.append({
                         'video_path': str(video_file),
@@ -196,8 +276,14 @@ class TrajectoryDataset(Dataset):
                 continue
             # time.sleep(0.05)
         
-        # Save to cache for future use
+        # Save full index to cache for future use
         self._save_index_to_cache(index_mapping)
+        
+        # Apply downsampling filter if needed (only for training split)
+        if self.frame_downsampling_ratio > 1 and self.split == "train":
+            filtered_index = self._apply_downsampling_filter(index_mapping)
+            print(f"Applied downsampling ratio {self.frame_downsampling_ratio}: {len(index_mapping)} -> {len(filtered_index)} samples")
+            return filtered_index
         
         return index_mapping
     
@@ -320,8 +406,23 @@ class TrajectoryDataset(Dataset):
             f"after {max_retries} attempts"
         )
     
-    def _load_trajectory(self, hdf5_path: str, start_frame: int, num_steps: int) -> torch.Tensor:
-        with h5py.File(hdf5_path, 'r') as f:
+    def _load_trajectory(self, hdf5_path: str, start_frame: int, num_steps: int, max_retries: int = 3) -> torch.Tensor:
+        """
+        Load trajectory data from HDF5 file with retry logic for NFS I/O errors.
+        
+        Args:
+            hdf5_path: Path to the HDF5 file
+            start_frame: Starting frame index
+            num_steps: Number of steps to load
+            max_retries: Maximum number of retry attempts
+            
+        Returns:
+            torch.Tensor containing trajectory data
+            
+        Raises:
+            OSError: If file cannot be opened after max_retries attempts
+        """
+        with hdf5_file_with_retry(hdf5_path, max_retries) as f:
             trajectories = {}
             for joint in self.joint_names:
                 if f'transforms/{joint}' in f:
@@ -333,30 +434,76 @@ class TrajectoryDataset(Dataset):
             trajectory = np.stack(trajectory_list, axis=1)
             return torch.from_numpy(trajectory).float()
     
-    def _load_instruction(self, hdf5_path: str) -> str:
-        with h5py.File(hdf5_path, 'r') as f:
+    def _load_instruction(self, hdf5_path: str, max_retries: int = 3) -> str:
+        """
+        Load instruction from HDF5 file attributes with retry logic for NFS I/O errors.
+        
+        Args:
+            hdf5_path: Path to the HDF5 file
+            max_retries: Maximum number of retry attempts
+            
+        Returns:
+            Instruction string from HDF5 file attributes
+            
+        Raises:
+            OSError: If file cannot be opened after max_retries attempts
+        """
+        with hdf5_file_with_retry(hdf5_path, max_retries) as f:
             instruction = f.attrs.get('llm_description', 'No instruction available')
             if isinstance(instruction, bytes):
                 instruction = instruction.decode('utf-8')
             return instruction
     
-    def _transform_trajectory_to_camera_frame(self, hdf5_path: str, current_frame: int, trajectory: torch.Tensor) -> torch.Tensor:
-        with h5py.File(hdf5_path, 'r') as f:
+    def _transform_trajectory_to_camera_frame(self, hdf5_path: str, current_frame: int, trajectory: torch.Tensor, max_retries: int = 3) -> torch.Tensor:
+        """
+        Transform trajectory to camera frame with retry logic for NFS I/O errors.
+        
+        Args:
+            hdf5_path: Path to the HDF5 file
+            current_frame: Current frame index
+            trajectory: Trajectory tensor to transform
+            max_retries: Maximum number of retry attempts
+            
+        Returns:
+            Transformed trajectory tensor in camera frame
+            
+        Raises:
+            OSError: If file cannot be opened after max_retries attempts
+        """
+        with hdf5_file_with_retry(hdf5_path, max_retries) as f:
             if 'transforms/camera' not in f:
+                print(f"Warning: No camera transform found in {hdf5_path}")
                 return trajectory
             
-            camera_transform = torch.from_numpy(f['transforms/camera'][current_frame]).float()
-            camera_transform_inv = torch.inverse(camera_transform)
-            
-            num_steps, num_joints, _ = trajectory.shape
-            trajectory_homo = torch.cat([trajectory, torch.ones(num_steps, num_joints, 1)], dim=-1)
-            trajectory_homo_flat = trajectory_homo.view(-1, 4)
-            transformed_homo = trajectory_homo_flat @ camera_transform_inv.T
-            transformed_3d = transformed_homo[:, :3]
-            return transformed_3d.view(num_steps, num_joints, 3)
+            camera_transform_data = f['transforms/camera'][current_frame]
+            camera_transform = torch.from_numpy(camera_transform_data.copy()).float()
+        
+        camera_transform_inv = torch.inverse(camera_transform)
+        
+        num_steps, num_joints, _ = trajectory.shape
+        trajectory_homo = torch.cat([trajectory, torch.ones(num_steps, num_joints, 1)], dim=-1)
+        trajectory_homo_flat = trajectory_homo.view(-1, 4)
+        transformed_homo = trajectory_homo_flat @ camera_transform_inv.T
+        transformed_3d = transformed_homo[:, :3]
+        return transformed_3d.view(num_steps, num_joints, 3)
 
-    def _project_trajectory_to_2d(self, hdf5_path: str, current_frame: int, trajectory: torch.Tensor) -> torch.Tensor:
-        with h5py.File(hdf5_path, 'r') as f:
+    def _project_trajectory_to_2d(self, hdf5_path: str, current_frame: int, trajectory: torch.Tensor, max_retries: int = 3) -> torch.Tensor:
+        """
+        Project trajectory to 2D with retry logic for NFS I/O errors.
+        
+        Args:
+            hdf5_path: Path to the HDF5 file
+            current_frame: Current frame index
+            trajectory: Trajectory tensor to project
+            max_retries: Maximum number of retry attempts
+            
+        Returns:
+            Projected 2D trajectory tensor
+            
+        Raises:
+            OSError: If file cannot be opened after max_retries attempts
+        """
+        with hdf5_file_with_retry(hdf5_path, max_retries) as f:
             if 'camera/intrinsic' in f and f['camera/intrinsic'][()].shape == (3, 3):
                 intrinsic = f['camera/intrinsic'][()]
                 img_width = intrinsic[0, 2] * 2
@@ -366,25 +513,27 @@ class TrajectoryDataset(Dataset):
                 img_width, img_height = 1920, 1080
             
             intrinsic = torch.from_numpy(intrinsic).float()
-            trajectory_camera_frame = self._transform_trajectory_to_camera_frame(hdf5_path, current_frame, trajectory)
-            
-            num_steps, num_joints, _ = trajectory_camera_frame.shape
-            points_3d = trajectory_camera_frame.view(-1, 3)
-            points_2d_homo = points_3d @ intrinsic.T
-            
-            w = points_2d_homo[:, 2:3]
-            w = torch.where(w == 0, torch.ones_like(w), w)
-            points_2d_pixel = points_2d_homo[:, :2] / w
-            
-            if self.normalize_2d_coordinates:
-                points_2d_normalized = torch.zeros_like(points_2d_pixel)
-                points_2d_normalized[:, 0] = (points_2d_pixel[:, 0] / img_width) * 100.0
-                points_2d_normalized[:, 1] = (points_2d_pixel[:, 1] / img_height) * 100.0
-                points_2d_final = points_2d_normalized
-            else:
-                points_2d_final = points_2d_pixel
-            
-            return points_2d_final.view(num_steps, num_joints, 2)
+        
+        # Transform trajectory to camera frame
+        trajectory_camera_frame = self._transform_trajectory_to_camera_frame(hdf5_path, current_frame, trajectory, max_retries)
+        
+        num_steps, num_joints, _ = trajectory_camera_frame.shape
+        points_3d = trajectory_camera_frame.view(-1, 3)
+        points_2d_homo = points_3d @ intrinsic.T
+        
+        w = points_2d_homo[:, 2:3]
+        w = torch.where(w == 0, torch.ones_like(w), w)
+        points_2d_pixel = points_2d_homo[:, :2] / w
+        
+        if self.normalize_2d_coordinates:
+            points_2d_normalized = torch.zeros_like(points_2d_pixel)
+            points_2d_normalized[:, 0] = (points_2d_pixel[:, 0] / img_width) * 100.0
+            points_2d_normalized[:, 1] = (points_2d_pixel[:, 1] / img_height) * 100.0
+            points_2d_final = points_2d_normalized
+        else:
+            points_2d_final = points_2d_pixel
+        
+        return points_2d_final.view(num_steps, num_joints, 2)
 
 
 def build_and_save_index_offline(
@@ -397,6 +546,9 @@ def build_and_save_index_offline(
     """
     Build and save index mapping offline for faster dataset loading.
     
+    Note: This always builds the full index with all frames (downsampling_ratio=1).
+    Downsampling is applied in-memory when loading the dataset.
+    
     Args:
         data_dir: Path to the data directory
         split: Dataset split ('train' or 'test')
@@ -408,14 +560,17 @@ def build_and_save_index_offline(
     print(f"Building index mapping offline for {split} split")
     print(f"Data directory: {data_dir}")
     print(f"Action chunking horizon: {action_chunking_horizon}")
+    print(f"Note: Building full index with all frames (downsampling applied at load time)")
     print(f"{'='*80}\n")
     
     # Create a temporary dataset instance to trigger index building
+    # Always use frame_downsampling_ratio=1 to build full index
     dataset = TrajectoryDataset(
         data_dir=data_dir,
         split=split,
         action_chunking_horizon=action_chunking_horizon,
         joint_names=joint_names,
+        frame_downsampling_ratio=1,
     )
     
     if force_rebuild:
@@ -429,6 +584,7 @@ def build_and_save_index_offline(
                 split=split,
                 action_chunking_horizon=action_chunking_horizon,
                 joint_names=joint_names,
+                frame_downsampling_ratio=1,
             )
     
     print(f"\n{'='*80}")
