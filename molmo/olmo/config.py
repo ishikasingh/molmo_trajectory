@@ -630,6 +630,11 @@ class ModelConfig(BaseConfig):
     For length condition, what length use for inference
     """
 
+    include_proprio: bool = True
+    """
+    Whether to include proprioceptive information (current finger positions) in trajectory prompts
+    """
+
     overlap_margins: Tuple[int, int] = (4, 4)
     """
     For overlapping crops, how large the (left, right) overlap margins should be
@@ -978,6 +983,7 @@ class OptimizerConfig(BaseConfig):
     connector_learning_rate: Optional[float] = 1.0e-4
     vit_learning_rate: Optional[float] = 1.0e-4
     llm_learning_rate: Optional[float] = 1.0e-4
+    flow_matching_learning_rate: Optional[float] = 1.0e-4
     """
     Separate learning_rate values for the connector, vision backbone, and llm transformer.
     """
@@ -985,6 +991,8 @@ class OptimizerConfig(BaseConfig):
     connector_weight_decay: Optional[float] = 0.01
     vit_weight_decay: Optional[float] = 0.01
     llm_weight_decay: Optional[float] = 0.01
+    flow_matching_weight_decay: Optional[float] = 0.01
+
     """
     Separate weight decay values for the connector, vision backbone, and llm transformer.
     """
@@ -992,6 +1000,7 @@ class OptimizerConfig(BaseConfig):
     connector_betas: Tuple[float, float] = (0.9, 0.95)
     vit_betas: Tuple[float, float] = (0.9, 0.95)
     llm_betas: Tuple[float, float] = (0.9, 0.95)
+    flow_matching_betas: Tuple[float, float] = (0.9, 0.95)
     """
     Separate betas values for the connector, vision backbone, and llm transformer.
     """
@@ -999,8 +1008,9 @@ class OptimizerConfig(BaseConfig):
     connector_eps: Optional[float] = 1.0e-6
     vit_eps: Optional[float] = 1.0e-6
     llm_eps: Optional[float] = 1.0e-6
+    flow_matching_eps: Optional[float] = 1.0e-6
     """
-    Separate weight decay values for the connector, vision backbone, and llm transformer.
+    Separate eps values for the connector, vision backbone, and llm transformer.
     """
 
     metrics_log_interval: Optional[int] = None
@@ -1015,6 +1025,7 @@ class OptimizerConfig(BaseConfig):
         self.connector_betas = tuple(self.connector_betas)  # type: ignore[assignment]
         self.vit_betas = tuple(self.vit_betas)  # type: ignore[assignment]
         self.llm_betas = tuple(self.llm_betas)  # type: ignore[assignment]
+        self.flow_matching_betas = tuple(self.flow_matching_betas)  # type: ignore[assignment]
 
     @classmethod
     def update_legacy_settings(cls, config: D) -> D:
@@ -1060,6 +1071,7 @@ class SchedulerConfig(BaseConfig):
     connector_t_warmup: Union[int, float] = 200
     vit_t_warmup: Union[int, float] = 200
     llm_t_warmup: Union[int, float] = 200
+    flow_matching_t_warmup: Union[int, float] = 200
     """
     Per-parameter group warmups
     """
@@ -1335,6 +1347,7 @@ class FSDPConfig(BaseConfig):
 
     # sharding_strategy: ShardingStrategy = ShardingStrategy.FULL_SHARD
     sharding_strategy: ShardingStrategy = ShardingStrategy.HYBRID_SHARD
+    # sharding_strategy: ShardingStrategy = ShardingStrategy._HYBRID_SHARD_ZERO2
 
     wrapping_strategy: Optional[FSDPWrapStrategy] = None
     """

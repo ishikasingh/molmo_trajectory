@@ -1745,7 +1745,6 @@ class Molmo(nn.Module):
                 "vision_backbone.cls_projector",
                 "vision_backbone.pad_embed",
                 "transformer.wte.new_embedding",
-                "flow_matching_head",
             ]
         )
 
@@ -1764,6 +1763,14 @@ class Molmo(nn.Module):
                 "transformer.wte.embedding", "transformer.wte.weight", "transformer.wpe",
                 "transformer.blocks", "transformer.block_groups",
                 "transformer.ln_f", "transformer.ff_out",
+            ]
+        )
+
+    @staticmethod
+    def get_flow_matching_parameters():
+        return tuple(
+            [
+                "flow_matching_head",
             ]
         )
 

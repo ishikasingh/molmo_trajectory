@@ -45,7 +45,8 @@ def build_mm_preprocessor(
             message_format=model_config.message_formatting,
             system_prompt=model_config.system_prompt_kind,
             always_start_with_space=model_config.always_start_with_space,
-            default_inference_len=model_config.default_inference_len
+            default_inference_len=model_config.default_inference_len,
+            include_proprio=model_config.include_proprio
         ),
         MultiModalPreprocessor(
             tokenizer=model_config.get_tokenizer(),
@@ -377,5 +378,52 @@ def get_dataset_by_name(dataset_name, split):
             normalize_2d_coordinates=False,
             output_format="flow_matching",
             frame_downsampling_ratio=15,
+        )
+    
+    # Delta (velocity) representation variants
+    elif dataset_name == "trajectory_2d_delta_text":
+        data_dir = os.environ.get("EGODEX_DATA_DIR")
+        return TrajectoryDataset(
+            data_dir=data_dir,
+            split=split,
+            action_chunking_horizon=30,
+            output_2d_trajectory=True,
+            normalize_2d_coordinates=True,
+            output_format="text",
+            trajectory_representation="delta"
+        )
+    elif dataset_name == "trajectory_2d_delta_fm":
+        data_dir = os.environ.get("EGODEX_DATA_DIR")
+        return TrajectoryDataset(
+            data_dir=data_dir,
+            split=split,
+            action_chunking_horizon=30,
+            output_2d_trajectory=True,
+            normalize_2d_coordinates=True,
+            output_format="flow_matching",
+            trajectory_representation="delta"
+        )
+    elif dataset_name == "trajectory_3d_delta_text":
+        data_dir = os.environ.get("EGODEX_DATA_DIR")
+        return TrajectoryDataset(
+            data_dir=data_dir,
+            split=split,
+            action_chunking_horizon=30,
+            output_2d_trajectory=False,
+            normalize_2d_coordinates=False,
+            output_format="text",
+            trajectory_representation="delta"
+        )
+    elif dataset_name == "trajectory_3d_delta_fm":
+        data_dir = os.environ.get("EGODEX_DATA_DIR")
+        return TrajectoryDataset(
+            data_dir=data_dir,
+            split=split,
+            action_chunking_horizon=30,
+            output_2d_trajectory=False,
+            normalize_2d_coordinates=False,
+            output_format="flow_matching",
+            frame_downsampling_ratio=15,
+            trajectory_representation="delta"
         )
     raise NotImplementedError(dataset_name, split)

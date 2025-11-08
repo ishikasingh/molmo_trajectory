@@ -28,8 +28,8 @@ def posemb_sincos(
     Returns:
         (batch_size, embedding_dim) tensor of position embeddings
     """
-    assert (pos < 1).all(), "Positions must be less than 1"
-    assert (pos > 0).all(), "Positions must be greater than 0"
+    assert (pos <= 1).all(), "Positions must be less than 1"
+    assert (pos >= 0).all(), "Positions must be greater than 0"
     if embedding_dim % 2 != 0:
         raise ValueError(f"embedding_dim ({embedding_dim}) must be divisible by 2")
     

@@ -474,15 +474,21 @@ class Trainer:
                 "connector": self.cfg.optimizer.connector_learning_rate,
                 "vit": self.cfg.optimizer.vit_learning_rate,
                 "llm": self.cfg.optimizer.llm_learning_rate,
+                "flow_matching": self.cfg.optimizer.flow_matching_learning_rate,
             }
             weight_decay_dict = {
                 "connector": self.cfg.optimizer.connector_weight_decay,
                 "vit": self.cfg.optimizer.vit_weight_decay,
                 "llm": self.cfg.optimizer.llm_weight_decay,
+                "flow_matching": self.cfg.optimizer.flow_matching_weight_decay,
             }
             for group in self.optim.param_groups:
                 group_name = group["group_name"]
-                component_name = group_name.split("_")[0]
+                # Handle flow_matching specially since it has an underscore in the component name
+                if group_name.startswith("flow_matching"):
+                    component_name = "flow_matching"
+                else:
+                    component_name = group_name.split("_")[0]
                 new_learning_rate = self.scheduler.get_lr(
                     initial_lr_dict[component_name],
                     self.scheduler_current,
@@ -1130,10 +1136,15 @@ class Trainer:
                 "connector": self.cfg.optimizer.connector_learning_rate,
                 "vit": self.cfg.optimizer.vit_learning_rate,
                 "llm": self.cfg.optimizer.llm_learning_rate,
+                "flow_matching": self.cfg.optimizer.flow_matching_learning_rate,
             }
             for group in self.optim.param_groups:
                 group_name = group["group_name"]
-                component_name = group_name.split("_")[0]
+                # Handle flow_matching specially since it has an underscore in the component name
+                if group_name.startswith("flow_matching"):
+                    component_name = "flow_matching"
+                else:
+                    component_name = group_name.split("_")[0]
                 group["lr"] = self.scheduler.get_lr(
                     initial_lr_dict[component_name],
                     self.scheduler_current,

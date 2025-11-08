@@ -370,6 +370,7 @@ class DataFormatter:
     default_inference_len: int = 65  # Inference len for length-conditioned prompting
     select_answer: str = "best"  # How to select answer for questions with many answers
     debug: bool = False  # deterministic mode for debugging
+    include_proprio: bool = True  # Whether to include proprioceptive information (current finger positions) in trajectory prompts
     # debug_print_counter: int = 0  # Add this as a class attribute
 
     def points_to_text(self, points, scale, label_text, alt_text, do_sort=True):
@@ -784,7 +785,7 @@ class DataFormatter:
                         prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1[prompt_style], dict(example, label=prompt), rng, dbg=self.debug)
                     
                     # Add robot state information to the prompt for trajectory tasks
-                    if style in ["trajectory_2d_text", "trajectory_3d_text", "trajectory_2d_fm", "trajectory_3d_fm"] and "state" in example:
+                    if style in ["trajectory_2d_text", "trajectory_3d_text", "trajectory_2d_fm", "trajectory_3d_fm"] and "state" in example and self.include_proprio:
                         # Transform the robot state to text format and prepend to the prompt
                         state_scale = example.get("point_scale", 100)
                         state_text = self.state_to_text(example["state"], state_scale)
