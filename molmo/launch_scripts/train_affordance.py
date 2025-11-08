@@ -116,6 +116,9 @@ if __name__ == "__main__":
                         help="whether to use transitions in the affordance dataset")
     args, other_args = parser.parse_known_args()
 
+    # Default training split
+    data_split = "train"
+
     if args.mixture.startswith("single"):
         task_name = args.mixture.split("_", 1)[1]
         eval_tasks = [task_name,]
@@ -245,6 +248,16 @@ if __name__ == "__main__":
         # Flow matching based 3D trajectory prediction
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
+    elif args.mixture in ["trajectory_3d_fm_overfit"]:
+        # Flow matching 3D trajectory with overfit split
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
+        data_split = "overfit"
+    elif args.mixture == "trajectory_3d_fm_overfit_delta":
+        # Flow matching based 3D trajectory prediction with delta representation
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_3d_delta_fm"], 1.0]]
+        data_split = "overfit"
     elif args.mixture == "robo_casa_affordance":
         # eval_tasks = ["robo_casa_affordance"]
         eval_tasks = []
@@ -307,7 +320,7 @@ if __name__ == "__main__":
     model_cfg.multi_annotation_weighting = "root_subsegments"
 
     # Enable flow matching for trajectory prediction tasks
-    if args.mixture.endswith("_fm"):
+    if "_fm" in args.mixture:
         model_cfg.use_flow_matching_head = True
         # Configure action dimensions based on task
         # action_horizon: number of timesteps to predict (e.g., 30)
@@ -326,6 +339,11 @@ if __name__ == "__main__":
     else:
         model_cfg.use_flow_matching_head = False
 
+    # Configure proprioceptive information inclusion
+    if args.mixture == "trajectory_3d_fm_overfit":
+        model_cfg.include_proprio = False
+        log.info("Setting include_proprio=False for trajectory_3d_fm_overfit")
+
     root_size_mixture: List[RootSizeMixture] = []
     for name, submixture, rate in tasks:
         submixture = get_training_mixture(submixture)
@@ -342,7 +360,7 @@ if __name__ == "__main__":
         )
         evaluation.data.persistent_workers = True
         evaluations.append(evaluation)
-    save_interval_unsharded = 10000 if not args.finetune else 3000
+    save_interval_unsharded = 7500 if not args.finetune else 3000
     cfg = TrainConfig(
         run_name="affordance_train",
         no_pre_train_checkpoint=True,
@@ -364,7 +382,7 @@ if __name__ == "__main__":
             root_size_mixture=root_size_mixture,
             for_inference=False,
             shuffle=True,
-            split="train",
+            split=data_split,
             drop_last=True,
             sequence_length=args.seq_len,
             num_workers=2,
@@ -381,15 +399,19 @@ if __name__ == "__main__":
             connector_learning_rate=5e-6,
             vit_learning_rate=5e-6,
             llm_learning_rate=1e-5,
+            flow_matching_learning_rate=5e-4,
             connector_weight_decay=0.0,
             vit_weight_decay=0.0,
             llm_weight_decay=0.0,
+            flow_matching_weight_decay=0.001,
             connector_betas=[0.9, 0.95],
             vit_betas=[0.9, 0.95],
             llm_betas=[0.9, 0.95],
+            flow_matching_betas=[0.9, 0.95],
             connector_eps=1e-6,
             vit_eps=1e-6,
             llm_eps=1e-6,
+            flow_matching_eps=1e-6,
             metrics_log_interval=20
         ),
         scheduler=SchedulerConfig(
@@ -397,6 +419,7 @@ if __name__ == "__main__":
             connector_t_warmup=200,
             vit_t_warmup=200,
             llm_t_warmup=200,
+            flow_matching_t_warmup=200,
             alpha_f=0.1,
             warmup_min_lr=0.0
         ),

@@ -460,18 +460,12 @@ def main():
                        help="Path to numpy file containing camera intrinsic matrix (for 3D tasks)")
     parser.add_argument("--save_metrics", action="store_true",
                        help="Save trajectory metrics (MSE, ADE, FDE) to JSON")
-    parser.add_argument("--debug", action="store_true",
-                       help="Debug mode: skip model loading and only visualize ground-truth trajectories")
     
     args = parser.parse_args()
     
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
-
-    if args.debug and args.save_metrics:
-        print("Debug mode enabled: disabling metric computation and saving.")
-        args.save_metrics = False
     
     # Load test examples
     print(f"Loading {args.num_examples} test examples for {args.task_type} trajectory task...")
@@ -481,20 +475,17 @@ def main():
         print("No examples loaded. Exiting.")
         return
     
-    # Load model and preprocessor unless in debug mode
+    # Load model and preprocessor
     model = None
     preprocessor = None
-    if not args.debug:
-        print("Loading model...")
-        model = Molmo.from_checkpoint(args.checkpoint, device=args.device)
-        model.eval()
-        model.config.action_horizon = args.action_chunking_horizon
-        model.flow_matching_head.action_horizon = args.action_chunking_horizon
-        
-        print("Building preprocessor...")
-        preprocessor = build_mm_preprocessor(model.config, for_inference=True, is_training=False)
-    else:
-        print("Debug mode: skipping model and preprocessor loading. Will only draw ground-truth trajectories.")
+    print("Loading model...")
+    model = Molmo.from_checkpoint(args.checkpoint, device=args.device)
+    model.eval()
+    model.config.action_horizon = args.action_chunking_horizon
+    model.flow_matching_head.action_horizon = args.action_chunking_horizon
+    
+    print("Building preprocessor...")
+    preprocessor = build_mm_preprocessor(model.config, for_inference=True, is_training=False)
     
     # Load camera intrinsic for 3D tasks
     intrinsic = None
@@ -532,69 +523,68 @@ def main():
         
         pred_trajectory = None
         pred_trajectory_2d = None
-        if not args.debug:
-            # Prepare example for model
-            example = {
-                "image": image_np,
-                "prompt": prompt,
-                "style": style,
-                # Include current state and scale so DataFormatter can inject it into the prompt
-                "state": example_row.get("state"),
-                "point_scale": example_row.get("point_scale"),
-            }
-            batch = preprocessor(example)
-            
-            # Move tensors to device
-            device = torch.device(args.device)
-            input_ids = torch.tensor(batch["input_tokens"], dtype=torch.long).unsqueeze(0).to(device)
-            attention_mask = (input_ids != -1).to(device)
-            images = torch.tensor(batch["images"], dtype=torch.float32).unsqueeze(0).to(device)
-            image_input_idx = torch.tensor(batch["image_input_idx"], dtype=torch.long).unsqueeze(0).to(device)
-            image_masks = None
-            if "image_masks" in batch:
-                image_masks = torch.tensor(batch["image_masks"]).unsqueeze(0).to(device)
-            
-            # Generate trajectory using flow matching
-            print("Sampling trajectory using flow matching ODE...")
-            start_time = time.time()
-            with torch.no_grad():
-                pred_trajectory = model.sample_actions_flow_matching(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    images=images,
-                    image_masks=image_masks,
-                    image_input_idx=image_input_idx,
-                    num_steps=args.num_ode_steps,
-                    initial_noise=None,
-                )
-            end_time = time.time()
-            print(f"Time taken for sampling: {end_time - start_time:.2f} seconds")
-            
-            # Convert to numpy
-            if isinstance(pred_trajectory, torch.Tensor):
-                pred_trajectory = pred_trajectory.cpu().numpy()
-            
-            print(f"Predicted trajectory shape (raw): {pred_trajectory.shape}")
-            
-            # Reshape from (batch_size, action_horizon, action_dim) to (action_horizon, num_joints, coords_per_joint)
-            # Remove batch dimension and reshape flattened coordinates
-            batch_size, action_horizon, action_dim = pred_trajectory.shape
-            pred_trajectory = pred_trajectory.squeeze(0)  # Remove batch dimension: (action_horizon, action_dim)
-            
-            if args.task_type == '3d':
-                # For 3D: action_dim = num_joints * 3
-                num_joints = action_dim // 3
-                if action_dim % 3 != 0:
-                    raise ValueError(f"action_dim ({action_dim}) must be divisible by 3 for 3D trajectories")
-                pred_trajectory = pred_trajectory.reshape(action_horizon, num_joints, 3)
-            else:
-                # For 2D: action_dim = num_joints * 2
-                num_joints = action_dim // 2
-                if action_dim % 2 != 0:
-                    raise ValueError(f"action_dim ({action_dim}) must be divisible by 2 for 2D trajectories")
-                pred_trajectory = pred_trajectory.reshape(action_horizon, num_joints, 2)
-            
-            print(f"Predicted trajectory shape (reshaped): {pred_trajectory.shape}")
+        # Prepare example for model
+        example = {
+            "image": image_np,
+            "prompt": prompt,
+            "style": style,
+            # Include current state and scale so DataFormatter can inject it into the prompt
+            "state": example_row.get("state"),
+            "point_scale": example_row.get("point_scale"),
+        }
+        batch = preprocessor(example)
+        
+        # Move tensors to device
+        device = torch.device(args.device)
+        input_ids = torch.tensor(batch["input_tokens"], dtype=torch.long).unsqueeze(0).to(device)
+        attention_mask = (input_ids != -1).to(device)
+        images = torch.tensor(batch["images"], dtype=torch.float32).unsqueeze(0).to(device)
+        image_input_idx = torch.tensor(batch["image_input_idx"], dtype=torch.long).unsqueeze(0).to(device)
+        image_masks = None
+        if "image_masks" in batch:
+            image_masks = torch.tensor(batch["image_masks"]).unsqueeze(0).to(device)
+        
+        # Generate trajectory using flow matching
+        print("Sampling trajectory using flow matching ODE...")
+        start_time = time.time()
+        with torch.no_grad():
+            pred_trajectory = model.sample_actions_flow_matching(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                images=images,
+                image_masks=image_masks,
+                image_input_idx=image_input_idx,
+                num_steps=args.num_ode_steps,
+                initial_noise=None,
+            )
+        end_time = time.time()
+        print(f"Time taken for sampling: {end_time - start_time:.2f} seconds")
+        
+        # Convert to numpy
+        if isinstance(pred_trajectory, torch.Tensor):
+            pred_trajectory = pred_trajectory.cpu().numpy()
+        
+        print(f"Predicted trajectory shape (raw): {pred_trajectory.shape}")
+        
+        # Reshape from (batch_size, action_horizon, action_dim) to (action_horizon, num_joints, coords_per_joint)
+        # Remove batch dimension and reshape flattened coordinates
+        batch_size, action_horizon, action_dim = pred_trajectory.shape
+        pred_trajectory = pred_trajectory.squeeze(0)  # Remove batch dimension: (action_horizon, action_dim)
+        
+        if args.task_type == '3d':
+            # For 3D: action_dim = num_joints * 3
+            num_joints = action_dim // 3
+            if action_dim % 3 != 0:
+                raise ValueError(f"action_dim ({action_dim}) must be divisible by 3 for 3D trajectories")
+            pred_trajectory = pred_trajectory.reshape(action_horizon, num_joints, 3)
+        else:
+            # For 2D: action_dim = num_joints * 2
+            num_joints = action_dim // 2
+            if action_dim % 2 != 0:
+                raise ValueError(f"action_dim ({action_dim}) must be divisible by 2 for 2D trajectories")
+            pred_trajectory = pred_trajectory.reshape(action_horizon, num_joints, 2)
+        
+        print(f"Predicted trajectory shape (reshaped): {pred_trajectory.shape}")
                 
         # Process ground truth trajectory
         gt_trajectory_2d = None
@@ -641,19 +631,18 @@ def main():
                 )
                 print(f"Projected GT trajectory to 2D: {gt_trajectory_2d.shape}")
         
-        # Convert prediction trajectory to 2D if needed (only when not in debug)
-        if not args.debug:
-            if args.task_type == '2d':
-                pred_trajectory_2d = pred_trajectory
-            else:
-                # Project 3D prediction to 2D
-                pred_trajectory_2d = project_3d_trajectory_to_2d(
-                    pred_trajectory, intrinsic, w, h, normalize=True
-                )
-                print(f"Projected prediction trajectory to 2D: {pred_trajectory_2d.shape}")
+        # Convert prediction trajectory to 2D if needed
+        if args.task_type == '2d':
+            pred_trajectory_2d = pred_trajectory
+        else:
+            # Project 3D prediction to 2D
+            pred_trajectory_2d = project_3d_trajectory_to_2d(
+                pred_trajectory, intrinsic, w, h, normalize=True
+            )
+            print(f"Projected prediction trajectory to 2D: {pred_trajectory_2d.shape}")
         
         # Compute metrics if requested (after both trajectories are in 2D)
-        if gt_trajectory_2d is not None and args.save_metrics and not args.debug:
+        if gt_trajectory_2d is not None and args.save_metrics:
             # MSE
             mse = np.mean((pred_trajectory_2d - gt_trajectory_2d) ** 2)
             metrics["mse"] = float(mse)
@@ -683,10 +672,7 @@ def main():
         # Save visualization
         sanitized_task = sanitize_filename(task_name)
         sanitized_prompt = sanitize_filename(prompt[:50])
-        if args.debug:
-            suffix = "_gt_only" if gt_trajectory_2d is not None else ""
-        else:
-            suffix = "_with_gt" if gt_trajectory_2d is not None else ""
+        suffix = "_with_gt" if gt_trajectory_2d is not None else ""
         out_filename = f"{args.task_type}d_traj_fm_{sanitized_task}_{idx+1}{suffix}.jpg"
         out_path = output_dir / out_filename
         

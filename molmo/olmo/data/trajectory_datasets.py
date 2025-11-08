@@ -97,6 +97,7 @@ class TrajectoryDataset(Dataset):
         confidence_threshold: float = 0.5,
         output_format: str = "text",  # "text" or "flow_matching"
         frame_downsampling_ratio: int = 15,  # Sample every n frames (1 = no downsampling, 10 = every 10 frames)
+        trajectory_representation: str = "absolute",  # "absolute" or "delta" (velocity: v_t = x_{t+1} - x_t)
     ):
         # Get data directory from environment variable if not provided
         if data_dir is None:
@@ -113,9 +114,11 @@ class TrajectoryDataset(Dataset):
         self.normalize_2d_coordinates = normalize_2d_coordinates
         self.output_format = output_format  # "text" or "flow_matching"
         self.frame_downsampling_ratio = frame_downsampling_ratio
+        self.trajectory_representation = trajectory_representation
         
         assert output_format in ["text", "flow_matching"], f"output_format must be 'text' or 'flow_matching', got {output_format}"
         assert frame_downsampling_ratio >= 1, f"frame_downsampling_ratio must be >= 1, got {frame_downsampling_ratio}"
+        assert trajectory_representation in ["absolute", "delta"], f"trajectory_representation must be 'absolute' or 'delta', got {trajectory_representation}"
         
         # Default joint names matching data_formatter.py TRAJECTORY_KEYPOINTS
         if joint_names is None:
@@ -151,7 +154,7 @@ class TrajectoryDataset(Dataset):
                 print(f"Successfully loaded {len(full_index)} samples from cache")
                 
                 # Apply downsampling filter if needed (only for training split)
-                if self.frame_downsampling_ratio > 1 and self.split == "train":
+                if self.frame_downsampling_ratio > 1 and (self.split == "train" or self.split == "overfit"):
                     filtered_index = self._apply_downsampling_filter(full_index)
                     print(f"Applied downsampling ratio {self.frame_downsampling_ratio}: {len(full_index)} -> {len(filtered_index)} samples")
                     return filtered_index
@@ -219,6 +222,8 @@ class TrajectoryDataset(Dataset):
         elif self.split == "test":
             # split_dirs = [self.data_dir / "test"]
             split_dirs = [self.data_dir / "small_test"]
+        elif self.split == "overfit":
+            split_dirs = [self.data_dir / "very_small_test"]
         else:
             raise ValueError(f"Invalid split: {self.split}")
         
@@ -280,7 +285,7 @@ class TrajectoryDataset(Dataset):
         self._save_index_to_cache(index_mapping)
         
         # Apply downsampling filter if needed (only for training split)
-        if self.frame_downsampling_ratio > 1 and self.split == "train":
+        if self.frame_downsampling_ratio > 1 and (self.split == "train" or self.split == "overfit"):
             filtered_index = self._apply_downsampling_filter(index_mapping)
             print(f"Applied downsampling ratio {self.frame_downsampling_ratio}: {len(index_mapping)} -> {len(filtered_index)} samples")
             return filtered_index
@@ -302,6 +307,17 @@ class TrajectoryDataset(Dataset):
         else:
             final_trajectory = self._transform_trajectory_to_camera_frame(mapping['hdf5_path'], mapping['frame_idx'], trajectory)
         
+        # Save initial state before converting to delta (if applicable)
+        # The state should always be absolute position, even when predicting deltas
+        if isinstance(final_trajectory, torch.Tensor):
+            initial_state = final_trajectory[0].numpy()
+        else:
+            initial_state = final_trajectory[0]
+        
+        # Convert to delta representation if requested
+        if self.trajectory_representation == "delta":
+            final_trajectory = self._convert_to_delta_representation(final_trajectory)
+        
         instruction = self._load_instruction(mapping['hdf5_path'])
         
         if isinstance(final_trajectory, torch.Tensor):
@@ -313,7 +329,7 @@ class TrajectoryDataset(Dataset):
         num_steps = final_trajectory.shape[0]
         trajectory_flattened_joints = final_trajectory.reshape(num_steps, -1).astype(np.float32)
         
-        # Determine style based on output format
+        # Determine style based on output format and trajectory representation
         if self.output_2d_trajectory:
             style = 'trajectory_2d_text' if self.output_format == "text" else 'trajectory_2d_fm'
         else:
@@ -321,14 +337,14 @@ class TrajectoryDataset(Dataset):
         
         return {
             'image': image,
-            'state': final_trajectory[0],
+            'state': initial_state,  # Always use absolute position for state
             'message_list': [
                 {
                     'label': instruction,
                     'points': final_trajectory, # to make it compatible with the data formatter, points means trajectory
                     'point_scale': 100 if self.normalize_2d_coordinates and self.output_2d_trajectory else None,
                     'style': style,
-                    'state': final_trajectory[0],  # Include the initial robot state so it can be formatted in the prompt
+                    'state': initial_state,  # Include the initial robot state so it can be formatted in the prompt
                 }
             ],
             'trajectory_target': trajectory_flattened_joints,  # For flow matching: shape (num_steps, num_joints*coords) = (action_horizon, action_dim)
@@ -339,6 +355,7 @@ class TrajectoryDataset(Dataset):
                 # 'episode_id': mapping['episode_id'],
                 'frame_idx': mapping['frame_idx'],
                 'output_2d_trajectory': self.output_2d_trajectory,
+                'trajectory_representation': self.trajectory_representation,
             }
         }
     
@@ -535,6 +552,35 @@ class TrajectoryDataset(Dataset):
         
         return points_2d_final.view(num_steps, num_joints, 2)
 
+    def _convert_to_delta_representation(self, trajectory: torch.Tensor) -> torch.Tensor:
+        """
+        Convert absolute positions to delta positions (velocities).
+        
+        For a trajectory of shape (num_steps, num_joints, coords), computes:
+        v_t = x_{t+1} - x_t for t = 0, ..., num_steps-2
+        
+        The last timestep uses v_{T-1} = x_T - x_{T-1} (same as the second to last).
+        This keeps the same shape as input.
+        
+        Args:
+            trajectory: Trajectory tensor of shape (num_steps, num_joints, coords)
+            
+        Returns:
+            Delta trajectory tensor of shape (num_steps, num_joints, coords)
+        """
+        # Compute deltas: v_t = x_{t+1} - x_t
+        # For timesteps 0 to T-2, compute x_{t+1} - x_t
+        deltas = trajectory[1:] - trajectory[:-1]  # Shape: (num_steps-1, num_joints, coords)
+        
+        # For the last timestep, we duplicate the last delta to maintain shape
+        # This means the last action is the same as the second-to-last action
+        last_delta = deltas[-1:]  # Shape: (1, num_joints, coords)
+        
+        # Concatenate to get the full delta trajectory
+        delta_trajectory = torch.cat([deltas, last_delta], dim=0)  # Shape: (num_steps, num_joints, coords)
+        
+        return delta_trajectory
+
 
 def build_and_save_index_offline(
     data_dir: str,
@@ -608,7 +654,7 @@ if __name__ == "__main__":
         "--split",
         type=str,
         default="train",
-        choices=["train", "test"],
+        choices=["train", "test", "overfit"],
         help="Dataset split to build index for"
     )
     parser.add_argument(
@@ -641,7 +687,7 @@ if __name__ == "__main__":
     
     if args.build_all:
         # Build both train and test splits
-        for split in ["train", "test"]:
+        for split in ["train", "test", "overfit"]:
             build_and_save_index_offline(
                 data_dir=data_dir,
                 split=split,
