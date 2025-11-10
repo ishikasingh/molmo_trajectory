@@ -361,8 +361,40 @@ def draw_legend(draw: ImageDraw.Draw, finger_colors: Dict[str, str],
                  "Prediction", fill='white', font=font)
 
 
+def convert_delta_to_absolute(delta_trajectory: np.ndarray, initial_state: np.ndarray) -> np.ndarray:
+    """
+    Convert delta positions (velocities) to absolute positions.
+    
+    For a delta trajectory where v_t = x_{t+1} - x_t, we reconstruct absolute positions as:
+    x_0 = initial_state
+    x_t = x_0 + sum(v_0 to v_{t-1}) for t > 0
+    
+    Args:
+        delta_trajectory: Delta trajectory of shape (num_steps, num_joints, coords)
+                          Each entry is v_t representing the velocity/delta
+        initial_state: Initial absolute position of shape (num_joints, coords)
+                      This is the absolute position at timestep 0
+    
+    Returns:
+        Absolute trajectory of shape (num_steps, num_joints, coords)
+    """
+    num_steps = delta_trajectory.shape[0]
+    absolute_trajectory = np.zeros_like(delta_trajectory)
+    
+    # First timestep is the initial state
+    absolute_trajectory[0] = initial_state
+    
+    # For subsequent timesteps, cumulatively add deltas
+    # x_t = x_{t-1} + v_{t-1}
+    for t in range(1, num_steps):
+        absolute_trajectory[t] = absolute_trajectory[t-1] + delta_trajectory[t-1]
+    
+    return absolute_trajectory
+
+
 def load_test_examples(task_type: str, num_examples: int = 10, 
-                       action_chunking_horizon: int = 10) -> List[Dict]:
+                       action_chunking_horizon: int = 10,
+                       trajectory_representation: str = "absolute") -> List[Dict]:
     """
     Load examples from the test set.
     
@@ -370,6 +402,7 @@ def load_test_examples(task_type: str, num_examples: int = 10,
         task_type: Either '2d' or '3d' for trajectory task type
         num_examples: Number of examples to load
         action_chunking_horizon: Number of timesteps in trajectory
+        trajectory_representation: Either 'absolute' or 'delta' for trajectory representation
     
     Returns:
         List of example dictionaries
@@ -386,6 +419,7 @@ def load_test_examples(task_type: str, num_examples: int = 10,
         output_2d_trajectory=output_2d,
         normalize_2d_coordinates=True,
         output_format="flow_matching",  # Use flow matching format
+        trajectory_representation=trajectory_representation,
     )
     
     print(f"Loaded test dataset with {len(dataset)} examples")
@@ -430,6 +464,7 @@ def load_test_examples(task_type: str, num_examples: int = 10,
                 "is_test_data": True,
                 "test_idx": idx,
                 "state": state,
+                "trajectory_representation": metadata.get("trajectory_representation", "absolute"),
             })
             
             print(f"Loaded test example {idx}: {instruction[:50]}...")
@@ -460,6 +495,9 @@ def main():
                        help="Path to numpy file containing camera intrinsic matrix (for 3D tasks)")
     parser.add_argument("--save_metrics", action="store_true",
                        help="Save trajectory metrics (MSE, ADE, FDE) to JSON")
+    parser.add_argument("--trajectory_representation", type=str, default="absolute",
+                       choices=["absolute", "delta"],
+                       help="Trajectory representation mode: 'absolute' positions or 'delta' (velocity)")
     
     args = parser.parse_args()
     
@@ -469,7 +507,9 @@ def main():
     
     # Load test examples
     print(f"Loading {args.num_examples} test examples for {args.task_type} trajectory task...")
-    examples = load_test_examples(args.task_type, args.num_examples, args.action_chunking_horizon)
+    print(f"Trajectory representation: {args.trajectory_representation}")
+    examples = load_test_examples(args.task_type, args.num_examples, args.action_chunking_horizon, 
+                                  args.trajectory_representation)
     
     if not examples:
         print("No examples loaded. Exiting.")
@@ -585,6 +625,30 @@ def main():
             pred_trajectory = pred_trajectory.reshape(action_horizon, num_joints, 2)
         
         print(f"Predicted trajectory shape (reshaped): {pred_trajectory.shape}")
+        
+        # Convert delta predictions to absolute positions if needed
+        trajectory_rep = example_row.get("trajectory_representation", "absolute")
+        if trajectory_rep == "delta":
+            initial_state = example_row.get("state")
+            if initial_state is not None:
+                print(f"Converting delta predictions to absolute positions using initial state...")
+                print(f"Initial state shape: {initial_state.shape}")
+                
+                # Ensure initial_state has the right shape: (num_joints, coords)
+                if len(initial_state.shape) == 1:
+                    # Flatten format, reshape to (num_joints, coords)
+                    if args.task_type == '3d':
+                        coords_per_joint = 3
+                    else:
+                        coords_per_joint = 2
+                    num_joints_state = initial_state.shape[0] // coords_per_joint
+                    initial_state = initial_state.reshape(num_joints_state, coords_per_joint)
+                
+                # Convert delta to absolute
+                pred_trajectory = convert_delta_to_absolute(pred_trajectory, initial_state)
+                print(f"Converted to absolute trajectory. Shape: {pred_trajectory.shape}")
+            else:
+                print("WARNING: Delta mode but no initial state found! Treating as absolute positions.")
                 
         # Process ground truth trajectory
         gt_trajectory_2d = None
@@ -592,6 +656,7 @@ def main():
             "example_idx": idx,
             "task_name": task_name,
             "prompt": prompt,
+            "trajectory_representation": trajectory_rep,
         }
         
         if gt_trajectory_raw is not None:
@@ -619,6 +684,26 @@ def main():
                     if gt_action_dim % 2 != 0:
                         raise ValueError(f"GT action_dim ({gt_action_dim}) must be divisible by 2 for 2D trajectories")
                     gt_trajectory_raw = gt_trajectory_raw.reshape(gt_action_horizon, gt_num_joints, 2)
+            
+            # Convert ground truth from delta to absolute if needed
+            if trajectory_rep == "delta":
+                initial_state = example_row.get("state")
+                if initial_state is not None:
+                    print(f"Converting GT delta trajectory to absolute positions...")
+                    
+                    # Ensure initial_state has the right shape: (num_joints, coords)
+                    if len(initial_state.shape) == 1:
+                        # Flatten format, reshape to (num_joints, coords)
+                        if args.task_type == '3d':
+                            coords_per_joint = 3
+                        else:
+                            coords_per_joint = 2
+                        num_joints_state = initial_state.shape[0] // coords_per_joint
+                        initial_state = initial_state.reshape(num_joints_state, coords_per_joint)
+                    
+                    # Convert delta to absolute
+                    gt_trajectory_raw = convert_delta_to_absolute(gt_trajectory_raw, initial_state)
+                    print(f"Converted GT to absolute trajectory. Shape: {gt_trajectory_raw.shape}")
             
             # Ground truth is already in 2D normalized coordinates for 2D tasks
             # For 3D tasks, we need to project to 2D
