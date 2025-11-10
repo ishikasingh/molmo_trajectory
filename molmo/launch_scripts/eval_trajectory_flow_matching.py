@@ -298,7 +298,10 @@ def draw_prompt_text(draw: ImageDraw.Draw, prompt: str,
 def draw_legend(draw: ImageDraw.Draw, finger_colors: Dict[str, str], 
                 image_width: int, image_height: int,
                 show_ground_truth: bool = False) -> None:
-    """Draw a legend showing finger colors and optionally ground truth vs prediction indicators."""
+    """Draw a legend showing finger colors and optionally a ground truth indicator.
+    
+    Note: All colored trajectories shown are model predictions, so no separate prediction label is needed.
+    """
     legend_x = int(image_width * 0.02)
     legend_y = int(image_height * 0.02)
     legend_spacing = int(image_height * 0.03)
@@ -306,7 +309,7 @@ def draw_legend(draw: ImageDraw.Draw, finger_colors: Dict[str, str],
     # Calculate legend height based on content
     legend_items = len(finger_colors)
     if show_ground_truth:
-        legend_items += 2  # Add space for GT/Pred indicators
+        legend_items += 1  # Add space for GT indicator (all colored trajectories are predictions)
     
     # Create a semi-transparent background for legend
     legend_width = int(image_width * 0.15)
@@ -345,7 +348,6 @@ def draw_legend(draw: ImageDraw.Draw, finger_colors: Dict[str, str],
     # Add ground truth vs prediction legend if needed
     if show_ground_truth:
         gt_y = legend_y + len(finger_colors) * legend_spacing
-        pred_y = gt_y + legend_spacing
         legend_r = int(image_height * 0.01)
         
         # Ground truth indicator (red circle with thinner line)
@@ -354,11 +356,7 @@ def draw_legend(draw: ImageDraw.Draw, finger_colors: Dict[str, str],
         draw.text((legend_x + int(image_width * 0.02), gt_y - int(image_height * 0.01)), 
                  "Ground Truth", fill='white', font=font)
         
-        # Prediction indicator (white circle with thicker line)
-        draw.ellipse((legend_x, pred_y - legend_r, legend_x + 2*legend_r, pred_y + legend_r), 
-                    fill='white', outline='white', width=2)
-        draw.text((legend_x + int(image_width * 0.02), pred_y - int(image_height * 0.01)), 
-                 "Prediction", fill='white', font=font)
+        # Note: All colored trajectories shown are model predictions, so no separate "Prediction" label needed
 
 
 def convert_delta_to_absolute(delta_trajectory: np.ndarray, initial_state: np.ndarray) -> np.ndarray:
