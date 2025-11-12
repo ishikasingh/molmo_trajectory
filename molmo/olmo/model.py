@@ -753,6 +753,20 @@ class OLMoBlock(nn.Module):
         # Apply output projection.
         return self.attn_out(att), present
 
+    def get_qkv(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Extract Q, K, V projections from this block.
+        Used for merged attention with action expert.
+        
+        Must be implemented by subclasses.
+        
+        Returns:
+            q: (batch_size, n_heads, seq_len, head_dim)
+            k: (batch_size, n_kv_heads, seq_len, head_dim)
+            v: (batch_size, n_kv_heads, seq_len, head_dim)
+        """
+        raise NotImplementedError("Subclasses must implement get_qkv()")
+
     @abstractmethod
     def forward(
         self,
@@ -975,6 +989,45 @@ class OLMoSequentialBlock(OLMoBlock):
         init_weights(
             self.config, self.ff_proj, d=self.config.d_model, layer_id=None, type_of_module=ModuleType.in_module
         )
+
+    def get_qkv(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Extract Q, K, V projections for merged attention with action expert.
+        
+        Args:
+            x: (batch_size, seq_len, d_model)
+            
+        Returns:
+            q: (batch_size, n_heads, seq_len, head_dim)
+            k: (batch_size, n_kv_heads, seq_len, head_dim)
+            v: (batch_size, n_kv_heads, seq_len, head_dim)
+        """
+        B, T, C = x.size()
+        
+        # Apply layer norm (same as in forward)
+        if not self.config.norm_after:
+            if self._activation_checkpoint_fn is not None:
+                x_normed = self._activation_checkpoint_fn(self.attn_norm, x)
+            else:
+                x_normed = self.attn_norm(x)
+        else:
+            x_normed = x
+        
+        # Get QKV projections
+        qkv = self.att_proj(x_normed)
+        
+        if self.config.clip_qkv is not None:
+            qkv.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
+        
+        q, k, v = qkv.split(self.fused_dims, dim=-1)
+        
+        # Reshape to separate heads
+        head_dim = self.config.d_model // self.config.n_heads
+        q = q.view(B, T, self.config.n_heads, head_dim).transpose(1, 2)
+        k = k.view(B, T, self.config.effective_n_kv_heads, head_dim).transpose(1, 2)
+        v = v.view(B, T, self.config.effective_n_kv_heads, head_dim).transpose(1, 2)
+        
+        return q, k, v
 
     def forward(
         self,
@@ -1223,6 +1276,328 @@ class OLMoLlamaBlock(OLMoBlock):
         x = og_x + x
 
         return x, cache
+
+
+class ActionExpertBlock(nn.Module):
+    """
+    Transformer block for the action expert.
+    Similar to OLMoSequentialBlock but uses action expert dimensions.
+    
+    This block processes action tokens with their own weights while allowing
+    cross-attention to vision/language context via merged K,V from the main model.
+    """
+
+    def __init__(self, layer_id: int, config: ModelConfig, cache: BufferCache):
+        super().__init__()
+        self.layer_id = layer_id
+        self.config = config
+        self.__cache = cache
+        
+        # Use action expert dimensions
+        d_model = config.action_expert_d_model
+        n_heads = config.action_expert_n_heads
+        n_kv_heads = config.action_expert_n_kv_heads
+        mlp_hidden_size = int(config.action_expert_d_model * config.action_expert_mlp_ratio)
+        
+        # Store dimensions for later use
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = d_model // n_heads
+        self.mlp_hidden_size = mlp_hidden_size
+        
+        # Layer norms
+        self.attn_norm = LayerNorm.build(config, size=d_model, elementwise_affine=config.layer_norm_with_affine)
+        self.ff_norm = LayerNorm.build(config, size=d_model, elementwise_affine=config.layer_norm_with_affine)
+        
+        # Attention projections (Q, K, V)
+        self.fused_dims = (
+            d_model,  # Q
+            n_kv_heads * self.head_dim,  # K
+            n_kv_heads * self.head_dim,  # V
+        )
+        self.att_proj = nn.Linear(
+            d_model, sum(self.fused_dims),
+            bias=config.include_bias or config.qkv_bias,
+            device=config.init_device
+        )
+        
+        # Attention output projection
+        self.attn_out = nn.Linear(
+            d_model, d_model,
+            bias=config.include_bias,
+            device=config.init_device
+        )
+        
+        # Feed-forward layers
+        self.ff_proj = nn.Linear(
+            d_model, mlp_hidden_size, 
+            bias=config.include_bias, 
+            device=config.init_device
+        )
+        self.act = Activation.build(config)
+        self.ff_out = nn.Linear(
+            int(self.act.output_multiplier * mlp_hidden_size),
+            d_model,
+            bias=config.include_bias,
+            device=config.init_device,
+        )
+        self.ff_out._is_residual = True  # type: ignore
+        
+        # Dropout
+        self.dropout = Dropout(config.residual_dropout, mask_p=config.response_residual_dropout)
+        
+        # Rotary embeddings (if using RoPE)
+        if config.rope:
+            self.rotary_emb = RotaryEmbedding(config, self.__cache)
+        
+        self._activation_checkpoint_fn = None
+    
+    def set_activation_checkpointing(self, strategy: Optional[ActivationCheckpointingStrategy]):
+        if strategy == ActivationCheckpointingStrategy.fine_grained:
+            self._activation_checkpoint_fn = activation_checkpoint_function(self.config)
+        else:
+            self._activation_checkpoint_fn = None
+    
+    def get_qkv(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Extract Q, K, V projections for this block.
+        Used in merged attention computation.
+        
+        Args:
+            x: (batch_size, seq_len, action_expert_d_model)
+            
+        Returns:
+            q: (batch_size, n_heads, seq_len, head_dim)
+            k: (batch_size, n_kv_heads, seq_len, head_dim)
+            v: (batch_size, n_kv_heads, seq_len, head_dim)
+        """
+        B, T, C = x.size()
+        
+        # Apply layer norm
+        if not self.config.norm_after:
+            if self._activation_checkpoint_fn is not None:
+                x_normed = self._activation_checkpoint_fn(self.attn_norm, x)
+            else:
+                x_normed = self.attn_norm(x)
+        else:
+            x_normed = x
+        
+        # Get QKV projections
+        qkv = self.att_proj(x_normed)
+        
+        if self.config.clip_qkv is not None:
+            qkv.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
+        
+        q, k, v = qkv.split(self.fused_dims, dim=-1)
+        
+        # Reshape to separate heads: (B, T, C) -> (B, nh, T, hs)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        
+        return q, k, v
+    
+    def attention_with_merged_kv(
+        self,
+        q: torch.Tensor,
+        merged_k: torch.Tensor,
+        merged_v: torch.Tensor,
+        attention_bias: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute attention with pre-merged K,V from both VLM and action expert.
+        
+        Args:
+            q: (B, n_heads, T_action, head_dim) - queries from action tokens
+            merged_k: (B, n_kv_heads, T_total, head_dim) - keys from vision+lang+action
+            merged_v: (B, n_kv_heads, T_total, head_dim) - values from vision+lang+action
+            attention_bias: Optional attention mask
+            position_ids: Optional position IDs for RoPE
+            
+        Returns:
+            attention output: (B, T_action, d_model)
+        """
+        B, _, T, _ = q.size()
+        
+        # Apply RoPE if configured
+        if self.config.rope and position_ids is not None and self.config.use_position_ids:
+            q, merged_k = self.rotary_emb(q, merged_k, position_ids=position_ids)
+        elif self.config.rope and not self.config.use_position_ids:
+            q, merged_k = self.rotary_emb(q, merged_k)
+        
+        # Handle GQA: repeat K,V heads to match Q heads
+        num_q_heads = q.size(1)
+        num_kv_heads = merged_k.size(1)
+        if num_q_heads != num_kv_heads:
+            assert num_q_heads % num_kv_heads == 0
+            merged_k = merged_k.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
+            merged_v = merged_v.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
+        
+        # Compute scaled dot product attention
+        att = F.scaled_dot_product_attention(
+            q,
+            merged_k,
+            merged_v,
+            attn_mask=attention_bias,
+            dropout_p=0.0 if not self.training else self.config.attention_dropout,
+            is_causal=False,  # We use explicit attention_bias, not causal mask
+        )
+        
+        # Reshape: (B, nh, T, hs) -> (B, T, d_model)
+        att = att.transpose(1, 2).contiguous().view(B, T, self.d_model)
+        
+        # Apply output projection
+        return self.attn_out(att)
+    
+    def apply_ffn(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        """
+        Apply feed-forward network with residual connection.
+        
+        Args:
+            x: Input after attention
+            residual: Residual connection input
+            
+        Returns:
+            Output after FFN + residual
+        """
+        og_x = x
+        
+        # Layer norm
+        if not self.config.norm_after:
+            if self._activation_checkpoint_fn is not None:
+                x = self._activation_checkpoint_fn(self.ff_norm, x)
+            else:
+                x = self.ff_norm(x)
+        
+        # FFN
+        x = self.ff_proj(x)
+        if self._activation_checkpoint_fn is not None:
+            x = self._activation_checkpoint_fn(self.act, x)
+        else:
+            x = self.act(x)
+        x = self.ff_out(x)
+        
+        # Post-norm if configured
+        if self.config.norm_after:
+            if self._activation_checkpoint_fn is not None:
+                x = self._activation_checkpoint_fn(self.ff_norm, x)
+            else:
+                x = self.ff_norm(x)
+        
+        # Dropout + residual
+        x = self.dropout(x, drop_mask=None)
+        return og_x + x
+
+
+class ActionExpertTransformer(nn.Module):
+    """
+    Action expert transformer for flow matching.
+    
+    This module processes noisy actions through a separate transformer that:
+    1. Projects actions to action expert's embedding space
+    2. Applies timestep conditioning
+    3. Processes through action expert transformer layers (with cross-attention to VLM)
+    4. Projects back to main model dimension for concatenation
+    
+    The action expert uses its own weights but attends to vision/language context
+    via merged K,V attention at each layer (OpenPI-style).
+    """
+    
+    def __init__(self, config: ModelConfig, init_params: bool = True):
+        super().__init__()
+        self.config = config
+        self.d_model = config.action_expert_d_model
+        self.action_dim = config.action_dim
+        self.action_horizon = config.action_horizon
+        
+        # Determine number of layers (default to same as main model)
+        n_layers = config.action_expert_n_layers if config.action_expert_n_layers is not None else config.n_layers
+        self.n_layers = n_layers
+        
+        # Input projection: action_dim -> action_expert_d_model
+        self.action_in_proj = nn.Linear(
+            config.action_dim, 
+            config.action_expert_d_model,
+            bias=config.include_bias,
+            device=config.init_device
+        )
+        
+        # Timestep conditioning MLPs (Pi0-style)
+        self.time_mlp_in = nn.Linear(
+            2 * config.action_expert_d_model,
+            config.action_expert_d_model,
+            bias=config.include_bias,
+            device=config.init_device
+        )
+        self.time_mlp_out = nn.Linear(
+            config.action_expert_d_model,
+            config.action_expert_d_model,
+            bias=config.include_bias,
+            device=config.init_device
+        )
+        
+        # Action expert transformer blocks
+        self.__cache = BufferCache()
+        self.blocks = nn.ModuleList([
+            ActionExpertBlock(layer_id=i, config=config, cache=self.__cache)
+            for i in range(n_layers)
+        ])
+        
+        # Final layer norm
+        self.ln_final = LayerNorm.build(
+            config, 
+            size=config.action_expert_d_model, 
+            elementwise_affine=config.layer_norm_with_affine
+        )
+        
+        # Output projection: action_expert_d_model -> d_model (main model dimension)
+        # This allows action embeddings to be concatenated with vision/language
+        self.output_proj = nn.Linear(
+            config.action_expert_d_model,
+            config.d_model,
+            bias=config.include_bias,
+            device=config.init_device
+        )
+        
+        # Use default PyTorch initialization (no custom init)
+    
+    def set_activation_checkpointing(self, strategy: Optional[ActivationCheckpointingStrategy]):
+        """Enable activation checkpointing for action expert blocks."""
+        for block in self.blocks:
+            block.set_activation_checkpointing(strategy)
+    
+    def embed_actions_with_time(
+        self, 
+        noisy_actions: torch.Tensor, 
+        timestep: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Embed noisy actions with timestep conditioning (Pi0-style).
+        
+        Args:
+            noisy_actions: (batch_size, action_horizon, action_dim)
+            timestep: (batch_size,) time values in [0, 1]
+            
+        Returns:
+            action_embeddings: (batch_size, action_horizon, action_expert_d_model)
+        """
+        from .losses import posemb_sincos  # Import here
+        
+        # Project actions to action expert dimension
+        action_tokens = self.action_in_proj(noisy_actions)  # (B, H, D_action)
+        
+        # Sinusoidal time embedding
+        time_emb = posemb_sincos(timestep, self.d_model)  # (B, D_action)
+        time_tokens = time_emb.unsqueeze(1).expand(-1, noisy_actions.shape[1], -1)  # (B, H, D_action)
+        
+        # Mix with MLPs (Pi0-style conditioning)
+        combined = torch.cat([action_tokens, time_tokens], dim=-1)  # (B, H, 2*D_action)
+        combined = F.silu(self.time_mlp_in(combined))
+        action_embeddings = F.silu(self.time_mlp_out(combined))  # (B, H, D_action)
+        
+        return action_embeddings
 
 
 class OLMoOutput(NamedTuple):
@@ -1683,15 +2058,20 @@ class Molmo(nn.Module):
         if config.vision_backbone is not None:
             self.vision_backbone = MolmoVisionBackbone.build(config)
 
-        # Flow matching trajectory head (optional)
-        self.flow_matching_head: Optional[FlowMatchingHead] = None
+        # Action expert transformer for flow matching (OpenPI-style)
+        self.action_expert: Optional[ActionExpertTransformer] = None
+        self.velocity_head: Optional[nn.Linear] = None
         if config.use_flow_matching_head:
-            self.flow_matching_head = FlowMatchingHead(
-                d_model=config.d_model,
-                action_dim=config.action_dim,
-                action_horizon=config.action_horizon,
-                use_adarms=config.use_adarms_flow_matching,
-                config=config,  # Pass config for proper weight initialization
+            # Separate transformer for action processing
+            self.action_expert = ActionExpertTransformer(config, init_params=init_params)
+            
+            # Velocity prediction head (maps from main d_model to action_dim)
+            # Uses default initialization
+            self.velocity_head = nn.Linear(
+                config.d_model,
+                config.action_dim,
+                bias=config.include_bias,
+                device=config.init_device,
             )
 
         self.__num_fwd_flops: Optional[int] = None
@@ -1735,6 +2115,9 @@ class Molmo(nn.Module):
 
         if self.vision_backbone is not None:
             self.vision_backbone.set_activation_checkpointing(strategy)
+        
+        if self.action_expert is not None:
+            self.action_expert.set_activation_checkpointing(strategy)
     
     @staticmethod
     def get_connector_parameters():
@@ -1770,7 +2153,8 @@ class Molmo(nn.Module):
     def get_flow_matching_parameters():
         return tuple(
             [
-                "flow_matching_head",
+                "action_expert",
+                "velocity_head",
             ]
         )
 
@@ -1802,6 +2186,39 @@ class Molmo(nn.Module):
             self.vision_backbone.reset_parameters()
         self.reset_non_vision_parameters()
 
+    def _apply_ffn_sequential(self, block: OLMoSequentialBlock, x: torch.Tensor, drop_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """
+        Apply feed-forward network for OLMoSequentialBlock.
+        This is a helper for the OpenPI-style forward pass.
+        """
+        og_x = x
+        
+        # Layer norm
+        if not self.config.norm_after:
+            if block._activation_checkpoint_fn is not None:
+                x = block._activation_checkpoint_fn(block.ff_norm, x)
+            else:
+                x = block.ff_norm(x)
+        
+        # FFN
+        x = block.ff_proj(x)
+        if block._activation_checkpoint_fn is not None:
+            x = block._activation_checkpoint_fn(block.act, x)
+        else:
+            x = block.act(x)
+        x = block.ff_out(x)
+        
+        # Post-norm if configured
+        if self.config.norm_after:
+            if block._activation_checkpoint_fn is not None:
+                x = block._activation_checkpoint_fn(block.ff_norm, x)
+            else:
+                x = block.ff_norm(x)
+        
+        # Dropout + residual
+        x = block.dropout(x, drop_mask=drop_mask)
+        return og_x + x
+    
     def reset_non_vision_parameters(self):
         # Top-level embeddings / linear layers.
         if self.config.additional_vocab_size is not None:
@@ -1970,51 +2387,27 @@ class Molmo(nn.Module):
         if self.config.normalize_input_embeds:
             x = x * (self.config.d_model ** 0.5)
 
-        # Flow matching: Add action tokens if provided
-        has_action_tokens = noisy_actions is not None and self.flow_matching_head is not None
-        action_hidden_states_indices = None
+        # Flow matching: Prepare action expert processing (OpenPI-style)
+        has_action_tokens = noisy_actions is not None and self.action_expert is not None
+        action_hidden = None
+        action_position_ids = None
         
         if has_action_tokens:
-            # Embed noisy actions with timestep conditioning
-            # noisy_actions: (batch_size, action_horizon, action_dim)
-            # action_timestep: (batch_size,)
-            action_embeddings = self.flow_matching_head.embed_actions_with_time(
+            # Embed noisy actions through action expert's input layers
+            # This gives us action embeddings in action_expert_d_model dimension
+            action_hidden = self.action_expert.embed_actions_with_time(
                 noisy_actions, action_timestep
-            )  # (batch_size, action_horizon, d_model)
+            )  # (batch_size, action_horizon, action_expert_d_model)
             
-            # Track where action tokens are in the sequence
-            prefix_seq_len = x.shape[1]
-            action_seq_len = action_embeddings.shape[1]
-            action_hidden_states_indices = (prefix_seq_len, prefix_seq_len + action_seq_len)
-            
-            # Concatenate action embeddings after text/image embeddings
-            x = torch.cat([x, action_embeddings], dim=1)  # (batch_size, prefix_len + action_len, d_model)
-            
-            # Update sequence length
-            seq_len = x.shape[1]
-            
-            # Update position_ids to include action tokens
+            # Create position IDs for action tokens  
             if self.config.use_position_ids and position_ids is not None:
-                # Create position IDs for action tokens (continue from where prefix ended)
-                # Action tokens get sequential positions starting from max_prefix_pos + 1
                 max_prefix_pos = position_ids.max()
                 action_position_ids = torch.arange(
                     max_prefix_pos + 1,
-                    max_prefix_pos + 1 + action_seq_len,
+                    max_prefix_pos + 1 + action_hidden.shape[1],
                     dtype=torch.long,
                     device=x.device
                 ).unsqueeze(0).expand(batch_size, -1)
-                
-                # Concatenate position IDs
-                position_ids = torch.cat([position_ids, action_position_ids], dim=1)
-            
-            # Extend attention_mask to include action tokens (all valid, no padding)
-            if attention_mask is not None:
-                action_attention_mask = torch.ones(
-                    batch_size, action_seq_len,
-                    dtype=attention_mask.dtype, device=attention_mask.device
-                )
-                attention_mask = torch.cat([attention_mask, action_attention_mask], dim=1)
 
         # Transform the attention mask into what the blocks expect.
         if attention_mask is not None:
@@ -2057,46 +2450,109 @@ class Molmo(nn.Module):
                 # it can produce NaNs.
                 ensure_finite_(attention_bias, check_neg_inf=True, check_pos_inf=False)
             
-            # Flow matching: Modify attention pattern for action tokens
-            # Standard causal mask already gives us:
-            # - Prefix tokens: causal among themselves ✓
-            # - Prefix→Actions: -inf (can't attend forward) ✓
-            # - Actions→Prefix: 0 (can attend backward) ✓
-            # - Actions→Actions: triangular (need to make bidirectional)
-            if has_action_tokens:
-                prefix_len = action_hidden_states_indices[0]
-                # Make action→action bidirectional by removing causal mask
-                attention_bias[:, :, prefix_len:, prefix_len:] = 0
-
         attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
 
         # decoder layers
         all_hidden_states = []
 
-        # Apply blocks one-by-one.
-        if self.config.block_group_size == 1:
+        # OpenPI-style layer-by-layer processing when we have action tokens
+        if has_action_tokens and self.config.block_group_size == 1:
+            # Process prefix and actions separately through each layer with merged K,V attention
+            prefix_hidden = x  # (B, prefix_len, d_model)
+            # action_hidden already initialized above: (B, action_horizon, action_expert_d_model)
+            
+            for block_idx, (vlm_block, action_block) in enumerate(zip(
+                self.transformer.blocks,
+                self.action_expert.blocks
+            )):
+                if output_hidden_states:
+                    # Concatenate for output (even though processing separately)
+                    combined = self.action_expert.output_proj(action_hidden)
+                    all_hidden_states.append(torch.cat([prefix_hidden, combined], dim=1))
+                
+                layer_past = None if past_key_values is None else past_key_values[block_idx]
+                
+                # Step 1: Get Q, K, V from both transformers
+                prefix_q, prefix_k, prefix_v = vlm_block.get_qkv(prefix_hidden)
+                action_q, action_k, action_v = action_block.get_qkv(action_hidden)
+                
+                # Step 2: Merge K, V for shared attention context
+                # Actions attend to all (prefix + actions), prefix only attends to prefix
+                merged_k = torch.cat([prefix_k, action_k], dim=2)  # (B, n_kv_heads, prefix_len+action_len, head_dim)
+                merged_v = torch.cat([prefix_v, action_v], dim=2)
+                
+                # Step 3: Compute attention separately
+                # Prefix attends only to prefix (causal)
+                prefix_att_out = vlm_block.attention(
+                    prefix_q, prefix_k, prefix_v,
+                    attention_bias=attention_bias,
+                    position_ids=position_ids,
+                    drop_mask=response_mask,
+                    layer_past=layer_past,
+                    use_cache=use_cache
+                )[0]  # Returns (output, cache); we take output
+                
+                # Actions attend to all (prefix + actions), bidirectionally
+                # Create attention bias for actions: can attend to all prefix + all actions
+                if attention_bias is not None:
+                    # Actions can see all prefix (no causal constraint from prefix to actions)
+                    # Actions can see all other actions (bidirectional)
+                    action_bias = torch.zeros(
+                        batch_size, 1, action_hidden.shape[1], merged_k.shape[2],
+                        dtype=attention_bias.dtype, device=attention_bias.device
+                    )
+                else:
+                    action_bias = None
+                
+                action_att_out = action_block.attention_with_merged_kv(
+                    action_q, merged_k, merged_v,
+                    attention_bias=action_bias,
+                    position_ids=action_position_ids
+                )
+                
+                # Step 4: Apply residual connection for attention
+                prefix_hidden = prefix_hidden + vlm_block.dropout(prefix_att_out, drop_mask=response_mask)
+                action_hidden = action_hidden + action_block.dropout(action_att_out, drop_mask=None)
+                
+                # Step 5: Apply feed-forward networks
+                prefix_hidden = vlm_block.apply_ffn(prefix_hidden, prefix_hidden) if hasattr(vlm_block, 'apply_ffn') else self._apply_ffn_sequential(vlm_block, prefix_hidden, response_mask)
+                action_hidden = action_block.apply_ffn(action_hidden, action_hidden)
+                
+                # Cache handling (only for prefix, actions don't use cache)
+                if attn_key_values is not None:
+                    # We only cache prefix K,V since actions are recomputed each time
+                    cache = (prefix_k, prefix_v) if use_cache else None
+                    if cache is not None:
+                        attn_key_values.append(cache)
+            
+            # After all layers, project action_hidden to main model dimension and concatenate
+            action_hidden_projected = self.action_expert.output_proj(action_hidden)
+            x = torch.cat([prefix_hidden, action_hidden_projected], dim=1)
+            
+        # Standard processing when no action tokens or using block groups
+        elif self.config.block_group_size == 1:
             for block_idx, block in enumerate(self.transformer.blocks):
                 if output_hidden_states:
-                    # add hidden states
                     all_hidden_states.append(x)
 
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
                 if should_checkpoint_block(self.activation_checkpointing_strategy, block_idx):
-                    # shape: (batch_size, seq_len, d_model)
                     x, cache = self._activation_checkpoint_fn(
                         block, x, attention_bias=attention_bias, position_ids=position_ids, drop_mask=response_mask, layer_past=layer_past, use_cache=use_cache
                     )
                 else:
-                    # shape: (batch_size, seq_len, d_model)
                     x, cache = block(x, attention_bias=attention_bias, position_ids=position_ids, drop_mask=response_mask, layer_past=layer_past, use_cache=use_cache)
 
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.append(cache)
         else:
+            # Block group processing (not compatible with action expert yet)
+            if has_action_tokens:
+                raise NotImplementedError("Action expert with block groups is not yet supported")
+            
             for group_idx, block_group in enumerate(self.transformer.block_groups):
                 if output_hidden_states:
-                    # add hidden states
                     all_hidden_states.append(x)
 
                 layers_past = (
@@ -2145,15 +2601,16 @@ class Molmo(nn.Module):
 
         # Flow matching: Extract action hidden states and predict velocity
         velocity_output = None
-        if has_action_tokens and action_hidden_states_indices is not None:
-            # Extract action token hidden states from the transformer output (after final layer norm)
-            start_idx, end_idx = action_hidden_states_indices
-            action_hidden_states = x[:, start_idx:end_idx, :]  # (batch_size, action_horizon, d_model)
+        if has_action_tokens:
+            # Extract action tokens from concatenated output
+            # x now contains: [prefix_hidden, action_hidden_projected]
+            prefix_len = prefix_hidden.shape[1]
+            action_hidden_states = x[:, prefix_len:, :]  # (batch_size, action_horizon, d_model)
             
-            # Project to velocity predictions (not the trajectory itself!)
+            # Project to velocity predictions using velocity head
             # During training: used to compute FM loss
             # During inference: integrated via ODE to get actual trajectory
-            velocity_output = self.flow_matching_head.predict_velocity(action_hidden_states)
+            velocity_output = self.velocity_head(action_hidden_states)
             # velocity_output: (batch_size, action_horizon, action_dim)
 
         return OLMoOutput(

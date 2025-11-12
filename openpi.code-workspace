@@ -1,0 +1,13 @@
+{
+    "folders": [
+		{
+			"path": "../../../code/openpi"
+		},
+		{
+			"path": "../../../code/flow_matching"
+		},
+		{
+			"path": "."
+		}
+	]
+}

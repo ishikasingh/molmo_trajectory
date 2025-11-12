@@ -801,6 +801,35 @@ class ModelConfig(BaseConfig):
     Number of ODE integration steps during inference.
     """
 
+    # Action expert transformer configuration (for flow matching)
+    action_expert_d_model: int = 1024
+    """
+    Hidden dimension for the action expert transformer.
+    This is typically much smaller than the main model d_model (e.g., 1024 vs 4096).
+    """
+
+    action_expert_n_layers: Optional[int] = None
+    """
+    Number of layers in the action expert transformer.
+    If None, defaults to n_layers (same depth as main model).
+    """
+
+    action_expert_n_heads: int = 8
+    """
+    Number of attention heads in the action expert transformer.
+    """
+
+    action_expert_n_kv_heads: int = 1
+    """
+    Number of key-value heads for grouped query attention in action expert.
+    Set to 1 for multi-query attention (default), or n_heads for full attention.
+    """
+
+    action_expert_mlp_ratio: float = 4.0
+    """
+    MLP hidden size ratio for action expert (mlp_hidden = mlp_ratio * action_expert_d_model).
+    """
+
     precision: Optional[str] = "amp_bf16"
     """
     Precision for inference (e.g. "amp_bf16", "amp_fp16", or "fp32").

@@ -194,12 +194,6 @@ def main(cfg: TrainConfig) -> None:
         log.info(f"Number of active parameters: {olmo_model.num_params(include_inactive_params=False):,d}")    
     log.info(f"Peak GPU Memory (MB) before FSDP: {int(peak_gpu_memory() or 0)}")
 
-    # Reinitialize flow matching head BEFORE FSDP wrapping to ensure weight sync
-    if olmo_model.config.use_flow_matching_head and hasattr(olmo_model, 'flow_matching_head') and olmo_model.flow_matching_head is not None:
-        log.info("[FLOW MATCHING INIT] Reinitializing flow matching head before FSDP wrapping...")
-        olmo_model.flow_matching_head.reinitialize_output_head()
-        log.info("[FLOW MATCHING INIT] Flow matching head reinitialized with model's init scheme")
-
     # Wrap the model in FSDP.
     log.info("Wrapping model with FDSP...")
     wrap_policy = olmo_model.get_fsdp_wrap_policy(cfg.fsdp.wrapping_strategy)
