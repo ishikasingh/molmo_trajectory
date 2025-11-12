@@ -296,18 +296,12 @@ class Trainer:
             self.moe_args = config_to_moe_args(self.cfg.model)
 
         # Initialize flow matching trajectory loss if enabled
+        # NOTE: Flow matching head reinitialization now happens in scripts/train.py 
+        # BEFORE FSDP wrapping to ensure proper weight synchronization across nodes
         self.trajectory_loss_fn: Optional[FlowMatchingTrajectoryLoss] = None
         if self.model.config.use_flow_matching_head:
             self.trajectory_loss_fn = FlowMatchingTrajectoryLoss(velocity_weighting="none")
             self.trajectory_loss_fn = self.trajectory_loss_fn.to(self.device)
-            
-            # CRITICAL: Reinitialize the flow matching head
-            # This is necessary in case the model was loaded from a checkpoint with
-            # uninitialized or poorly initialized flow matching weights
-            if hasattr(self.model, 'flow_matching_head') and self.model.flow_matching_head is not None:
-                log.info("[FLOW MATCHING INIT] Reinitializing flow matching head...")
-                self.model.flow_matching_head.reinitialize_output_head()
-                log.info("[FLOW MATCHING INIT] Flow matching head reinitialized with model's init scheme")
 
     @property
     def dataset(self) -> IterableDataset:
