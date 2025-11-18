@@ -630,7 +630,7 @@ class ModelConfig(BaseConfig):
     For length condition, what length use for inference
     """
 
-    include_proprio: bool = True
+    include_proprio: bool = False
     """
     Whether to include proprioceptive information (current finger positions) in trajectory prompts
     """
@@ -769,7 +769,7 @@ class ModelConfig(BaseConfig):
     The capacity factor to use in the MoE block. Only applies if not using dMoE.
     """
     # Flow matching trajectory prediction parameters
-    use_flow_matching_head: bool = False
+    use_action_expert: bool = False
     """
     Enable flow matching head for continuous trajectory prediction.
     When True, the model can process action tokens for flow matching.
@@ -802,10 +802,17 @@ class ModelConfig(BaseConfig):
     """
 
     # Action expert transformer configuration (for flow matching)
-    action_expert_d_model: int = 1024
+    action_expert_d_model: Optional[int] = None
     """
     Hidden dimension for the action expert transformer.
-    This is typically much smaller than the main model d_model (e.g., 1024 vs 4096).
+    If None (default), matches VLM d_model for backward compatibility.
+    
+    Can be set to a smaller value (e.g., 1024) to reduce memory usage while keeping
+    head_dim matching. OpenPI uses gemma_300m (width=1024) with gemma_2b (width=2048).
+    
+    IMPORTANT: For merged attention to work, the following must match:
+    - n_heads: action_expert_n_heads must equal VLM n_heads (enforced by assertion)
+    - head_dim: action expert uses VLM's head_dim directly (not computed from action_expert_d_model)
     """
 
     action_expert_n_layers: Optional[int] = None
@@ -814,15 +821,18 @@ class ModelConfig(BaseConfig):
     If None, defaults to n_layers (same depth as main model).
     """
 
-    action_expert_n_heads: int = 8
+    action_expert_n_heads: Optional[int] = None
     """
     Number of attention heads in the action expert transformer.
+    If None (default), will automatically match the VLM's n_heads for shared attention compatibility.
+    MUST be the same as VLM n_heads for OpenPI-style merged attention.
     """
 
-    action_expert_n_kv_heads: int = 1
+    action_expert_n_kv_heads: Optional[int] = None
     """
     Number of key-value heads for grouped query attention in action expert.
-    Set to 1 for multi-query attention (default), or n_heads for full attention.
+    If None (default), will automatically match the VLM's effective_n_kv_heads for FSDP compatibility.
+    Otherwise, set to 1 for multi-query attention, or action_expert_n_heads for full attention.
     """
 
     action_expert_mlp_ratio: float = 4.0
@@ -950,6 +960,30 @@ class ModelConfig(BaseConfig):
             return self.n_heads
         else:
             return self.n_kv_heads
+
+    @property
+    def effective_action_expert_n_heads(self) -> int:
+        """
+        Returns the effective number of attention heads for the action expert.
+        If action_expert_n_heads is None, defaults to matching the VLM's n_heads
+        for shared attention compatibility (OpenPI-style).
+        """
+        if self.action_expert_n_heads is None:
+            return self.n_heads
+        else:
+            return self.action_expert_n_heads
+
+    @property
+    def effective_action_expert_n_kv_heads(self) -> int:
+        """
+        Returns the effective number of KV heads for the action expert.
+        If action_expert_n_kv_heads is None, defaults to matching the VLM's effective_n_kv_heads
+        for FSDP compatibility.
+        """
+        if self.action_expert_n_kv_heads is None:
+            return self.effective_n_kv_heads
+        else:
+            return self.action_expert_n_kv_heads
 
     @property
     def image_num_patch(self):

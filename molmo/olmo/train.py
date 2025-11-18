@@ -299,7 +299,7 @@ class Trainer:
         # NOTE: Flow matching head reinitialization now happens in scripts/train.py 
         # BEFORE FSDP wrapping to ensure proper weight synchronization across nodes
         self.trajectory_loss_fn: Optional[FlowMatchingTrajectoryLoss] = None
-        if self.model.config.use_flow_matching_head:
+        if self.model.config.use_action_expert:
             self.trajectory_loss_fn = FlowMatchingTrajectoryLoss(velocity_weighting="none")
             self.trajectory_loss_fn = self.trajectory_loss_fn.to(self.device)
 
@@ -875,9 +875,40 @@ class Trainer:
         
         # Handle CE loss based on batch type
         if has_trajectory:
-            # Trajectory batches: we have velocity_output, but skip CE loss supervision
-            # (logits are still computed but not supervised, like OpenPI)
-            pass
+            # Trajectory batches: check if using flow matching or text output
+            if output.velocity_output is not None:
+                # Flow matching mode: skip CE loss, use velocity_output loss
+                # (logits are still computed but not supervised, like OpenPI)
+                pass
+            elif "labels" in batch:
+                # Text-based trajectory output: compute CE loss on text tokens
+                assert "loss_masks" in batch
+                assert loss_reduction == "none"
+                loss_masks = batch["loss_masks"] * (batch["loss_masks"] > 0)
+                labels = batch["labels"].long()
+                labels.masked_fill_(~(loss_masks > 0), -100)
+                labels = labels.view(-1)
+                logits_for_loss = logits.to(torch.float32).view(-1, logits.size(-1)) # for numerical stability
+                ce_loss, z_loss = self.loss_fn(
+                    logits_for_loss, labels, ignore_index=-100, reduction=loss_reduction,
+                    compute_z_loss=compute_z_loss, z_loss_scale=self.cfg.softmax_auxiliary_loss_scale,
+                )
+                bs = batch["input_ids"].shape[0]
+                if loss_reduction == "none":
+                    # Reshape (batch_size * seq_len,) -> (batch_size, seq_len)
+                    ce_loss = ce_loss.view(bs, -1)
+                    if z_loss is not None:
+                        z_loss = z_loss.view(bs, -1)
+
+                accuracy = torch.argmax(logits_for_loss, dim=-1) == labels
+                ce_loss = ce_loss * loss_masks
+                if z_loss is not None:
+                    z_loss = z_loss * loss_masks
+                accuracy = accuracy.view(bs, -1)
+                accuracy = accuracy * loss_masks
+            else:
+                # Trajectory batches without labels: skip CE loss
+                pass
         elif "labels" in batch:
             # VLM tasks with labeled targets: compute CE loss
             assert "loss_masks" in batch
@@ -962,9 +993,14 @@ class Trainer:
         # Combine losses: selectively supervise based on task type
         # This matches OpenPI's approach: compute all outputs but only supervise on the relevant ones
         if has_trajectory:
-            # Trajectory tasks: supervise only on velocity_output (from action tokens)
-            # Logits are still computed (from text tokens) but not supervised
-            total_loss = self.cfg.model.flow_matching_loss_weight * trajectory_loss
+            # Trajectory tasks: check if using flow matching or text output
+            if output.velocity_output is not None:
+                # Flow matching mode: supervise on velocity_output (from action tokens)
+                # Logits are still computed (from text tokens) but not supervised
+                total_loss = self.cfg.model.flow_matching_loss_weight * trajectory_loss
+            else:
+                # Text-based trajectory output: supervise on text tokens (CE loss)
+                total_loss = ce_loss
         else:
             # VLM tasks: supervise only on logits (from text tokens)
             # velocity_output is None (flow_matching_head not enabled for VLM tasks)
@@ -976,6 +1012,7 @@ class Trainer:
         # Split into micro-batches.
         micro_batches = self.split_batch(batch)
         has_labels = "labels" in batch
+        has_trajectory = "trajectory_target" in batch
 
         if has_labels:
             loss_masks = batch["loss_masks"] * (batch["loss_masks"] > 0)
@@ -989,6 +1026,31 @@ class Trainer:
                 raise ValueError()
         else:
             batch_size_in_tokens = batch["input_ids"].numel()
+
+        # Keep track of how many trajectory examples contributed to this batch so
+        # flow-matching losses can be normalized consistently.
+        flow_matching_batch_size = None
+        if has_trajectory:
+            flow_matching_batch_size = torch.tensor(
+                batch["trajectory_target"].shape[0], device=self.device, dtype=torch.float32
+            )
+            if self.cfg.batch_divisor == BatchDivisor.global_batch:
+                dist.all_reduce(flow_matching_batch_size)
+                flow_matching_batch_size.div_(get_world_size())
+
+        # For flow matching: if batch_size_in_tokens is 0 (because loss_masks are all 0),
+        # use batch size instead (trajectory_loss is already averaged over action dimensions)
+        is_zero = (batch_size_in_tokens == 0).item() if isinstance(batch_size_in_tokens, torch.Tensor) else batch_size_in_tokens == 0
+        if is_zero and has_trajectory:
+            batch_size = batch["trajectory_target"].shape[0]
+            if self.cfg.batch_divisor == BatchDivisor.global_batch:
+                batch_size_in_tokens = torch.tensor(batch_size, device=self.device, dtype=torch.float32)
+                dist.all_reduce(batch_size_in_tokens)
+                batch_size_in_tokens.div_(get_world_size())
+            elif self.cfg.batch_divisor == BatchDivisor.device_batch:
+                batch_size_in_tokens = torch.tensor(batch_size, device=self.device, dtype=torch.float32)
+            else:
+                raise ValueError()
 
         del batch  # in case this helps reduce memory
 
@@ -1024,7 +1086,11 @@ class Trainer:
                 if z_loss is not None:
                     z_loss = z_loss.sum()
 
-            total_loss = total_loss / batch_size_in_tokens
+            is_flow_matching_loss = has_trajectory and trajectory_loss.requires_grad
+            loss_normalizer = (
+                flow_matching_batch_size if (is_flow_matching_loss and flow_matching_batch_size is not None) else batch_size_in_tokens
+            )
+            total_loss = total_loss / loss_normalizer
             accuracy = accuracy / batch_size_in_tokens
 
             # In case this helps with memory utilization.

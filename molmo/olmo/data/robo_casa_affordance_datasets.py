@@ -12,8 +12,8 @@ import cv2
 import warnings
 import torch
 
-import lerobot
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+# import lerobot
+# from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 warnings.filterwarnings("ignore", message=".*video decoding and encoding capabilities.*", category=UserWarning)
 
 class RobotCasaHandPositioningDataset(Dataset):

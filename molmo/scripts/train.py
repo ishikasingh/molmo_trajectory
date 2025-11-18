@@ -181,8 +181,18 @@ def main(cfg: TrainConfig) -> None:
                 olmo_model.to_empty(device="cpu")
             if cfg.initial_model_checkpoint:
                 state_dict = torch.load(join(cfg.initial_model_checkpoint, "model.pt"), map_location="cpu")
+                loaded_keys = set(state_dict.keys())
                 olmo_model.load_state_dict(state_dict, strict=False)
                 del state_dict
+                
+                # Initialize action expert parameters if they weren't in the checkpoint
+                if olmo_model.action_expert is not None:
+                    action_expert_keys = [k for k in loaded_keys if k.startswith("action_expert")]
+                    if len(action_expert_keys) == 0:
+                        log.info("Action expert parameters not found in checkpoint, initializing from scratch...")
+                        olmo_model.action_expert.reset_parameters()
+                    else:
+                        log.info(f"Action expert parameters loaded from checkpoint ({len(action_expert_keys)} keys)")
             else:
                 olmo_model.reset_with_pretrained_weights()
     else:

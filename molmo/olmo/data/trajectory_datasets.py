@@ -85,6 +85,10 @@ def hdf5_file_with_retry(hdf5_path: str, max_retries: int = 3):
 class TrajectoryDataset(Dataset):
     """PyTorch Dataset for trajectory prediction training."""
     
+    # Class-level parameter for limiting examples in overfit split
+    # Set before instantiation: TrajectoryDataset.overfit_num_examples = 1
+    overfit_num_examples: Optional[int] = 1
+    
     def __init__(
         self,
         data_dir: str = None,
@@ -115,10 +119,13 @@ class TrajectoryDataset(Dataset):
         self.output_format = output_format  # "text" or "flow_matching"
         self.frame_downsampling_ratio = frame_downsampling_ratio
         self.trajectory_representation = trajectory_representation
+        self.overfit_num_examples = type(self).overfit_num_examples
         
         assert output_format in ["text", "flow_matching"], f"output_format must be 'text' or 'flow_matching', got {output_format}"
         assert frame_downsampling_ratio >= 1, f"frame_downsampling_ratio must be >= 1, got {frame_downsampling_ratio}"
         assert trajectory_representation in ["absolute", "delta"], f"trajectory_representation must be 'absolute' or 'delta', got {trajectory_representation}"
+        if self.overfit_num_examples is not None:
+            assert self.overfit_num_examples > 0, f"overfit_num_examples must be > 0, got {self.overfit_num_examples}"
         
         # Default joint names matching data_formatter.py TRAJECTORY_KEYPOINTS
         if joint_names is None:
@@ -131,6 +138,13 @@ class TrajectoryDataset(Dataset):
         
         print(f"Loading index mapping for {split} split...")
         self.index_mapping = self._build_index_mapping()
+        
+        # Apply overfit example limit if specified (only when split="overfit")
+        if self.split == "overfit" and self.overfit_num_examples is not None:
+            original_len = len(self.index_mapping)
+            self.index_mapping = self.index_mapping[:self.overfit_num_examples]
+            print(f"Limited overfit split to {len(self.index_mapping)} examples (from {original_len})")
+        
         print(f"Loaded {len(self.index_mapping)} samples from {split} split")
         
     def _get_cache_filepath(self) -> Path:
@@ -223,6 +237,7 @@ class TrajectoryDataset(Dataset):
             # split_dirs = [self.data_dir / "test"]
             split_dirs = [self.data_dir / "small_test"]
         elif self.split == "overfit":
+            print("!!Using overfit split")
             split_dirs = [self.data_dir / "very_small_test"]
         else:
             raise ValueError(f"Invalid split: {self.split}")

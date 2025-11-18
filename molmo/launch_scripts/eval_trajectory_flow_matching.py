@@ -412,12 +412,13 @@ def load_test_examples(task_type: str, num_examples: int = 10,
     
     # Load test dataset
     dataset = TrajectoryDataset(
-        split="test",
+        split="overfit",
         action_chunking_horizon=action_chunking_horizon,
         output_2d_trajectory=output_2d,
         normalize_2d_coordinates=True,
         output_format="flow_matching",  # Use flow matching format
         trajectory_representation=trajectory_representation,
+        frame_downsampling_ratio=30,
     )
     
     print(f"Loaded test dataset with {len(dataset)} examples")
@@ -520,7 +521,6 @@ def main():
     model = Molmo.from_checkpoint(args.checkpoint, device=args.device)
     model.eval()
     model.config.action_horizon = args.action_chunking_horizon
-    model.flow_matching_head.action_horizon = args.action_chunking_horizon
     
     print("Building preprocessor...")
     preprocessor = build_mm_preprocessor(model.config, for_inference=True, is_training=False)

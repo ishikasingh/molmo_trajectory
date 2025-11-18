@@ -298,7 +298,7 @@ if __name__ == "__main__":
         inf_eval_interval = 2000
         eval_interval = 2000
         if args.finetune:
-            duration = 10000
+            duration = 25000
         else:
             duration = 30000
         model_init = args.checkpoint
@@ -321,7 +321,7 @@ if __name__ == "__main__":
 
     # Enable flow matching for trajectory prediction tasks
     if "_fm" in args.mixture:
-        model_cfg.use_flow_matching_head = True
+        model_cfg.use_action_expert = True
         # Configure action dimensions based on task
         # action_horizon: number of timesteps to predict (e.g., 30)
         # action_dim: flattened coordinate dimension = num_joints * num_coordinates
@@ -334,10 +334,25 @@ if __name__ == "__main__":
         model_cfg.use_adarms_flow_matching = False  # Use Pi0-style MLP conditioning
         model_cfg.flow_matching_loss_weight = 1.0
         model_cfg.flow_matching_num_steps = 10  # ODE integration steps during inference
+        
+        # Configure action expert to be smaller than VLM (OpenPI-style)
+        # This reduces memory while maintaining head_dim compatibility
+        # OpenPI uses gemma_300m (width=1024) with gemma_2b (width=2048)
+        vlm_head_dim = model_cfg.d_model // model_cfg.n_heads
+        
+        if model_cfg.action_expert_d_model is None:
+            model_cfg.action_expert_d_model = model_cfg.d_model // 16        
+        # Ensure n_heads matches (required for merged attention)
+        model_cfg.action_expert_n_heads = model_cfg.n_heads
+        
+        # Note: head_dim will automatically match VLM's head_dim in ActionExpertBlock
+        # (it uses VLM's head_dim directly, not computed from action_expert_d_model)
+        # This allows different d_model values while maintaining head_dim compatibility (OpenPI pattern)
+        
         log.info("Flow matching trajectory head enabled with action_horizon=%d, action_dim=%d", 
                  model_cfg.action_horizon, model_cfg.action_dim)
     else:
-        model_cfg.use_flow_matching_head = False
+        model_cfg.use_action_expert = False
 
     # Configure proprioceptive information inclusion
     if args.mixture == "trajectory_3d_fm_overfit":
@@ -360,7 +375,7 @@ if __name__ == "__main__":
         )
         evaluation.data.persistent_workers = True
         evaluations.append(evaluation)
-    save_interval_unsharded = 7500 if not args.finetune else 3000
+    save_interval_unsharded = 7500 if not args.finetune else 5000
     cfg = TrainConfig(
         run_name="affordance_train",
         no_pre_train_checkpoint=True,
@@ -394,16 +409,21 @@ if __name__ == "__main__":
         ft_connector=True,
         ft_llm=True,
         ft_vit=True,
+        # ft_connector=False,
+        # ft_llm=False,
+        # ft_vit=False,
         optimizer=OptimizerConfig(
             name=OptimizerType.adamw,
             connector_learning_rate=5e-6,
             vit_learning_rate=5e-6,
             llm_learning_rate=1e-5,
             flow_matching_learning_rate=5e-5,
+            # flow_matching_learning_rate=5e-2,
             connector_weight_decay=0.0,
             vit_weight_decay=0.0,
             llm_weight_decay=0.0,
-            flow_matching_weight_decay=1e-10,
+            # flow_matching_weight_decay=1e-10,
+            flow_matching_weight_decay=0,
             connector_betas=[0.9, 0.95],
             vit_betas=[0.9, 0.95],
             llm_betas=[0.9, 0.95],
@@ -419,7 +439,7 @@ if __name__ == "__main__":
             connector_t_warmup=200,
             vit_t_warmup=200,
             llm_t_warmup=200,
-            flow_matching_t_warmup=1000,
+            flow_matching_t_warmup=100,
             alpha_f=0.1,
             warmup_min_lr=0.0
         ),
@@ -449,6 +469,7 @@ if __name__ == "__main__":
         softmax_auxiliary_loss=True,
         softmax_auxiliary_loss_scale=1e-4,
         activation_checkpointing=ActivationCheckpointingStrategy.whole_layer,
+        # activation_checkpointing=ActivationCheckpointingStrategy.fine_grained,
         eval_interval=eval_interval,
         inf_eval_interval=inf_eval_interval,
         inf_evaluators=evaluations,
