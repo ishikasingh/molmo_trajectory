@@ -775,6 +775,11 @@ class ModelConfig(BaseConfig):
     When True, the model can process action tokens for flow matching.
     """
 
+    use_direct_trajectory_prediction: bool = False
+    """
+    If True, use the action expert to predict the trajectory directly instead of flow matching velocity.
+    """
+
     action_dim: int = 30
     """
     Dimension of each action vector (e.g., 7 joint velocities + 1 gripper).

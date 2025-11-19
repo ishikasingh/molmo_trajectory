@@ -47,17 +47,8 @@ class FlowMatchingTrajectoryLoss(nn.Module):
     the velocity field of trajectories interpolating between noise and ground truth.
     """
 
-    def __init__(self, velocity_weighting: str = "none"):
-        """
-        Args:
-            velocity_weighting: How to weight the loss. Options:
-                - "none": uniform weighting
-                - "t": weight by time (weight = t) to emphasize later steps
-                - "inverse_t": weight by 1-t to emphasize earlier steps
-        """
+    def __init__(self):
         super().__init__()
-        assert velocity_weighting in ["none", "t", "inverse_t"]
-        self.velocity_weighting = velocity_weighting
 
     def forward(
         self,
@@ -109,16 +100,6 @@ class FlowMatchingTrajectoryLoss(nn.Module):
 
         # MSE loss between predicted and true velocity
         velocity_loss = F.mse_loss(predicted_velocity, true_velocity, reduction="none")
-
-        # Apply time weighting if specified
-        if self.velocity_weighting == "t":
-            # Expand t to match loss dimensions
-            weights = t.view(-1, *([1] * (velocity_loss.dim() - 1)))
-            velocity_loss = velocity_loss * weights
-        elif self.velocity_weighting == "inverse_t":
-            # Weight earlier steps more heavily
-            weights = (1.0 - t).view(-1, *([1] * (velocity_loss.dim() - 1)))
-            velocity_loss = velocity_loss * weights
 
         # Check if loss is reasonable before returning
         mean_loss = velocity_loss.mean()

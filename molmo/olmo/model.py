@@ -1809,6 +1809,12 @@ class ActionExpertTransformer(nn.Module):
             bias=config.include_bias,
             device=config.init_device
         )
+
+        # Trajectory queries for direct prediction
+        if config.use_direct_trajectory_prediction:
+            self.trajectory_queries = nn.Parameter(
+                 torch.empty(1, config.action_horizon, config.action_expert_d_model, device=config.init_device)
+            )
         
         # Use default PyTorch initialization (no custom init)
     
@@ -1864,6 +1870,10 @@ class ActionExpertTransformer(nn.Module):
             layer_id=None,
             type_of_module=ModuleType.final_out
         )
+
+        # Initialize trajectory queries
+        if self.config.use_direct_trajectory_prediction:
+            nn.init.normal_(self.trajectory_queries, std=self.config.initializer_range)
     
     def set_activation_checkpointing(self, strategy: Optional[ActivationCheckpointingStrategy]):
         """Enable activation checkpointing for action expert blocks."""
@@ -1900,6 +1910,18 @@ class ActionExpertTransformer(nn.Module):
         action_embeddings = F.silu(self.time_mlp_out(combined))  # (B, H, D_action)
         
         return action_embeddings
+
+    def embed_trajectory_queries(self, batch_size: int) -> torch.Tensor:
+        """
+        Embed learnable trajectory queries.
+        
+        Args:
+            batch_size: batch size
+            
+        Returns:
+            action_embeddings: (batch_size, action_horizon, action_expert_d_model)
+        """
+        return self.trajectory_queries.expand(batch_size, -1, -1)
     
     def predict_velocity(self, action_hidden_states: torch.Tensor) -> torch.Tensor:
         """
@@ -2622,6 +2644,19 @@ class Molmo(nn.Module):
         :param use_cache: If `True`, return key and value tensors for each block.
         :param last_logits_only: If `True`, only compute the logits for the last token of each sequence.
             This can speed up decoding when you only care about the next token.
+
+        in my specific application
+        past_key_values: None
+        use_cache: None
+        last_logits_only:False
+        output_hidden_states: None
+        append_last_valid_logits: None
+        attention_mask: None
+        attention_bias: None
+        response_mask: False for all
+        subsegment_ids: None
+        position_ids: as what is supposed to be , not none
+
         """
         output_hidden_states = output_hidden_states if output_hidden_states is not None else False
 
@@ -2705,17 +2740,21 @@ class Molmo(nn.Module):
             x = x * (self.config.d_model ** 0.5)
 
         # Flow matching: Prepare action expert processing (OpenPI-style)
-        has_action_tokens = noisy_actions is not None and self.action_expert is not None
+        has_action_tokens = (noisy_actions is not None or self.config.use_direct_trajectory_prediction) and self.action_expert is not None
         action_hidden = None
         action_position_ids = None
         velocity_output = None  # Will be set during action expert processing if has_action_tokens
         
         if has_action_tokens:
-            # Embed noisy actions through action expert's input layers
-            # This gives us action embeddings in action_expert_d_model dimension
-            action_hidden = self.action_expert.embed_actions_with_time(
-                noisy_actions, action_timestep
-            )  # (batch_size, action_horizon, action_expert_d_model)
+            if self.config.use_direct_trajectory_prediction:
+                # Direct trajectory prediction: use learnable queries
+                action_hidden = self.action_expert.embed_trajectory_queries(batch_size)
+            else:
+                # Embed noisy actions through action expert's input layers
+                # This gives us action embeddings in action_expert_d_model dimension
+                action_hidden = self.action_expert.embed_actions_with_time(
+                    noisy_actions, action_timestep
+                )  # (batch_size, action_horizon, action_expert_d_model)
 
             # Ensure concatenated prefix + action tokens do not exceed configured limit
             total_sequence_length = seq_len + action_hidden.shape[1]
@@ -2793,7 +2832,6 @@ class Molmo(nn.Module):
             prefix_hidden = x  # (B, prefix_len, d_model)
             prefix_len = prefix_hidden.shape[1]  # Save for later: separate prefix from action tokens
             # action_hidden already initialized above: (B, action_horizon, action_expert_d_model)
-            
             # Prepare merged position IDs for attention (covers full sequence)
             merged_position_ids = None
             if self.config.use_position_ids and position_ids is not None and action_position_ids is not None:
@@ -2807,10 +2845,17 @@ class Molmo(nn.Module):
                 action_len = action_hidden.shape[1]
                 total_len = prefix_len + action_len
                 
-                # Start with causal mask for prefix
+                # Start with causal mask for full sequence (prefix + action)
                 merged_attention_bias = get_causal_attention_bias(
                     self.__cache, total_len, x.device
                 ).to(dtype=torch.float)
+                
+                # Copy prefix portion from existing attention_bias (which already has causal + padding mask)
+                # This preserves the padding mask that was added to attention_bias
+                # attention_bias shape: (batch_size, 1, seq_len, seq_len) where seq_len may include padding
+                # We need to extract the prefix_len x prefix_len portion
+                prefix_attn_bias = attention_bias[:, :, :prefix_len, :prefix_len]
+                merged_attention_bias[:, :, :prefix_len, :prefix_len] = prefix_attn_bias
                 
                 # Action tokens (rows) can attend to all tokens (columns)
                 # Set action rows to 0 (full attention)
@@ -2892,10 +2937,7 @@ class Molmo(nn.Module):
                 # Cache handling
                 if attn_key_values is not None:
                     attn_key_values.append(prefix_cache if prefix_cache is not None else cache)
-            
-            # Apply final layer norm before producing action-specific outputs
-            # action_hidden = self.action_expert.ln_final(action_hidden)
-            
+                        
             # After all layers, compute velocity predictions from action_hidden (before projection)
             # This uses action_expert_d_model directly, avoiding unnecessary projection to d_model
             velocity_output = self.action_expert.predict_velocity(action_hidden)
@@ -3009,13 +3051,16 @@ class Molmo(nn.Module):
         initial_noise: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Sample actions using flow matching with ODE integration.
+        Sample actions using flow matching with ODE integration OR direct prediction.
         
         This implements the inference procedure from openpi's Pi0:
         1. Cache the prefix (text/image) keys and values
         2. Start from noise at t=1
         3. Integrate ODE with Euler steps: x_t = x_t + dt * v_t
         4. Return denoised actions at t=0
+
+        If use_direct_trajectory_prediction is True, it performs a single forward pass
+        to predict the trajectory directly.
         
         Args:
             input_ids: Text input token IDs (batch_size, seq_len)
@@ -3029,7 +3074,21 @@ class Molmo(nn.Module):
         Returns:
             actions: Predicted actions (batch_size, action_horizon, action_dim)
         """
-        
+        # Direct trajectory prediction case
+        if self.config.use_direct_trajectory_prediction:
+            with torch.autocast("cuda", enabled=False):
+                output = self(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    images=images,
+                    image_masks=image_masks,
+                    image_input_idx=image_input_idx,
+                    use_cache=False,
+                    noisy_actions=None,
+                    action_timestep=None,
+                )
+            return output.velocity_output
+
         batch_size = input_ids.shape[0]
         device = input_ids.device
         num_steps = num_steps or self.config.flow_matching_num_steps
