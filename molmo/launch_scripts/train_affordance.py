@@ -246,10 +246,6 @@ if __name__ == "__main__":
     elif args.mixture == "trajectory_3d_text":
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d_text"], 1.0]]
-    elif args.mixture == "trajectory_2d_fm":
-        # Flow matching based 2D trajectory prediction
-        eval_tasks = []
-        tasks = [["egodex", ["trajectory_2d_fm"], 1.0]]
     elif args.mixture == "trajectory_3d_fm":
         # Flow matching based 3D trajectory prediction
         eval_tasks = []
@@ -415,7 +411,7 @@ if __name__ == "__main__":
             action_chunking_horizon=model_cfg.action_horizon,
             drop_last=True,
             sequence_length=args.seq_len,
-            num_workers=2,
+            num_workers=32,  # Increased from 2 to 32 to enable parallel loading
             pad="to_max",
             shuffle_messages=True,
             pin_memory=True,

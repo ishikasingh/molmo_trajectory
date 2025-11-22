@@ -366,16 +366,6 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
             normalize_coordinates=True,
             output_format="text"
         )
-    elif dataset_name == "trajectory_2d_fm":
-        data_dir = os.environ.get("EGODEX_DATA_DIR")
-        return TrajectoryDataset(
-            data_dir=data_dir,
-            split=split,
-            action_chunking_horizon=horizon,
-            output_2d_trajectory=True,
-            normalize_coordinates=True,
-            output_format="flow_matching"
-        )
     elif dataset_name == "trajectory_3d_text":
         data_dir = os.environ.get("EGODEX_DATA_DIR")
         return TrajectoryDataset(
@@ -388,7 +378,8 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
         )
     elif dataset_name == "trajectory_3d_fm":
         data_dir = os.environ.get("EGODEX_DATA_DIR")
-        stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
+        # stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
+        stats_file = None # currently only for delta representation
         return TrajectoryDataset(
             data_dir=data_dir,
             split=split,
@@ -410,17 +401,6 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
             output_2d_trajectory=True,
             normalize_coordinates=True,
             output_format="text",
-            trajectory_representation="delta"
-        )
-    elif dataset_name == "trajectory_2d_delta_fm":
-        data_dir = os.environ.get("EGODEX_DATA_DIR")
-        return TrajectoryDataset(
-            data_dir=data_dir,
-            split=split,
-            action_chunking_horizon=horizon,
-            output_2d_trajectory=True,
-            normalize_coordinates=True,
-            output_format="flow_matching",
             trajectory_representation="delta"
         )
     elif dataset_name == "trajectory_3d_delta_text":

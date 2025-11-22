@@ -103,6 +103,7 @@ class TrajectoryDataset(Dataset):
         output_format: str = "text",  # "text" or "flow_matching"
         frame_downsampling_ratio: int = 15,  # Sample every n frames (1 = no downsampling, 10 = every 10 frames)
         trajectory_representation: str = "absolute",  # "absolute" or "delta" (velocity: v_t = x_{t+1} - x_t)
+        load_images: bool = True,
     ):
         # Get data directory from environment variable if not provided
         if data_dir is None:
@@ -122,6 +123,7 @@ class TrajectoryDataset(Dataset):
         self.frame_downsampling_ratio = frame_downsampling_ratio
         self.trajectory_representation = trajectory_representation
         self.overfit_num_examples = type(self).overfit_num_examples
+        self.load_images = load_images
         
         assert output_format in ["text", "flow_matching"], f"output_format must be 'text' or 'flow_matching', got {output_format}"
         assert frame_downsampling_ratio >= 1, f"frame_downsampling_ratio must be >= 1, got {frame_downsampling_ratio}"
@@ -132,7 +134,7 @@ class TrajectoryDataset(Dataset):
         if self.normalize_coordinates and not self.output_2d_trajectory:
             if self.stats_file is None:
                 raise ValueError("stats_file must be provided when normalize_coordinates is True and output_2d_trajectory is False")
-            print(f"Loading trajectory stats from {self.stats_file}...")
+            print(f"Loading trajectory normalizationstats from {self.stats_file}...")
             stats = torch.load(self.stats_file)
             self.stats_mean = stats["mean"]
             self.stats_std = stats["std"]
@@ -328,13 +330,21 @@ class TrajectoryDataset(Dataset):
         """Get a single training example."""
         mapping = self.index_mapping[idx]
         
-        image = self._load_frame(mapping['video_path'], mapping['frame_idx'])
-        trajectory = self._load_trajectory(mapping['hdf5_path'], mapping['frame_idx'], self.action_chunking_horizon)
+        video_path = mapping['video_path']
+        hdf5_path = mapping['hdf5_path']
+        
+        if self.load_images:
+            image = self._load_frame(video_path, mapping['frame_idx'])
+        else:
+            # Return dummy image (1x1 pixel black image)
+            image = Image.fromarray(np.zeros((1, 1, 3), dtype=np.uint8))
+            
+        trajectory = self._load_trajectory(hdf5_path, mapping['frame_idx'], self.action_chunking_horizon)
         
         if self.output_2d_trajectory:
-            final_trajectory = self._project_trajectory_to_2d(mapping['hdf5_path'], mapping['frame_idx'], trajectory)
+            final_trajectory = self._project_trajectory_to_2d(hdf5_path, mapping['frame_idx'], trajectory)
         else:
-            final_trajectory = self._transform_trajectory_to_camera_frame(mapping['hdf5_path'], mapping['frame_idx'], trajectory)
+            final_trajectory = self._transform_trajectory_to_camera_frame(hdf5_path, mapping['frame_idx'], trajectory)
         
         # Save initial state before converting to delta (if applicable)
         # The state should always be absolute position, even when predicting deltas
@@ -360,7 +370,7 @@ class TrajectoryDataset(Dataset):
             
             final_trajectory = (final_trajectory - mean) / std
 
-        instruction = self._load_instruction(mapping['hdf5_path'])
+        instruction = self._load_instruction(hdf5_path)
         
         if isinstance(final_trajectory, torch.Tensor):
             final_trajectory = final_trajectory.numpy()
@@ -373,7 +383,9 @@ class TrajectoryDataset(Dataset):
         
         # Determine style based on output format and trajectory representation
         if self.output_2d_trajectory:
-            style = 'trajectory_2d_text' if self.output_format == "text" else 'trajectory_2d_fm'
+            if self.output_format == "flow_matching":
+                raise ValueError("trajectory_2d_fm and trajectory_2d_delta_fm modes have been removed. Use trajectory_2d_text or trajectory_3d_fm instead.")
+            style = 'trajectory_2d_text'
         else:
             style = 'trajectory_3d_text' if self.output_format == "text" else 'trajectory_3d_fm'
         

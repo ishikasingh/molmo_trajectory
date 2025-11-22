@@ -28,7 +28,8 @@ def compute_stats(
         trajectory_representation=trajectory_representation,
         output_2d_trajectory=False,
         normalize_coordinates=False, # Disable normalization to compute raw stats
-        frame_downsampling_ratio=1, # Use all frames for stats
+        frame_downsampling_ratio=1, # Use all frames for stats,
+        load_images=False, # Use new flag to avoid loading images
     )
     
     total_samples = len(dataset.index_mapping)
@@ -43,50 +44,59 @@ def compute_stats(
         rng = np.random.RandomState(42)
         indices = rng.choice(total_samples, size=sample_size, replace=False)
     
+    # Use subset indices
+    subset = torch.utils.data.Subset(dataset, indices)
+    
+    # Create DataLoader with multiple workers to hide latency
+    # Use collate_fn=lambda x: x to get a list of dicts, or write a custom one
+    loader = torch.utils.data.DataLoader(
+        subset,
+        batch_size=batch_size, # Process in batches
+        num_workers=16,  # Increase workers for parallel I/O
+        collate_fn=lambda x: x, # Simple collate (returns list of items)
+        shuffle=False
+    )
+    
     # Lists to store processed trajectories
     all_trajectories = []
     
-    print("Processing samples...")
+    print(f"Processing samples with {loader.num_workers} workers...")
     valid_samples = 0
     
-    for idx in tqdm(indices, desc="Computing stats"):
-        try:
-            mapping = dataset.index_mapping[idx]
-            
-            # Load trajectory (HDF5) - logic copied/adapted from TrajectoryDataset.get()
-            # We don't load the image
-            
-            # 1. Load raw trajectory
-            trajectory = dataset._load_trajectory(
-                mapping['hdf5_path'], 
-                mapping['frame_idx'], 
-                dataset.action_chunking_horizon
-            )
-            
-            # 2. Transform to camera frame (since output_2d_trajectory=False)
-            final_trajectory = dataset._transform_trajectory_to_camera_frame(
-                mapping['hdf5_path'], 
-                mapping['frame_idx'], 
-                trajectory
-            )
-            
-            # 3. Convert to delta if needed
-            if dataset.trajectory_representation == "delta":
-                final_trajectory = dataset._convert_to_delta_representation(final_trajectory)
+    for batch in tqdm(loader, desc="Computing stats"):
+        for item in batch:
+            try:
+                # Extract trajectory from item['message_list'][0]['points']
+                # The dataset.get() method returns 'points' which is the final_trajectory
                 
-            if isinstance(final_trajectory, torch.Tensor):
-                final_trajectory = final_trajectory.numpy()
-            
-            # 4. Reshape: [num_steps, num_joints, 3] -> [num_steps, num_joints * 3]
-            num_steps = final_trajectory.shape[0]
-            trajectory_flat = final_trajectory.reshape(num_steps, -1).astype(np.float32)
-            
-            all_trajectories.append(trajectory_flat)
-            valid_samples += 1
-            
-        except Exception as e:
-            print(f"Error processing sample {idx}: {e}")
-            continue
+                # The item structure from TrajectoryDataset.get():
+                # {
+                #     'image': image,
+                #     'message_list': [
+                #         {
+                #             'points': final_trajectory, 
+                #             ...
+                #         }
+                #     ],
+                #     ...
+                # }
+                
+                final_trajectory = item['message_list'][0]['points']
+                
+                # Ensure it's numpy array
+                if isinstance(final_trajectory, torch.Tensor):
+                    final_trajectory = final_trajectory.numpy()
+                
+                # Reshape: [num_steps, num_joints, 3] -> [num_steps, num_joints * 3]
+                num_steps = final_trajectory.shape[0]
+                trajectory_flat = final_trajectory.reshape(num_steps, -1).astype(np.float32)
+                
+                all_trajectories.append(trajectory_flat)
+                valid_samples += 1
+                
+            except Exception as e:
+                print(f"Error processing sample: {e}")
+                continue
             
     if valid_samples == 0:
         raise ValueError("No valid samples found to compute stats!")
@@ -144,4 +154,3 @@ if __name__ == "__main__":
         sample_size=args.sample_size,
         output_file=args.output_file
     )
-

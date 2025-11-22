@@ -609,7 +609,7 @@ class DataFormatter:
             # Text-based trajectory output (legacy format)
             trajectory_data = points
             point_txt = self.trajectory_to_text(trajectory_data, 100, label, label)
-        elif style in ["trajectory_2d_fm", "trajectory_3d_fm"]:
+        elif style == "trajectory_3d_fm":
             # Flow matching trajectory output (dummy marker token)
             trajectory_data = points
             point_txt = self.trajectory_to_dummy_text(trajectory_data.shape if hasattr(trajectory_data, 'shape') else None)
@@ -768,7 +768,7 @@ class DataFormatter:
                 if style == "long_caption":
                     prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1["long_caption"], example, rng, dbg=self.debug)
                 elif style in ["pointing", "point_count", "affordance", "affordance_new", "trajectory_2d_text", "trajectory_3d_text",
-                "trajectory_2d_fm", "trajectory_3d_fm"]:
+                "trajectory_3d_fm"]:
                     # output, prompt, metadata = self.format_points(example)
                     if "question" in example:
                         prompt = example["question"]
@@ -780,12 +780,12 @@ class DataFormatter:
                         prompt_style = style
                         if style == "affordance_new":
                             prompt_style = "affordance"
-                        if style in ["trajectory_2d_text", "trajectory_3d_text", "trajectory_2d_fm", "trajectory_3d_fm"]:
+                        if style in ["trajectory_2d_text", "trajectory_3d_text", "trajectory_3d_fm"]:
                             prompt_style = "trajectory"
                         prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1[prompt_style], dict(example, label=prompt), rng, dbg=self.debug)
                     
                     # Add robot state information to the prompt for trajectory tasks
-                    if style in ["trajectory_2d_text", "trajectory_3d_text", "trajectory_2d_fm", "trajectory_3d_fm"] and "state" in example and self.include_proprio:
+                    if style in ["trajectory_2d_text", "trajectory_3d_text", "trajectory_3d_fm"] and "state" in example and self.include_proprio:
                         # Transform the robot state to text format and prepend to the prompt
                         state_scale = example.get("point_scale", 100)
                         state_text = self.state_to_text(example["state"], state_scale)

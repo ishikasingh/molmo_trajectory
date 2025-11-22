@@ -2849,6 +2849,10 @@ class Molmo(nn.Module):
                 merged_attention_bias = get_causal_attention_bias(
                     self.__cache, total_len, x.device
                 ).to(dtype=torch.float)
+
+                # Expand to match batch size if necessary (since we'll copy batch-specific prefix bias)
+                if attention_bias.shape[0] > 1:
+                    merged_attention_bias = merged_attention_bias.repeat(attention_bias.shape[0], 1, 1, 1)
                 
                 # Copy prefix portion from existing attention_bias (which already has causal + padding mask)
                 # This preserves the padding mask that was added to attention_bias
