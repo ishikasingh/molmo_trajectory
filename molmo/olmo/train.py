@@ -300,7 +300,7 @@ class Trainer:
         # BEFORE FSDP wrapping to ensure proper weight synchronization across nodes
         self.trajectory_loss_fn: Optional[FlowMatchingTrajectoryLoss] = None
         if self.model.config.use_action_expert:
-            self.trajectory_loss_fn = FlowMatchingTrajectoryLoss(velocity_weighting="none")
+            self.trajectory_loss_fn = FlowMatchingTrajectoryLoss()
             self.trajectory_loss_fn = self.trajectory_loss_fn.to(self.device)
 
     @property
@@ -819,34 +819,40 @@ class Trainer:
                     f"with shape {trajectory_target.shape}"
                 )
             
-            # Sample time from Beta(1.5, 1) distribution and clip to [0.001, 0.999]
-            # This follows openpi's approach for stable training
-            t = torch.distributions.Beta(1.5, 1.0).sample((batch_size,)).to(device)
-            t = t * 0.999 + 0.001
+            # DEBUG MODE: Set to True to only sample t = 1 (pure noise)
+            DEBUG_FLOW_MATCHING = False
             
-            # Sample noise from standard normal
-            noise = torch.randn_like(trajectory_target)
-            
-            # IMPORTANT: If trajectory values are very large (e.g., > 10 in magnitude), 
-            # consider normalizing them before training. You can track statistics here:
-            traj_abs_max = trajectory_target.abs().max().item()
-            if traj_abs_max > 100:
-                log.warning(
-                    f"[FLOW MATCHING WARNING] trajectory_target has very large values (max abs: {traj_abs_max:.2f}). "
-                    f"Consider normalizing trajectory data to [-1, 1] or similar range for better numerical stability."
-                )
-            
-            # Interpolate: x_t = t * noise + (1 - t) * target
-            # Expand t for broadcasting: (batch_size,) -> (batch_size, 1, 1)
-            t_expanded = t.view(batch_size, 1, 1)
-            noisy_actions = t_expanded * noise + (1 - t_expanded) * trajectory_target
-            action_timestep = t
+            if self.cfg.model.use_direct_trajectory_prediction:
+                # Direct trajectory prediction mode: no noise injection
+                noisy_actions = None
+                action_timestep = None
+            else:
+                # Sample time from Beta(1.5, 1) distribution and clip to [0.001, 0.999]
+                # This follows openpi's approach for stable training
+                if DEBUG_FLOW_MATCHING:
+                    t = torch.ones(batch_size, device=device) * 0.999  # t = 1 (pure noise)
+                else:
+                    t = torch.distributions.Beta(1.5, 1.0).sample((batch_size,)).to(device)
+                    t = t * 0.999 + 0.001
+                
+                # Sample noise from standard normal
+                noise = torch.randn_like(trajectory_target)
+                
+                # IMPORTANT: If trajectory values are very large (e.g., > 10 in magnitude), 
+                # consider normalizing them before training. You can track statistics here:
+                # traj_abs_max = trajectory_target.abs().max().item()
+                
+                # Interpolate: x_t = t * noise + (1 - t) * target
+                # Expand t for broadcasting: (batch_size,) -> (batch_size, 1, 1)
+                t_expanded = t.view(batch_size, 1, 1)
+                noisy_actions = t_expanded * noise + (1 - t_expanded) * trajectory_target
+                action_timestep = t
 
-            # log.info(f"[FLOW MATCHING DEBUG] Prepared noisy actions: t_mean={t.mean():.3f}, noise_std={noise.std():.3f}")
-            
-            # Store for loss computation
-            batch['flow_matching_time'] = t
-            batch['flow_matching_noise'] = noise
+                # log.info(f"[FLOW MATCHING DEBUG] Prepared noisy actions: t_mean={t.mean():.3f}, noise_std={noise.std():.3f}")
+                
+                # Store for loss computation
+                batch['flow_matching_time'] = t
+                batch['flow_matching_noise'] = noise
         
         # shape: (batch_size, seq_len, vocab_size)
         # Note: Like OpenPI, we compute BOTH text logits (from prefix tokens) and velocity output (from action tokens)
@@ -874,43 +880,17 @@ class Trainer:
         accuracy = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
         
         # Handle CE loss based on batch type
-        if has_trajectory:
-            # Trajectory batches: check if using flow matching or text output
-            if output.velocity_output is not None:
-                # Flow matching mode: skip CE loss, use velocity_output loss
-                # (logits are still computed but not supervised, like OpenPI)
-                pass
-            elif "labels" in batch:
-                # Text-based trajectory output: compute CE loss on text tokens
-                assert "loss_masks" in batch
-                assert loss_reduction == "none"
-                loss_masks = batch["loss_masks"] * (batch["loss_masks"] > 0)
-                labels = batch["labels"].long()
-                labels.masked_fill_(~(loss_masks > 0), -100)
-                labels = labels.view(-1)
-                logits_for_loss = logits.to(torch.float32).view(-1, logits.size(-1)) # for numerical stability
-                ce_loss, z_loss = self.loss_fn(
-                    logits_for_loss, labels, ignore_index=-100, reduction=loss_reduction,
-                    compute_z_loss=compute_z_loss, z_loss_scale=self.cfg.softmax_auxiliary_loss_scale,
-                )
-                bs = batch["input_ids"].shape[0]
-                if loss_reduction == "none":
-                    # Reshape (batch_size * seq_len,) -> (batch_size, seq_len)
-                    ce_loss = ce_loss.view(bs, -1)
-                    if z_loss is not None:
-                        z_loss = z_loss.view(bs, -1)
-
-                accuracy = torch.argmax(logits_for_loss, dim=-1) == labels
-                ce_loss = ce_loss * loss_masks
-                if z_loss is not None:
-                    z_loss = z_loss * loss_masks
-                accuracy = accuracy.view(bs, -1)
-                accuracy = accuracy * loss_masks
-            else:
-                # Trajectory batches without labels: skip CE loss
-                pass
+        # Validate: trajectory batches must have either flow matching or labels
+        if has_trajectory and output.velocity_output is None and "labels" not in batch:
+            raise ValueError("Trajectory batch without velocity_output must have labels")
+        
+        if has_trajectory and output.velocity_output is not None:
+            # Flow matching mode: skip CE loss, use velocity_output loss
+            # (logits are still computed but not supervised, like OpenPI)
+            pass
         elif "labels" in batch:
-            # VLM tasks with labeled targets: compute CE loss
+            # Text-based tasks with labeled targets: compute CE loss
+            # This handles both text-based trajectory output and VLM tasks
             assert "loss_masks" in batch
             assert loss_reduction == "none"
             loss_masks = batch["loss_masks"] * (batch["loss_masks"] > 0)
@@ -971,22 +951,27 @@ class Trainer:
             # velocity_output is in autocast dtype (bfloat16), but loss computation happens outside autocast
             velocity_pred = output.velocity_output.to(torch.float32)
             
-            # Get the ground truth actions and the time/noise used during forward pass
-            # These should have been passed to the forward method
-            # Ensure all tensors are in float32 for consistent dtype in loss computation
-            trajectory_target = batch['trajectory_target'].to(torch.float32)  # (batch_size, action_horizon, action_dim)
-            t = batch['flow_matching_time'].to(torch.float32)  # (batch_size,) - sampled in model_forward
-            noise = batch['flow_matching_noise'].to(torch.float32)  # (batch_size, action_horizon, action_dim)
-            
-            # Check for NaN/Inf before loss computation
-            if torch.isnan(velocity_pred).any() or torch.isinf(velocity_pred).any():
-                log.error(f"[FLOW MATCHING ERROR] velocity_pred contains NaN or Inf! NaN: {torch.isnan(velocity_pred).sum().item()}, Inf: {torch.isinf(velocity_pred).sum().item()}")
-            trajectory_loss = self.trajectory_loss_fn(
-                predicted_velocity=velocity_pred,
-                trajectory_target=trajectory_target,
-                t=t,
-                noise=noise
-            )
+            if self.cfg.model.use_direct_trajectory_prediction:
+                # Direct trajectory prediction loss (MSE against GT)
+                trajectory_target = batch['trajectory_target'].to(torch.float32)
+                trajectory_loss = F.mse_loss(velocity_pred, trajectory_target)
+            else:
+                # Get the ground truth actions and the time/noise used during forward pass
+                # These should have been passed to the forward method
+                # Ensure all tensors are in float32 for consistent dtype in loss computation
+                trajectory_target = batch['trajectory_target'].to(torch.float32)  # (batch_size, action_horizon, action_dim)
+                t = batch['flow_matching_time'].to(torch.float32)  # (batch_size,) - sampled in model_forward
+                noise = batch['flow_matching_noise'].to(torch.float32)  # (batch_size, action_horizon, action_dim)
+                
+                # Check for NaN/Inf before loss computation
+                if torch.isnan(velocity_pred).any() or torch.isinf(velocity_pred).any():
+                    log.error(f"[FLOW MATCHING ERROR] velocity_pred contains NaN or Inf! NaN: {torch.isnan(velocity_pred).sum().item()}, Inf: {torch.isinf(velocity_pred).sum().item()}")
+                trajectory_loss = self.trajectory_loss_fn(
+                    predicted_velocity=velocity_pred,
+                    trajectory_target=trajectory_target,
+                    t=t,
+                    noise=noise
+                )
 
             # log.info(f"[FLOW MATCHING DEBUG] Flow matching loss computed: {trajectory_loss.item():.6f}")
         

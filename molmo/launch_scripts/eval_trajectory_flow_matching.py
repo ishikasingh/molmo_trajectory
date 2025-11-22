@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Evaluation script for flow matching trajectory predictions.
-Supports both 2D and 3D trajectory tasks using ODE-based sampling.
+Evaluation script for trajectory predictions.
+Supports both flow matching (ODE sampling) and direct regression modes in 2D or 3D.
 """
 
 import argparse
@@ -415,7 +415,7 @@ def load_test_examples(task_type: str, num_examples: int = 10,
         split="overfit",
         action_chunking_horizon=action_chunking_horizon,
         output_2d_trajectory=output_2d,
-        normalize_2d_coordinates=True,
+        normalize_coordinates=False, # Only normalize for 2D unless stats are provided/handled
         output_format="flow_matching",  # Use flow matching format
         trajectory_representation=trajectory_representation,
         frame_downsampling_ratio=30,
@@ -475,7 +475,7 @@ def load_test_examples(task_type: str, num_examples: int = 10,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate flow matching trajectory head predictions"
+        description="Evaluate trajectory predictions (flow matching or direct regression)"
     )
     parser.add_argument("checkpoint", type=str, help="Path to model checkpoint directory")
     parser.add_argument("--task_type", type=str, choices=['2d', '3d'], required=True,
@@ -485,7 +485,7 @@ def main():
     parser.add_argument("--action_chunking_horizon", type=int, default=30,
                        help="Number of timesteps in trajectory")
     parser.add_argument("--num_ode_steps", type=int, default=10,
-                       help="Number of ODE integration steps for flow matching")
+                       help="Number of ODE integration steps for flow matching (ignored for direct prediction)")
     parser.add_argument("--device", type=str, default="cuda",
                        help="Device to run the model on")
     parser.add_argument("--output_dir", type=str, default="trajectory_flow_matching_output",
@@ -497,6 +497,10 @@ def main():
     parser.add_argument("--trajectory_representation", type=str, default="absolute",
                        choices=["absolute", "delta"],
                        help="Trajectory representation mode: 'absolute' positions or 'delta' (velocity)")
+    parser.add_argument("--save_3d_trajectory", action="store_true",
+                       help="Save 3D trajectory data to .npz file (only for 3d task_type)")
+    parser.add_argument("--normalize_coordinates", action="store_true",
+                       help="Whether the model was trained with normalized coordinates (requires TRAJECTORY_STATS_FILE env var)")
     
     args = parser.parse_args()
     
@@ -527,7 +531,23 @@ def main():
     
     # Load camera intrinsic for 3D tasks
     intrinsic = None
+    stats_mean = None
+    stats_std = None
+    
     if args.task_type == '3d':
+        # Load stats if normalization was used
+        if args.normalize_coordinates:
+            stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
+            if stats_file and os.path.exists(stats_file):
+                print(f"Loading trajectory stats from {stats_file}")
+                stats = torch.load(stats_file, map_location="cpu")
+                stats_mean = stats["mean"].numpy()
+                stats_std = stats["std"].numpy()
+                print("Loaded mean/std for denormalization")
+            else:
+                print("WARNING: normalize_coordinates is True but TRAJECTORY_STATS_FILE not set or not found!")
+                print("Model predictions will NOT be denormalized (results may be incorrect)")
+            
         if args.camera_intrinsic and os.path.exists(args.camera_intrinsic):
             intrinsic = np.load(args.camera_intrinsic)
             print(f"Loaded camera intrinsic from {args.camera_intrinsic}")
@@ -582,28 +602,45 @@ def main():
         if "image_masks" in batch:
             image_masks = torch.tensor(batch["image_masks"]).unsqueeze(0).to(device)
         
-        # Generate trajectory using flow matching
-        print("Sampling trajectory using flow matching ODE...")
+        # Extract position_ids from batch if available
+        position_ids = None
+        if "position_ids" in batch:
+            position_ids = torch.tensor(batch["position_ids"], dtype=torch.long).unsqueeze(0).to(device)
+        
+        # Generate trajectory
+        is_direct_prediction = getattr(model.config, "use_direct_trajectory_prediction", False)
+        if is_direct_prediction:
+            print("Predicting trajectory directly (regression)...")
+        else:
+            print(f"Sampling trajectory using flow matching ODE (steps={args.num_ode_steps})...")
+
         start_time = time.time()
         with torch.no_grad():
             pred_trajectory = model.sample_actions_flow_matching(
                 input_ids=input_ids,
-                attention_mask=attention_mask,
+                attention_mask=None,
                 images=images,
                 image_masks=image_masks,
                 image_input_idx=image_input_idx,
                 num_steps=args.num_ode_steps,
                 initial_noise=None,
+                position_ids=position_ids,
             )
         end_time = time.time()
-        print(f"Time taken for sampling: {end_time - start_time:.2f} seconds")
+        print(f"Time taken for prediction: {end_time - start_time:.2f} seconds")
         
         # Convert to numpy
         if isinstance(pred_trajectory, torch.Tensor):
             pred_trajectory = pred_trajectory.cpu().numpy()
-        
-        print(f"Predicted trajectory shape (raw): {pred_trajectory.shape}")
-        
+            
+        # Denormalize if stats available (before reshaping, as stats are flattened)
+        if stats_mean is not None and stats_std is not None:
+            # pred_trajectory is (1, action_horizon, action_dim) or (batch_size, action_horizon, action_dim)
+            # stats are (action_dim,)
+            # Broadcast: (..., action_dim) * (action_dim,) + (action_dim,)
+            pred_trajectory = pred_trajectory * stats_std + stats_mean
+            print("Denormalized predicted trajectory")
+                
         # Reshape from (batch_size, action_horizon, action_dim) to (action_horizon, num_joints, coords_per_joint)
         # Remove batch dimension and reshape flattened coordinates
         batch_size, action_horizon, action_dim = pred_trajectory.shape
@@ -621,9 +658,7 @@ def main():
             if action_dim % 2 != 0:
                 raise ValueError(f"action_dim ({action_dim}) must be divisible by 2 for 2D trajectories")
             pred_trajectory = pred_trajectory.reshape(action_horizon, num_joints, 2)
-        
-        print(f"Predicted trajectory shape (reshaped): {pred_trajectory.shape}")
-        
+                
         # Convert delta predictions to absolute positions if needed
         trajectory_rep = example_row.get("trajectory_representation", "absolute")
         if trajectory_rep == "delta":
@@ -644,7 +679,6 @@ def main():
                 
                 # Convert delta to absolute
                 pred_trajectory = convert_delta_to_absolute(pred_trajectory, initial_state)
-                print(f"Converted to absolute trajectory. Shape: {pred_trajectory.shape}")
             else:
                 print("WARNING: Delta mode but no initial state found! Treating as absolute positions.")
                 
@@ -660,9 +694,7 @@ def main():
         if gt_trajectory_raw is not None:
             if isinstance(gt_trajectory_raw, torch.Tensor):
                 gt_trajectory_raw = gt_trajectory_raw.numpy()
-            
-            print(f"Ground truth trajectory shape: {gt_trajectory_raw.shape}")
-            
+                        
             # Reshape GT trajectory if needed (it might also be flattened)
             if len(gt_trajectory_raw.shape) == 3 and gt_trajectory_raw.shape[0] == 1:
                 # Remove batch dimension
@@ -756,11 +788,48 @@ def main():
         sanitized_task = sanitize_filename(task_name)
         sanitized_prompt = sanitize_filename(prompt[:50])
         suffix = "_with_gt" if gt_trajectory_2d is not None else ""
-        out_filename = f"{args.task_type}d_traj_fm_{sanitized_task}_{idx+1}{suffix}.jpg"
+        mode_tag = "direct" if is_direct_prediction else "fm"
+        out_filename = f"{args.task_type}d_traj_{mode_tag}_{sanitized_task}_{idx+1}{suffix}.jpg"
         out_path = output_dir / out_filename
         
         visualized_image.save(out_path)
         print(f"Saved visualization to {out_path}")
+        
+        # Save 3D trajectory data if requested (only for 3D tasks)
+        if args.task_type == '3d' and args.save_3d_trajectory:
+            # Save both predicted and ground truth 3D trajectories
+            traj_filename = f"{args.task_type}d_traj_{mode_tag}_{sanitized_task}_{idx+1}.npz"
+            traj_path = output_dir / traj_filename
+            
+            save_data = {
+                'predicted_trajectory_3d': pred_trajectory,  # Shape: (num_steps, num_joints, 3)
+                'task_name': task_name,
+                'prompt': prompt,
+                'trajectory_representation': trajectory_rep,
+                'num_steps': pred_trajectory.shape[0],
+                'num_joints': pred_trajectory.shape[1],
+            }
+            
+            # Add ground truth if available
+            if gt_trajectory_raw is not None:
+                save_data['ground_truth_trajectory_3d'] = gt_trajectory_raw
+            
+            # Add initial state if available (for delta representation)
+            if example_row.get("state") is not None:
+                initial_state = example_row.get("state")
+                if len(initial_state.shape) == 1:
+                    # Reshape to (num_joints, 3)
+                    num_joints_state = initial_state.shape[0] // 3
+                    initial_state = initial_state.reshape(num_joints_state, 3)
+                save_data['initial_state'] = initial_state
+            
+            # Add camera intrinsic if available
+            if intrinsic is not None:
+                save_data['camera_intrinsic'] = intrinsic
+            
+            np.savez(traj_path, **save_data)
+            print(f"Saved 3D trajectory data to {traj_path}")
+            metrics["trajectory_3d_file"] = traj_filename
         
         # Store metrics
         metrics["output_filename"] = out_filename

@@ -18,7 +18,7 @@ from typing import (
 
 import torch
 import torch.nn.functional as F
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig
 from omegaconf import OmegaConf as om
 from omegaconf.errors import OmegaConfBaseException
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
@@ -1240,6 +1240,9 @@ class DataConfig(BaseConfig):
 
     multi_modal: Optional[str] = "torch"
     """Kind of dataset to load, in this repo only 'torch' is supported"""
+
+    action_chunking_horizon: Optional[int] = None
+    """Trajectory dataset horizon (defaults to dataset's intrinsic setting)"""
 
     # DataLoader args
     num_workers: int = 0

@@ -114,6 +114,12 @@ if __name__ == "__main__":
                         help="whether it is a cotraining run")
     parser.add_argument("--use_transitions", default=False, action="store_true",
                         help="whether to use transitions in the affordance dataset")
+    parser.add_argument(
+        "--action_horizon",
+        type=int,
+        default=30,
+        help="Number of timesteps to predict for trajectory actions",
+    )
     args, other_args = parser.parse_known_args()
 
     # Default training split
@@ -248,6 +254,11 @@ if __name__ == "__main__":
         # Flow matching based 3D trajectory prediction
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
+    elif args.mixture == "trajectory_3d_direct":
+        # Direct 3D trajectory prediction (regression) using action expert architecture
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
+        data_split = "overfit"
     elif args.mixture in ["trajectory_3d_fm_overfit"]:
         # Flow matching 3D trajectory with overfit split
         eval_tasks = []
@@ -298,7 +309,7 @@ if __name__ == "__main__":
         inf_eval_interval = 2000
         eval_interval = 2000
         if args.finetune:
-            duration = 25000
+            duration = 60000
         else:
             duration = 30000
         model_init = args.checkpoint
@@ -320,7 +331,7 @@ if __name__ == "__main__":
     model_cfg.multi_annotation_weighting = "root_subsegments"
 
     # Enable flow matching for trajectory prediction tasks
-    if "_fm" in args.mixture:
+    if "_fm" in args.mixture or "trajectory_3d_direct" in args.mixture:
         model_cfg.use_action_expert = True
         # Configure action dimensions based on task
         # action_horizon: number of timesteps to predict (e.g., 30)
@@ -328,12 +339,15 @@ if __name__ == "__main__":
         #   For 2D trajectories: num_joints * 2
         #   For 3D trajectories: num_joints * 3
         # Example: 10 joints * 3 coords = 30 dimensions
-        # NOTE: Verify these values match your actual trajectory data!
-        model_cfg.action_horizon = 30  # Number of timesteps
+        model_cfg.action_horizon = args.action_horizon
         model_cfg.action_dim = 30      # num_joints * coordinates (currently assuming 10 joints * 3 for 3D)
         model_cfg.use_adarms_flow_matching = False  # Use Pi0-style MLP conditioning
         model_cfg.flow_matching_loss_weight = 1.0
         model_cfg.flow_matching_num_steps = 10  # ODE integration steps during inference
+        
+        if "trajectory_3d_direct" in args.mixture:
+            model_cfg.use_direct_trajectory_prediction = True
+            log.info("Enabled direct trajectory prediction mode (regression)")
         
         # Configure action expert to be smaller than VLM (OpenPI-style)
         # This reduces memory while maintaining head_dim compatibility
@@ -375,7 +389,7 @@ if __name__ == "__main__":
         )
         evaluation.data.persistent_workers = True
         evaluations.append(evaluation)
-    save_interval_unsharded = 7500 if not args.finetune else 5000
+    save_interval_unsharded = 7500 if not args.finetune else 15000
     cfg = TrainConfig(
         run_name="affordance_train",
         no_pre_train_checkpoint=True,
@@ -398,6 +412,7 @@ if __name__ == "__main__":
             for_inference=False,
             shuffle=True,
             split=data_split,
+            action_chunking_horizon=model_cfg.action_horizon,
             drop_last=True,
             sequence_length=args.seq_len,
             num_workers=2,
@@ -406,19 +421,18 @@ if __name__ == "__main__":
             pin_memory=True,
             seed=50189
         ),
-        ft_connector=True,
-        ft_llm=True,
-        ft_vit=True,
-        # ft_connector=False,
-        # ft_llm=False,
-        # ft_vit=False,
+        # ft_connector=True,
+        # ft_llm=True,
+        # ft_vit=True,
+        ft_connector=False,
+        ft_llm=False,
+        ft_vit=False,
         optimizer=OptimizerConfig(
             name=OptimizerType.adamw,
             connector_learning_rate=5e-6,
             vit_learning_rate=5e-6,
             llm_learning_rate=1e-5,
-            flow_matching_learning_rate=5e-5,
-            # flow_matching_learning_rate=5e-2,
+            flow_matching_learning_rate=5e-4,
             connector_weight_decay=0.0,
             vit_weight_decay=0.0,
             llm_weight_decay=0.0,
@@ -439,7 +453,7 @@ if __name__ == "__main__":
             connector_t_warmup=200,
             vit_t_warmup=200,
             llm_t_warmup=200,
-            flow_matching_t_warmup=100,
+            flow_matching_t_warmup=200,
             alpha_f=0.1,
             warmup_min_lr=0.0
         ),

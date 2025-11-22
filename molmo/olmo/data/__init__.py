@@ -81,7 +81,11 @@ def build_torch_mm_eval_dataloader(
         require_image_features=pad_batches
     )
     logging.info(f"Loading eval dataset: {data_config.dataset}/{data_config.split}")
-    dataset = get_dataset_by_name(data_config.dataset, data_config.split)
+    dataset = get_dataset_by_name(
+        data_config.dataset,
+        data_config.split,
+        action_chunking_horizon=data_config.action_chunking_horizon,
+    )
     n_pad = 0
     if pad_batches:
         global_batch_size = batch_size*get_world_size()
@@ -156,21 +160,34 @@ def build_train_dataloader(train_config: TrainConfig, device=None) -> DataLoader
             train_config.model, shuffle_messages=data_config.shuffle, is_training=True, require_image_features=True)
         if data_config.dataset:
             datasets = [get_dataset_by_name(
-                data_config.dataset, data_config.split)]
+                data_config.dataset,
+                data_config.split,
+                action_chunking_horizon=data_config.action_chunking_horizon)]
             rates = [1]
         else:
             if data_config.mixture:
                 mixture = {}
                 for name, rate in data_config.mixture.items():
                     logging.info(f"Loading train dataset {name}/{data_config.split}")
-                    mixture[name] = (get_dataset_by_name(name, data_config.split), rate)
+                    mixture[name] = (
+                        get_dataset_by_name(
+                            name,
+                            data_config.split,
+                            action_chunking_horizon=data_config.action_chunking_horizon,
+                        ),
+                        rate,
+                    )
             else:
                 mixture = {}
                 for root_size_mixture in data_config.root_size_mixture:
                     group_datasets = {}
                     for name, as_size in root_size_mixture.mixture.items():
                         logging.info(f"Loading train dataset {name}/{data_config.split}")
-                        dataset = get_dataset_by_name(name, data_config.split)
+                        dataset = get_dataset_by_name(
+                            name,
+                            data_config.split,
+                            action_chunking_horizon=data_config.action_chunking_horizon,
+                        )
                         if as_size is not None:
                             size = as_size
                         else:
@@ -215,7 +232,8 @@ def build_train_dataloader(train_config: TrainConfig, device=None) -> DataLoader
         raise NotImplementedError(train_config.data.multi_modal)
 
 
-def get_dataset_by_name(dataset_name, split):
+def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
+    horizon = action_chunking_horizon if action_chunking_horizon is not None else 30
     if dataset_name in ["scifi_document_qa", "pixmo_docs_other"]:
         return PixMoDocs("other", split=split)
     elif dataset_name in ["scifi_table_qa", "pixmo_docs_tables"]:
@@ -343,9 +361,9 @@ def get_dataset_by_name(dataset_name, split):
         return TrajectoryDataset(
             data_dir=data_dir,
             split=split,
-            action_chunking_horizon=30,
+            action_chunking_horizon=horizon,
             output_2d_trajectory=True,
-            normalize_2d_coordinates=True,
+            normalize_coordinates=True,
             output_format="text"
         )
     elif dataset_name == "trajectory_2d_fm":
@@ -353,9 +371,9 @@ def get_dataset_by_name(dataset_name, split):
         return TrajectoryDataset(
             data_dir=data_dir,
             split=split,
-            action_chunking_horizon=30,
+            action_chunking_horizon=horizon,
             output_2d_trajectory=True,
-            normalize_2d_coordinates=True,
+            normalize_coordinates=True,
             output_format="flow_matching"
         )
     elif dataset_name == "trajectory_3d_text":
@@ -363,19 +381,21 @@ def get_dataset_by_name(dataset_name, split):
         return TrajectoryDataset(
             data_dir=data_dir,
             split=split,
-            action_chunking_horizon=30,
+            action_chunking_horizon=horizon,
             output_2d_trajectory=False,
-            normalize_2d_coordinates=False,
+            normalize_coordinates=False,
             output_format="text"
         )
     elif dataset_name == "trajectory_3d_fm":
         data_dir = os.environ.get("EGODEX_DATA_DIR")
+        stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
         return TrajectoryDataset(
             data_dir=data_dir,
             split=split,
-            action_chunking_horizon=30,
+            action_chunking_horizon=horizon,
             output_2d_trajectory=False,
-            normalize_2d_coordinates=False,
+            normalize_coordinates=bool(stats_file),
+            stats_file=stats_file,
             output_format="flow_matching",
             frame_downsampling_ratio=30,
         )
@@ -386,9 +406,9 @@ def get_dataset_by_name(dataset_name, split):
         return TrajectoryDataset(
             data_dir=data_dir,
             split=split,
-            action_chunking_horizon=30,
+            action_chunking_horizon=horizon,
             output_2d_trajectory=True,
-            normalize_2d_coordinates=True,
+            normalize_coordinates=True,
             output_format="text",
             trajectory_representation="delta"
         )
@@ -397,9 +417,9 @@ def get_dataset_by_name(dataset_name, split):
         return TrajectoryDataset(
             data_dir=data_dir,
             split=split,
-            action_chunking_horizon=30,
+            action_chunking_horizon=horizon,
             output_2d_trajectory=True,
-            normalize_2d_coordinates=True,
+            normalize_coordinates=True,
             output_format="flow_matching",
             trajectory_representation="delta"
         )
@@ -408,20 +428,22 @@ def get_dataset_by_name(dataset_name, split):
         return TrajectoryDataset(
             data_dir=data_dir,
             split=split,
-            action_chunking_horizon=30,
+            action_chunking_horizon=horizon,
             output_2d_trajectory=False,
-            normalize_2d_coordinates=False,
+            normalize_coordinates=False,
             output_format="text",
             trajectory_representation="delta"
         )
     elif dataset_name == "trajectory_3d_delta_fm":
         data_dir = os.environ.get("EGODEX_DATA_DIR")
+        stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
         return TrajectoryDataset(
             data_dir=data_dir,
             split=split,
-            action_chunking_horizon=30,
+            action_chunking_horizon=horizon,
             output_2d_trajectory=False,
-            normalize_2d_coordinates=False,
+            normalize_coordinates=bool(stats_file),
+            stats_file=stats_file,
             output_format="flow_matching",
             frame_downsampling_ratio=30,
             trajectory_representation="delta"

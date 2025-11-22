@@ -87,7 +87,7 @@ class TrajectoryDataset(Dataset):
     
     # Class-level parameter for limiting examples in overfit split
     # Set before instantiation: TrajectoryDataset.overfit_num_examples = 1
-    overfit_num_examples: Optional[int] = 1
+    overfit_num_examples: Optional[int] = 10
     
     def __init__(
         self,
@@ -96,7 +96,8 @@ class TrajectoryDataset(Dataset):
         action_chunking_horizon: int = 30,
         joint_names: Optional[List[str]] = None,
         output_2d_trajectory: bool = True,
-        normalize_2d_coordinates: bool = True,
+        normalize_coordinates: bool = True,
+        stats_file: Optional[str] = None,
         use_confidence_filter: bool = False,
         confidence_threshold: float = 0.5,
         output_format: str = "text",  # "text" or "flow_matching"
@@ -115,7 +116,8 @@ class TrajectoryDataset(Dataset):
         self.use_confidence_filter = use_confidence_filter
         self.confidence_threshold = confidence_threshold
         self.output_2d_trajectory = output_2d_trajectory
-        self.normalize_2d_coordinates = normalize_2d_coordinates
+        self.normalize_coordinates = normalize_coordinates
+        self.stats_file = stats_file
         self.output_format = output_format  # "text" or "flow_matching"
         self.frame_downsampling_ratio = frame_downsampling_ratio
         self.trajectory_representation = trajectory_representation
@@ -127,6 +129,18 @@ class TrajectoryDataset(Dataset):
         if self.overfit_num_examples is not None:
             assert self.overfit_num_examples > 0, f"overfit_num_examples must be > 0, got {self.overfit_num_examples}"
         
+        if self.normalize_coordinates and not self.output_2d_trajectory:
+            if self.stats_file is None:
+                raise ValueError("stats_file must be provided when normalize_coordinates is True and output_2d_trajectory is False")
+            print(f"Loading trajectory stats from {self.stats_file}...")
+            stats = torch.load(self.stats_file)
+            self.stats_mean = stats["mean"]
+            self.stats_std = stats["std"]
+            # Ensure stats are on CPU/float
+            if isinstance(self.stats_mean, torch.Tensor):
+                self.stats_mean = self.stats_mean.float()
+                self.stats_std = self.stats_std.float()
+
         # Default joint names matching data_formatter.py TRAJECTORY_KEYPOINTS
         if joint_names is None:
             self.joint_names = [
@@ -333,6 +347,19 @@ class TrajectoryDataset(Dataset):
         if self.trajectory_representation == "delta":
             final_trajectory = self._convert_to_delta_representation(final_trajectory)
         
+        # Normalize 3D trajectory if requested
+        if self.normalize_coordinates and not self.output_2d_trajectory:
+            # final_trajectory shape: [num_steps, num_joints, 3]
+            # stats shape: [num_joints * 3]
+            
+            num_steps, num_joints, coords = final_trajectory.shape
+            
+            # Reshape stats to match trajectory [1, num_joints, 3]
+            mean = self.stats_mean.view(1, num_joints, coords)
+            std = self.stats_std.view(1, num_joints, coords)
+            
+            final_trajectory = (final_trajectory - mean) / std
+
         instruction = self._load_instruction(mapping['hdf5_path'])
         
         if isinstance(final_trajectory, torch.Tensor):
@@ -357,7 +384,7 @@ class TrajectoryDataset(Dataset):
                 {
                     'label': instruction,
                     'points': final_trajectory, # to make it compatible with the data formatter, points means trajectory
-                    'point_scale': 100 if self.normalize_2d_coordinates and self.output_2d_trajectory else None,
+                    'point_scale': 100 if self.normalize_coordinates and self.output_2d_trajectory else None,
                     'style': style,
                     'state': initial_state,  # Include the initial robot state so it can be formatted in the prompt
                 }
@@ -557,7 +584,7 @@ class TrajectoryDataset(Dataset):
         w = torch.where(w == 0, torch.ones_like(w), w)
         points_2d_pixel = points_2d_homo[:, :2] / w
         
-        if self.normalize_2d_coordinates:
+        if self.normalize_coordinates:
             points_2d_normalized = torch.zeros_like(points_2d_pixel)
             points_2d_normalized[:, 0] = (points_2d_pixel[:, 0] / img_width) * 100.0
             points_2d_normalized[:, 1] = (points_2d_pixel[:, 1] / img_height) * 100.0

@@ -3049,6 +3049,7 @@ class Molmo(nn.Module):
         image_input_idx: Optional[torch.Tensor] = None,
         num_steps: Optional[int] = None,
         initial_noise: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Sample actions using flow matching with ODE integration OR direct prediction.
@@ -3070,6 +3071,7 @@ class Molmo(nn.Module):
             image_input_idx: Image input indices
             num_steps: Number of ODE integration steps (default: config.flow_matching_num_steps)
             initial_noise: Optional initial noise (default: sample from N(0,1))
+            position_ids: Position IDs for tokens (batch_size, seq_len)
             
         Returns:
             actions: Predicted actions (batch_size, action_horizon, action_dim)
@@ -3083,6 +3085,7 @@ class Molmo(nn.Module):
                     images=images,
                     image_masks=image_masks,
                     image_input_idx=image_input_idx,
+                    position_ids=position_ids,
                     use_cache=False,
                     noisy_actions=None,
                     action_timestep=None,
@@ -3127,6 +3130,7 @@ class Molmo(nn.Module):
                     images=images,
                     image_masks=image_masks,
                     image_input_idx=image_input_idx,
+                    position_ids=position_ids,
                     use_cache=False,  # No caching to save memory
                     noisy_actions=x_t,
                     action_timestep=t,
