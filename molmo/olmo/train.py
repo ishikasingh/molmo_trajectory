@@ -817,11 +817,7 @@ class Trainer:
                 raise ValueError(
                     f"trajectory_target expected 2D or 3D tensor, got {trajectory_target.dim()}D "
                     f"with shape {trajectory_target.shape}"
-                )
-            
-            # DEBUG MODE: Set to True to only sample t = 1 (pure noise)
-            DEBUG_FLOW_MATCHING = False
-            
+                )            
             if self.cfg.model.use_direct_trajectory_prediction:
                 # Direct trajectory prediction mode: no noise injection
                 noisy_actions = None
@@ -829,11 +825,8 @@ class Trainer:
             else:
                 # Sample time from Beta(1.5, 1) distribution and clip to [0.001, 0.999]
                 # This follows openpi's approach for stable training
-                if DEBUG_FLOW_MATCHING:
-                    t = torch.ones(batch_size, device=device) * 0.999  # t = 1 (pure noise)
-                else:
-                    t = torch.distributions.Beta(1.5, 1.0).sample((batch_size,)).to(device)
-                    t = t * 0.999 + 0.001
+                t = torch.distributions.Beta(1.5, 1.0).sample((batch_size,)).to(device)
+                t = t * 0.999 + 0.001
                 
                 # Sample noise from standard normal
                 noise = torch.randn_like(trajectory_target)
