@@ -868,6 +868,10 @@ class Preprocessor:
         if "trajectory_target" in example:
             batch["trajectory_target"] = example["trajectory_target"]
         
+        # Preserve proprioceptive state for flow matching training
+        if "state" in example:
+            batch["proprio_state"] = example["state"]
+        
         return batch
 
     @property

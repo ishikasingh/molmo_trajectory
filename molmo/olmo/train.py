@@ -863,6 +863,7 @@ class Trainer:
                 position_ids=batch.get("position_ids"),
                 noisy_actions=noisy_actions,
                 action_timestep=action_timestep,
+                proprio_state=batch.get("proprio_state"),
             )
             logits = output.logits
         

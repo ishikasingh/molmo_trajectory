@@ -540,6 +540,17 @@ class DataFormatter:
             state = state.numpy()
         state = np.array(state)
         
+        # Reshape flattened state if necessary
+        if state.ndim == 1:
+            # Assume 3 coords per joint if flattened
+            if state.shape[0] % 3 == 0:
+                state = state.reshape(-1, 3)
+            elif state.shape[0] % 2 == 0:
+                state = state.reshape(-1, 2)
+            else:
+                # Fallback for 1D state (e.g. scalar values per joint)
+                state = state.reshape(-1, 1)
+        
         num_joints, num_dims = state.shape
         
         # Apply scale normalization ONLY for 2D states
@@ -785,7 +796,9 @@ class DataFormatter:
                         prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1[prompt_style], dict(example, label=prompt), rng, dbg=self.debug)
                     
                     # Add robot state information to the prompt for trajectory tasks
-                    if style in ["trajectory_2d_text", "trajectory_3d_text", "trajectory_3d_fm"] and "state" in example and self.include_proprio:
+                    # Note: For trajectory_3d_fm, proprioception is passed as direct tokens to the action expert,
+                    # so we do NOT include it in the text prompt here.
+                    if style in ["trajectory_2d_text", "trajectory_3d_text"] and "state" in example and self.include_proprio:
                         # Transform the robot state to text format and prepend to the prompt
                         state_scale = example.get("point_scale", 100)
                         state_text = self.state_to_text(example["state"], state_scale)

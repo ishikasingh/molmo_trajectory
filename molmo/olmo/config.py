@@ -785,6 +785,11 @@ class ModelConfig(BaseConfig):
     Dimension of each action vector (e.g., 7 joint velocities + 1 gripper).
     """
 
+    proprio_dim: int = 30
+    """
+    Dimension of proprioceptive state vector (e.g., joint positions).
+    """
+
     action_horizon: int = 30
     """
     Number of action steps to predict.

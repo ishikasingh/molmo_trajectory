@@ -120,6 +120,18 @@ if __name__ == "__main__":
         default=30,
         help="Number of timesteps to predict for trajectory actions",
     )
+    parser.add_argument(
+        "--include_proprio",
+        action="store_true",
+        default=False,
+        help="Include proprioceptive information (current finger positions) in trajectory prediction",
+    )
+    parser.add_argument(
+        "--proprio_dim",
+        type=int,
+        default=30,
+        help="Dimension of proprioceptive state vector",
+    )
     args, other_args = parser.parse_known_args()
 
     # Default training split
@@ -254,16 +266,10 @@ if __name__ == "__main__":
         # Direct 3D trajectory prediction (regression) using action expert architecture
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
-        data_split = "overfit"
-    elif args.mixture in ["trajectory_3d_fm_overfit"]:
-        # Flow matching 3D trajectory with overfit split
-        eval_tasks = []
-        tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
-        data_split = "overfit"
-    elif args.mixture == "trajectory_3d_fm_overfit_delta":
+    elif args.mixture == "trajectory_3d_fm_overfit":
         # Flow matching based 3D trajectory prediction with delta representation
         eval_tasks = []
-        tasks = [["egodex", ["trajectory_3d_delta_fm"], 1.0]]
+        tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
         data_split = "overfit"
     elif args.mixture == "robo_casa_affordance":
         # eval_tasks = ["robo_casa_affordance"]
@@ -305,9 +311,9 @@ if __name__ == "__main__":
         inf_eval_interval = 2000
         eval_interval = 2000
         if args.finetune:
-            duration = 60000
-        else:
             duration = 30000
+        else:
+            duration = 60000
         model_init = args.checkpoint
         if exists(join(args.checkpoint, "model.yaml")):
             model_cfg = ModelConfig.load(join(args.checkpoint, "model.yaml"))
@@ -361,13 +367,15 @@ if __name__ == "__main__":
         
         log.info("Flow matching trajectory head enabled with action_horizon=%d, action_dim=%d", 
                  model_cfg.action_horizon, model_cfg.action_dim)
+        
+        # Proprioception settings
+        model_cfg.include_proprio = args.include_proprio
+        model_cfg.proprio_dim = args.proprio_dim
+        if args.include_proprio:
+            log.info(f"Proprioception enabled with dimension {args.proprio_dim}")
+
     else:
         model_cfg.use_action_expert = False
-
-    # Configure proprioceptive information inclusion
-    if args.mixture == "trajectory_3d_fm_overfit":
-        model_cfg.include_proprio = False
-        log.info("Setting include_proprio=False for trajectory_3d_fm_overfit")
 
     root_size_mixture: List[RootSizeMixture] = []
     for name, submixture, rate in tasks:
@@ -385,7 +393,7 @@ if __name__ == "__main__":
         )
         evaluation.data.persistent_workers = True
         evaluations.append(evaluation)
-    save_interval_unsharded = 7500 if not args.finetune else 15000
+    save_interval_unsharded = 15000 if not args.finetune else 7500
     cfg = TrainConfig(
         run_name="affordance_train",
         no_pre_train_checkpoint=True,

@@ -412,7 +412,7 @@ def load_test_examples(task_type: str, num_examples: int = 10,
     
     # Load test dataset
     dataset = TrajectoryDataset(
-        split="overfit",
+        split="test",
         action_chunking_horizon=action_chunking_horizon,
         output_2d_trajectory=output_2d,
         normalize_coordinates=False, # Only normalize for 2D unless stats are provided/handled
@@ -607,6 +607,12 @@ def main():
         if "position_ids" in batch:
             position_ids = torch.tensor(batch["position_ids"], dtype=torch.long).unsqueeze(0).to(device)
         
+        # Extract proprio_state from batch if available
+        proprio_state = None
+        if "proprio_state" in batch:
+            print("Using proprioceptive state for trajectory prediction")
+            proprio_state = torch.tensor(batch["proprio_state"], dtype=torch.float32).unsqueeze(0).to(device)
+        
         # Generate trajectory
         is_direct_prediction = getattr(model.config, "use_direct_trajectory_prediction", False)
         if is_direct_prediction:
@@ -625,6 +631,7 @@ def main():
                 num_steps=args.num_ode_steps,
                 initial_noise=None,
                 position_ids=position_ids,
+                proprio_state=proprio_state,
             )
         end_time = time.time()
         print(f"Time taken for prediction: {end_time - start_time:.2f} seconds")

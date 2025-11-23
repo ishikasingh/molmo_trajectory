@@ -1763,6 +1763,15 @@ class ActionExpertTransformer(nn.Module):
             bias=config.include_bias,
             device=config.init_device
         )
+
+        # Proprioception projection: proprio_dim -> action_expert_d_model
+        if config.include_proprio:
+            self.proprio_in_proj = nn.Linear(
+                config.proprio_dim,
+                config.action_expert_d_model,
+                bias=config.include_bias,
+                device=config.init_device
+            )
         
         # Timestep conditioning MLPs (Pi0-style)
         self.time_mlp_in = nn.Linear(
@@ -1829,6 +1838,15 @@ class ActionExpertTransformer(nn.Module):
             layer_id=None,
             type_of_module=ModuleType.emb
         )
+
+        if self.config.include_proprio:
+            init_weights(
+                self.config,
+                self.proprio_in_proj,
+                d=self.config.proprio_dim,
+                layer_id=None,
+                type_of_module=ModuleType.emb
+            )
         
         # Initialize timestep conditioning MLPs
         init_weights(
@@ -1910,6 +1928,20 @@ class ActionExpertTransformer(nn.Module):
         action_embeddings = F.silu(self.time_mlp_out(combined))  # (B, H, D_action)
         
         return action_embeddings
+
+    def embed_proprio(self, proprio: torch.Tensor) -> torch.Tensor:
+        """
+        Embed proprioceptive state.
+
+        Args:
+            proprio: (batch_size, proprio_dim) or (batch_size, 1, proprio_dim)
+
+        Returns:
+            proprio_embeddings: (batch_size, 1, action_expert_d_model)
+        """
+        if proprio.dim() == 2:
+            proprio = proprio.unsqueeze(1)
+        return self.proprio_in_proj(proprio)
 
     def embed_trajectory_queries(self, batch_size: int) -> torch.Tensor:
         """
@@ -2610,6 +2642,7 @@ class Molmo(nn.Module):
         # Flow matching specific inputs
         noisy_actions: Optional[torch.Tensor] = None,
         action_timestep: Optional[torch.Tensor] = None,
+        proprio_state: Optional[torch.Tensor] = None,
     ) -> OLMoOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -2756,6 +2789,13 @@ class Molmo(nn.Module):
                     noisy_actions, action_timestep
                 )  # (batch_size, action_horizon, action_expert_d_model)
 
+            # Add proprioception if enabled (goes before actions)
+            proprio_len = 0
+            if self.config.include_proprio and proprio_state is not None:
+                proprio_hidden = self.action_expert.embed_proprio(proprio_state)
+                action_hidden = torch.cat([proprio_hidden, action_hidden], dim=1)
+                proprio_len = proprio_hidden.shape[1]
+
             # Ensure concatenated prefix + action tokens do not exceed configured limit
             total_sequence_length = seq_len + action_hidden.shape[1]
             max_seq_len = self.config.max_sequence_length
@@ -2862,8 +2902,10 @@ class Molmo(nn.Module):
                 merged_attention_bias[:, :, :prefix_len, :prefix_len] = prefix_attn_bias
                 
                 # Action tokens (rows) can attend to all tokens (columns)
-                # Set action rows to 0 (full attention)
-                merged_attention_bias[:, :, prefix_len:, :] = 0.0
+                # Set ONLY action rows to 0 (full attention)
+                # This leaves proprioception rows (prefix_len to prefix_len+proprio_len) 
+                # with the original causal mask, as desired.
+                merged_attention_bias[:, :, prefix_len + proprio_len:, :] = 0.0
             
             for block_idx, (vlm_block, action_block) in enumerate(zip(
                 self.transformer.blocks,
@@ -2944,7 +2986,15 @@ class Molmo(nn.Module):
                         
             # After all layers, compute velocity predictions from action_hidden (before projection)
             # This uses action_expert_d_model directly, avoiding unnecessary projection to d_model
-            velocity_output = self.action_expert.predict_velocity(action_hidden)
+            # If proprioception is included, exclude it from velocity prediction
+            if self.config.include_proprio and proprio_state is not None:
+                # action_hidden shape: (B, S+A, D)
+                # We want only the last A tokens (action tokens)
+                velocity_hidden = action_hidden[:, proprio_len:]
+            else:
+                velocity_hidden = action_hidden
+            
+            velocity_output = self.action_expert.predict_velocity(velocity_hidden)
             
             # Project action_hidden to main model dimension and concatenate (for other uses if needed)
             action_hidden_projected = self.action_expert.output_proj(action_hidden)
@@ -3054,6 +3104,7 @@ class Molmo(nn.Module):
         num_steps: Optional[int] = None,
         initial_noise: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        proprio_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Sample actions using flow matching with ODE integration OR direct prediction.
@@ -3076,6 +3127,7 @@ class Molmo(nn.Module):
             num_steps: Number of ODE integration steps (default: config.flow_matching_num_steps)
             initial_noise: Optional initial noise (default: sample from N(0,1))
             position_ids: Position IDs for tokens (batch_size, seq_len)
+            proprio_state: Optional proprioceptive state (batch_size, proprio_dim)
             
         Returns:
             actions: Predicted actions (batch_size, action_horizon, action_dim)
@@ -3093,6 +3145,7 @@ class Molmo(nn.Module):
                     use_cache=False,
                     noisy_actions=None,
                     action_timestep=None,
+                    proprio_state=proprio_state,
                 )
             return output.velocity_output
 
@@ -3138,6 +3191,7 @@ class Molmo(nn.Module):
                     use_cache=False,  # No caching to save memory
                     noisy_actions=x_t,
                     action_timestep=t,
+                    proprio_state=proprio_state,
                 )
             
             # Get predicted velocity

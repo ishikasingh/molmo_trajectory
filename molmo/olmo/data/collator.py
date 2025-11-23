@@ -45,7 +45,7 @@ class MMCollator:
 
     TEXT_KEYS = ["input_tokens", "target_tokens", "loss_masks", "subsegment_ids", "position_ids"]
     IMAGE_KEYS = ["images", "image_masks", "image_input_idx",]
-    TRAJECTORY_KEYS = ["trajectory_target"]
+    TRAJECTORY_KEYS = ["trajectory_target", "proprio_state"]
 
     def __init__(self, max_sequence_length=None, include_metadata=True, pad=None,
                  max_crops=None):

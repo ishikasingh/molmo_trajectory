@@ -353,6 +353,10 @@ class TrajectoryDataset(Dataset):
         else:
             initial_state = final_trajectory[0]
         
+        # Flatten state to match proprio_dim (num_joints * coords)
+        # This ensures state is (30,) instead of (10, 3)
+        initial_state = initial_state.reshape(-1).astype(np.float32)
+        
         # Convert to delta representation if requested
         if self.trajectory_representation == "delta":
             final_trajectory = self._convert_to_delta_representation(final_trajectory)

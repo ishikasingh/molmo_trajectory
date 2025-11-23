@@ -378,8 +378,7 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
         )
     elif dataset_name == "trajectory_3d_fm":
         data_dir = os.environ.get("EGODEX_DATA_DIR")
-        # stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
-        stats_file = None # currently only for delta representation
+        stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
         return TrajectoryDataset(
             data_dir=data_dir,
             split=split,
@@ -389,6 +388,7 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
             stats_file=stats_file,
             output_format="flow_matching",
             frame_downsampling_ratio=30,
+            trajectory_representation="delta" # default to be delta, as it works 
         )
     
     # Delta (velocity) representation variants
@@ -412,20 +412,6 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
             output_2d_trajectory=False,
             normalize_coordinates=False,
             output_format="text",
-            trajectory_representation="delta"
-        )
-    elif dataset_name == "trajectory_3d_delta_fm":
-        data_dir = os.environ.get("EGODEX_DATA_DIR")
-        stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
-        return TrajectoryDataset(
-            data_dir=data_dir,
-            split=split,
-            action_chunking_horizon=horizon,
-            output_2d_trajectory=False,
-            normalize_coordinates=bool(stats_file),
-            stats_file=stats_file,
-            output_format="flow_matching",
-            frame_downsampling_ratio=30,
             trajectory_representation="delta"
         )
     raise NotImplementedError(dataset_name, split)
