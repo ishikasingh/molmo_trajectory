@@ -311,9 +311,9 @@ if __name__ == "__main__":
         inf_eval_interval = 2000
         eval_interval = 2000
         if args.finetune:
-            duration = 30000
+            duration = 40000
         else:
-            duration = 60000
+            duration = 160000
         model_init = args.checkpoint
         if exists(join(args.checkpoint, "model.yaml")):
             model_cfg = ModelConfig.load(join(args.checkpoint, "model.yaml"))
@@ -393,7 +393,7 @@ if __name__ == "__main__":
         )
         evaluation.data.persistent_workers = True
         evaluations.append(evaluation)
-    save_interval_unsharded = 15000 if not args.finetune else 7500
+    save_interval_unsharded = 20000 if not args.finetune else 7500
     cfg = TrainConfig(
         run_name="affordance_train",
         no_pre_train_checkpoint=True,
@@ -425,11 +425,11 @@ if __name__ == "__main__":
             pin_memory=True,
             seed=50189
         ),
-        # ft_connector=True,
-        # ft_llm=True,
+        ft_connector=True,
+        ft_llm=True,
         # ft_vit=True,
-        ft_connector=False,
-        ft_llm=False,
+        # ft_connector=False,
+        # ft_llm=False,
         ft_vit=False,
         optimizer=OptimizerConfig(
             name=OptimizerType.adamw,
