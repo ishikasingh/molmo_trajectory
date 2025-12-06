@@ -113,7 +113,8 @@ if __name__ == "__main__":
     parser.add_argument("--cotrain", default=False, action="store_true",
                         help="whether it is a cotraining run")
     parser.add_argument("--use_transitions", default=False, action="store_true",
-                        help="whether to use transitions in the affordance dataset")
+                        help="whether to use transitions in the affordance dataset, transitions\
+                        means whether the hand is from grasp to release or release to grasp")
     parser.add_argument(
         "--action_horizon",
         type=int,
@@ -121,16 +122,22 @@ if __name__ == "__main__":
         help="Number of timesteps to predict for trajectory actions",
     )
     parser.add_argument(
-        "--include_proprio",
+        "--exclude_proprio",
         action="store_true",
         default=False,
-        help="Include proprioceptive information (current finger positions) in trajectory prediction",
+        help="Exclude proprioceptive information (current finger positions) from trajectory prediction",
     )
     parser.add_argument(
         "--proprio_dim",
         type=int,
         default=30,
         help="Dimension of proprioceptive state vector",
+    )
+    parser.add_argument(
+        "--max_crops",
+        type=int,
+        default=None,
+        help="Override max_crops parameter for the VLM model (default: None means no override)",
     )
     args, other_args = parser.parse_known_args()
 
@@ -324,6 +331,11 @@ if __name__ == "__main__":
         logging.info(f"Setting eval subset batches to {eval_subset_batches}")
         assert eval_subset_batches > 0
 
+    # Override max_crops if specified
+    if args.max_crops is not None:
+        log.info(f"Overriding max_crops from {model_cfg.max_crops} to {args.max_crops}")
+        model_cfg.max_crops = args.max_crops
+
     # Fine-tuning settings
     model_cfg.residual_dropout = 0.1
     model_cfg.response_residual_dropout = 0.0
@@ -369,9 +381,9 @@ if __name__ == "__main__":
                  model_cfg.action_horizon, model_cfg.action_dim)
         
         # Proprioception settings
-        model_cfg.include_proprio = args.include_proprio
+        model_cfg.include_proprio = not args.exclude_proprio
         model_cfg.proprio_dim = args.proprio_dim
-        if args.include_proprio:
+        if not args.exclude_proprio:
             log.info(f"Proprioception enabled with dimension {args.proprio_dim}")
 
     else:
@@ -419,7 +431,7 @@ if __name__ == "__main__":
             action_chunking_horizon=model_cfg.action_horizon,
             drop_last=True,
             sequence_length=args.seq_len,
-            num_workers=32,  # Increased from 2 to 32 to enable parallel loading
+            num_workers=24,  # Increased from 2 to 32 to enable parallel loading
             pad="to_max",
             shuffle_messages=True,
             pin_memory=True,

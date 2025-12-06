@@ -630,7 +630,7 @@ class ModelConfig(BaseConfig):
     For length condition, what length use for inference
     """
 
-    include_proprio: bool = False
+    include_proprio: bool = True
     """
     Whether to include proprioceptive information (current finger positions) in trajectory prompts
     """
