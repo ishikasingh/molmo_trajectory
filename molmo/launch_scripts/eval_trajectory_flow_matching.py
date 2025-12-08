@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Evaluation script for trajectory predictions.
-Supports both flow matching (ODE sampling) and direct regression modes in 2D or 3D.
+Evaluation script for 3D trajectory predictions.
+Supports both flow matching (ODE sampling) and direct regression modes.
+Trajectories are projected to 2D for visualization on images.
 """
 
 import argparse
@@ -390,38 +391,40 @@ def convert_delta_to_absolute(delta_trajectory: np.ndarray, initial_state: np.nd
     return absolute_trajectory
 
 
-def load_test_examples(task_type: str, num_examples: int = 10, 
+def load_test_examples(num_examples: int = 10, 
                        action_chunking_horizon: int = 10,
-                       trajectory_representation: str = "absolute") -> List[Dict]:
+                       trajectory_representation: str = "absolute",
+                       split: str = "test") -> List[Dict]:
     """
-    Load examples from the test set.
+    Load examples from the specified split for 3D trajectory prediction.
     
     Args:
-        task_type: Either '2d' or '3d' for trajectory task type
         num_examples: Number of examples to load
         action_chunking_horizon: Number of timesteps in trajectory
         trajectory_representation: Either 'absolute' or 'delta' for trajectory representation
+        split: Dataset split to load (e.g., train, test)
     
     Returns:
         List of example dictionaries
     """
     from olmo.data.trajectory_datasets import TrajectoryDataset
     
-    # Determine whether to output 2D or 3D trajectories
-    output_2d = (task_type == '2d')
+    # Check if stats file is available for normalization
+    stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
+    normalize_coords = bool(stats_file)
     
-    # Load test dataset
+    # Load dataset (always 3D)
     dataset = TrajectoryDataset(
-        split="test",
+        split=split,
         action_chunking_horizon=action_chunking_horizon,
-        output_2d_trajectory=output_2d,
-        normalize_coordinates=False, # Only normalize for 2D unless stats are provided/handled
+        output_2d_trajectory=False,
+        normalize_coordinates=False, # Set to be False as in inference time, the trajectory itself is only for visualization, but this only works for delta representation.
         output_format="flow_matching",  # Use flow matching format
         trajectory_representation=trajectory_representation,
         frame_downsampling_ratio=30,
     )
     
-    print(f"Loaded test dataset with {len(dataset)} examples")
+    print(f"Loaded '{split}' dataset with {len(dataset)} examples")
     
     # Sample examples (using evenly spaced indices for diversity)
     indices = np.linspace(0, len(dataset) - 1, min(num_examples, len(dataset)), dtype=int)
@@ -475,11 +478,9 @@ def load_test_examples(task_type: str, num_examples: int = 10,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate trajectory predictions (flow matching or direct regression)"
+        description="Evaluate 3D trajectory predictions (flow matching or direct regression)"
     )
     parser.add_argument("checkpoint", type=str, help="Path to model checkpoint directory")
-    parser.add_argument("--task_type", type=str, choices=['2d', '3d'], required=True,
-                       help="Type of trajectory task: '2d' or '3d'")
     parser.add_argument("--num_examples", type=int, default=10,
                        help="Number of test examples to visualize")
     parser.add_argument("--action_chunking_horizon", type=int, default=30,
@@ -491,16 +492,23 @@ def main():
     parser.add_argument("--output_dir", type=str, default="trajectory_flow_matching_output",
                        help="Directory to save visualizations")
     parser.add_argument("--camera_intrinsic", type=str, default=None,
-                       help="Path to numpy file containing camera intrinsic matrix (for 3D tasks)")
+                       help="Path to numpy file containing camera intrinsic matrix")
     parser.add_argument("--save_metrics", action="store_true",
                        help="Save trajectory metrics (MSE, ADE, FDE) to JSON")
-    parser.add_argument("--trajectory_representation", type=str, default="absolute",
+    parser.add_argument("--trajectory_representation", type=str, default="delta",
                        choices=["absolute", "delta"],
                        help="Trajectory representation mode: 'absolute' positions or 'delta' (velocity)")
     parser.add_argument("--save_3d_trajectory", action="store_true",
-                       help="Save 3D trajectory data to .npz file (only for 3d task_type)")
+                       help="Save 3D trajectory data to .npz file")
     parser.add_argument("--normalize_coordinates", action="store_true",
                        help="Whether the model was trained with normalized coordinates (requires TRAJECTORY_STATS_FILE env var)")
+    parser.add_argument("--num_inference_samples", type=int, default=1,
+                       help="Number of inference samples to generate. When > 1, selects the sample with minimum MSE to ground truth (useful for multi-modal tasks)")
+    parser.add_argument("--inference_seed", type=int, default=None,
+                       help="Random seed for reproducible inference sampling (optional)")
+    parser.add_argument("--split", type=str, default="test",
+                       choices=["train", "test", "test_pick_and_place", "overfit"],
+                       help="Dataset split to load examples from")
     
     args = parser.parse_args()
     
@@ -508,11 +516,11 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
     
-    # Load test examples
-    print(f"Loading {args.num_examples} test examples for {args.task_type} trajectory task...")
+    # Load examples
+    print(f"Loading {args.num_examples} examples from split '{args.split}' for 3D trajectory task...")
     print(f"Trajectory representation: {args.trajectory_representation}")
-    examples = load_test_examples(args.task_type, args.num_examples, args.action_chunking_horizon, 
-                                  args.trajectory_representation)
+    examples = load_test_examples(args.num_examples, args.action_chunking_horizon, 
+                                  args.trajectory_representation, args.split)
     
     if not examples:
         print("No examples loaded. Exiting.")
@@ -529,34 +537,33 @@ def main():
     print("Building preprocessor...")
     preprocessor = build_mm_preprocessor(model.config, for_inference=True, is_training=False)
     
-    # Load camera intrinsic for 3D tasks
+    # Load camera intrinsic and stats
     intrinsic = None
     stats_mean = None
     stats_std = None
     
-    if args.task_type == '3d':
-        # Load stats if normalization was used
-        if args.normalize_coordinates:
-            stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
-            if stats_file and os.path.exists(stats_file):
-                print(f"Loading trajectory stats from {stats_file}")
-                stats = torch.load(stats_file, map_location="cpu")
-                stats_mean = stats["mean"].numpy()
-                stats_std = stats["std"].numpy()
-                print("Loaded mean/std for denormalization")
-            else:
-                print("WARNING: normalize_coordinates is True but TRAJECTORY_STATS_FILE not set or not found!")
-                print("Model predictions will NOT be denormalized (results may be incorrect)")
-            
-        if args.camera_intrinsic and os.path.exists(args.camera_intrinsic):
-            intrinsic = np.load(args.camera_intrinsic)
-            print(f"Loaded camera intrinsic from {args.camera_intrinsic}")
+    # Load stats if normalization was used
+    if args.normalize_coordinates:
+        stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
+        if stats_file and os.path.exists(stats_file):
+            print(f"Loading trajectory stats from {stats_file}")
+            stats = torch.load(stats_file, map_location="cpu")
+            stats_mean = stats["mean"].numpy()
+            stats_std = stats["std"].numpy()
+            print("Loaded mean/std for denormalization")
         else:
-            # Use default intrinsic from EgoDex
-            intrinsic = np.array([[736.6339, 0., 960.], 
-                                 [0., 736.6339, 540.], 
-                                 [0., 0., 1.]])
-            print("Using default EgoDex camera intrinsic")
+            print("WARNING: normalize_coordinates is True but TRAJECTORY_STATS_FILE not set or not found!")
+            print("Model predictions will NOT be denormalized (results may be incorrect)")
+    
+    if args.camera_intrinsic and os.path.exists(args.camera_intrinsic):
+        intrinsic = np.load(args.camera_intrinsic)
+        print(f"Loaded camera intrinsic from {args.camera_intrinsic}")
+    else:
+        # Use default intrinsic from EgoDex
+        intrinsic = np.array([[736.6339, 0., 960.], 
+                             [0., 736.6339, 540.], 
+                             [0., 0., 1.]])
+        print("Using default EgoDex camera intrinsic")
     
     # Store evaluation metrics
     all_metrics = []
@@ -566,7 +573,7 @@ def main():
         image_path = example_row["image_path"]
         prompt = example_row["prompt"]
         gt_trajectory_raw = example_row.get("ground_truth_trajectory", None)
-        style = example_row.get("style", f"trajectory_{args.task_type}d")
+        style = example_row.get("style", "trajectory_3d_fm")
         task_name = example_row.get("task_name", "unknown")
         
         print(f"\n{'='*80}")
@@ -620,21 +627,129 @@ def main():
         else:
             print(f"Sampling trajectory using flow matching ODE (steps={args.num_ode_steps})...")
 
+        # Multi-sample inference: generate multiple samples and select the best one
+        num_samples = args.num_inference_samples
+        if num_samples > 1 and is_direct_prediction:
+            print("WARNING: Direct prediction mode does not support multi-sample inference. Using single sample.")
+            num_samples = 1
+        
         start_time = time.time()
-        with torch.no_grad():
-            pred_trajectory = model.sample_actions_flow_matching(
-                input_ids=input_ids,
-                attention_mask=None,
-                images=images,
-                image_masks=image_masks,
-                image_input_idx=image_input_idx,
-                num_steps=args.num_ode_steps,
-                initial_noise=None,
-                position_ids=position_ids,
-                proprio_state=proprio_state,
+        all_pred_trajectories = []
+        
+        # Set base seed for reproducibility if provided
+        base_seed = args.inference_seed if args.inference_seed is not None else int(time.time()) + idx
+        
+        for sample_idx in range(num_samples):
+            # Use different seed for each sample to get different initial noise
+            sample_seed = base_seed + sample_idx * 12345
+            torch.manual_seed(sample_seed)
+            
+            # Generate initial noise with the new seed
+            initial_noise = torch.randn(
+                1,  # batch_size
+                model.config.action_horizon,
+                model.config.action_dim,
+                device=device
             )
+            
+            with torch.no_grad():
+                pred_traj_sample = model.sample_actions_flow_matching(
+                    input_ids=input_ids,
+                    attention_mask=None,
+                    images=images,
+                    image_masks=image_masks,
+                    image_input_idx=image_input_idx,
+                    num_steps=args.num_ode_steps,
+                    initial_noise=initial_noise,
+                    position_ids=position_ids,
+                    proprio_state=proprio_state,
+                )
+            all_pred_trajectories.append(pred_traj_sample)
+        
         end_time = time.time()
-        print(f"Time taken for prediction: {end_time - start_time:.2f} seconds")
+        
+        if num_samples > 1:
+            print(f"Generated {num_samples} samples in {end_time - start_time:.2f} seconds ({(end_time - start_time)/num_samples:.2f} s/sample)")
+        else:
+            print(f"Time taken for prediction: {end_time - start_time:.2f} seconds")
+        
+        # Select the best sample based on MSE with ground truth (if available and multiple samples)
+        pred_trajectory = all_pred_trajectories[0]  # Default to first sample
+        selected_sample_idx = 0
+        sample_mses = None  # Track MSEs for all samples
+        
+        if num_samples > 1 and gt_trajectory_raw is not None:
+            # Get ground truth in the same format for comparison
+            # GT is already in absolute coordinates (not normalized, not delta)
+            gt_for_comparison = gt_trajectory_raw
+            if isinstance(gt_for_comparison, torch.Tensor):
+                gt_for_comparison = gt_for_comparison.numpy()
+            
+            # Reshape GT if needed to match prediction format
+            if len(gt_for_comparison.shape) == 3 and gt_for_comparison.shape[0] == 1:
+                gt_for_comparison = gt_for_comparison.squeeze(0)
+            if len(gt_for_comparison.shape) == 2:
+                gt_action_horizon, gt_action_dim = gt_for_comparison.shape
+                gt_num_joints = gt_action_dim // 3
+                gt_for_comparison = gt_for_comparison.reshape(gt_action_horizon, gt_num_joints, 3)
+            
+            # For delta representation, convert GT to absolute for fair comparison
+            # (GT from dataset is already in absolute form after delta-to-absolute conversion in the dataset)
+            trajectory_rep = example_row.get("trajectory_representation", "delta")
+            initial_state = example_row.get("state")
+            if trajectory_rep == "delta" and initial_state is not None:
+                # GT is in delta format, convert to absolute for comparison
+                gt_initial_state = initial_state
+                if len(gt_initial_state.shape) == 1:
+                    num_joints_state = gt_initial_state.shape[0] // 3
+                    gt_initial_state = gt_initial_state.reshape(num_joints_state, 3)
+                gt_for_comparison = convert_delta_to_absolute(gt_for_comparison, gt_initial_state)
+            
+            # Compute MSE for each sample and select the best
+            # We need to apply the same transformations (denormalize + delta-to-absolute) to each sample
+            best_mse = float('inf')
+            sample_mses = []
+            
+            for s_idx, pred_traj_sample in enumerate(all_pred_trajectories):
+                # Convert to numpy
+                if isinstance(pred_traj_sample, torch.Tensor):
+                    pred_sample_np = pred_traj_sample.cpu().numpy()
+                else:
+                    pred_sample_np = pred_traj_sample.copy()
+                
+                # Denormalize if stats available (same as main code path)
+                if stats_mean is not None and stats_std is not None:
+                    pred_sample_np = pred_sample_np * stats_std + stats_mean
+                
+                # Remove batch dimension and reshape
+                pred_sample_np = pred_sample_np.squeeze(0)
+                sample_action_dim = pred_sample_np.shape[-1]
+                sample_num_joints = sample_action_dim // 3
+                pred_sample_np = pred_sample_np.reshape(-1, sample_num_joints, 3)
+                
+                # Convert delta to absolute if needed (same as main code path)
+                if trajectory_rep == "delta" and initial_state is not None:
+                    sample_initial_state = initial_state
+                    if len(sample_initial_state.shape) == 1:
+                        num_joints_state = sample_initial_state.shape[0] // 3
+                        sample_initial_state = sample_initial_state.reshape(num_joints_state, 3)
+                    pred_sample_np = convert_delta_to_absolute(pred_sample_np, sample_initial_state)
+                
+                # Compute MSE in the same coordinate space as GT (absolute positions)
+                mse = np.mean((pred_sample_np - gt_for_comparison) ** 2)
+                sample_mses.append(mse)
+                
+                if mse < best_mse:
+                    best_mse = mse
+                    best_sample_idx = s_idx
+            
+            selected_sample_idx = best_sample_idx
+            pred_trajectory = all_pred_trajectories[selected_sample_idx]
+            
+            print(f"Multi-sample selection: Sample MSEs = {[f'{m:.6f}' for m in sample_mses]}")
+            print(f"Selected sample {selected_sample_idx + 1}/{num_samples} with MSE = {best_mse:.6f}")
+        elif num_samples > 1:
+            print(f"WARNING: Multi-sample inference requested but no ground truth available. Using first sample.")
         
         # Convert to numpy
         if isinstance(pred_trajectory, torch.Tensor):
@@ -648,23 +763,16 @@ def main():
             pred_trajectory = pred_trajectory * stats_std + stats_mean
             print("Denormalized predicted trajectory")
                 
-        # Reshape from (batch_size, action_horizon, action_dim) to (action_horizon, num_joints, coords_per_joint)
+        # Reshape from (batch_size, action_horizon, action_dim) to (action_horizon, num_joints, 3)
         # Remove batch dimension and reshape flattened coordinates
         batch_size, action_horizon, action_dim = pred_trajectory.shape
         pred_trajectory = pred_trajectory.squeeze(0)  # Remove batch dimension: (action_horizon, action_dim)
         
-        if args.task_type == '3d':
-            # For 3D: action_dim = num_joints * 3
-            num_joints = action_dim // 3
-            if action_dim % 3 != 0:
-                raise ValueError(f"action_dim ({action_dim}) must be divisible by 3 for 3D trajectories")
-            pred_trajectory = pred_trajectory.reshape(action_horizon, num_joints, 3)
-        else:
-            # For 2D: action_dim = num_joints * 2
-            num_joints = action_dim // 2
-            if action_dim % 2 != 0:
-                raise ValueError(f"action_dim ({action_dim}) must be divisible by 2 for 2D trajectories")
-            pred_trajectory = pred_trajectory.reshape(action_horizon, num_joints, 2)
+        # For 3D: action_dim = num_joints * 3
+        num_joints = action_dim // 3
+        if action_dim % 3 != 0:
+            raise ValueError(f"action_dim ({action_dim}) must be divisible by 3 for 3D trajectories")
+        pred_trajectory = pred_trajectory.reshape(action_horizon, num_joints, 3)
                 
         # Convert delta predictions to absolute positions if needed
         trajectory_rep = example_row.get("trajectory_representation", "absolute")
@@ -674,15 +782,11 @@ def main():
                 print(f"Converting delta predictions to absolute positions using initial state...")
                 print(f"Initial state shape: {initial_state.shape}")
                 
-                # Ensure initial_state has the right shape: (num_joints, coords)
+                # Ensure initial_state has the right shape: (num_joints, 3)
                 if len(initial_state.shape) == 1:
-                    # Flatten format, reshape to (num_joints, coords)
-                    if args.task_type == '3d':
-                        coords_per_joint = 3
-                    else:
-                        coords_per_joint = 2
-                    num_joints_state = initial_state.shape[0] // coords_per_joint
-                    initial_state = initial_state.reshape(num_joints_state, coords_per_joint)
+                    # Flatten format, reshape to (num_joints, 3)
+                    num_joints_state = initial_state.shape[0] // 3
+                    initial_state = initial_state.reshape(num_joints_state, 3)
                 
                 # Convert delta to absolute
                 pred_trajectory = convert_delta_to_absolute(pred_trajectory, initial_state)
@@ -696,7 +800,13 @@ def main():
             "task_name": task_name,
             "prompt": prompt,
             "trajectory_representation": trajectory_rep,
+            "num_inference_samples": num_samples,
+            "selected_sample_idx": selected_sample_idx,
         }
+        
+        # Add all sample MSEs if multi-sample was used
+        if sample_mses is not None:
+            metrics["all_sample_mses"] = sample_mses
         
         if gt_trajectory_raw is not None:
             if isinstance(gt_trajectory_raw, torch.Tensor):
@@ -711,16 +821,10 @@ def main():
             if len(gt_trajectory_raw.shape) == 2:
                 # Flattened format: (action_horizon, action_dim)
                 gt_action_horizon, gt_action_dim = gt_trajectory_raw.shape
-                if args.task_type == '3d':
-                    gt_num_joints = gt_action_dim // 3
-                    if gt_action_dim % 3 != 0:
-                        raise ValueError(f"GT action_dim ({gt_action_dim}) must be divisible by 3 for 3D trajectories")
-                    gt_trajectory_raw = gt_trajectory_raw.reshape(gt_action_horizon, gt_num_joints, 3)
-                else:
-                    gt_num_joints = gt_action_dim // 2
-                    if gt_action_dim % 2 != 0:
-                        raise ValueError(f"GT action_dim ({gt_action_dim}) must be divisible by 2 for 2D trajectories")
-                    gt_trajectory_raw = gt_trajectory_raw.reshape(gt_action_horizon, gt_num_joints, 2)
+                gt_num_joints = gt_action_dim // 3
+                if gt_action_dim % 3 != 0:
+                    raise ValueError(f"GT action_dim ({gt_action_dim}) must be divisible by 3 for 3D trajectories")
+                gt_trajectory_raw = gt_trajectory_raw.reshape(gt_action_horizon, gt_num_joints, 3)
             
             # Convert ground truth from delta to absolute if needed
             if trajectory_rep == "delta":
@@ -728,40 +832,27 @@ def main():
                 if initial_state is not None:
                     print(f"Converting GT delta trajectory to absolute positions...")
                     
-                    # Ensure initial_state has the right shape: (num_joints, coords)
+                    # Ensure initial_state has the right shape: (num_joints, 3)
                     if len(initial_state.shape) == 1:
-                        # Flatten format, reshape to (num_joints, coords)
-                        if args.task_type == '3d':
-                            coords_per_joint = 3
-                        else:
-                            coords_per_joint = 2
-                        num_joints_state = initial_state.shape[0] // coords_per_joint
-                        initial_state = initial_state.reshape(num_joints_state, coords_per_joint)
+                        # Flatten format, reshape to (num_joints, 3)
+                        num_joints_state = initial_state.shape[0] // 3
+                        initial_state = initial_state.reshape(num_joints_state, 3)
                     
                     # Convert delta to absolute
                     gt_trajectory_raw = convert_delta_to_absolute(gt_trajectory_raw, initial_state)
                     print(f"Converted GT to absolute trajectory. Shape: {gt_trajectory_raw.shape}")
             
-            # Ground truth is already in 2D normalized coordinates for 2D tasks
-            # For 3D tasks, we need to project to 2D
-            if args.task_type == '2d':
-                gt_trajectory_2d = gt_trajectory_raw
-            else:
-                # Project 3D ground truth to 2D
-                gt_trajectory_2d = project_3d_trajectory_to_2d(
-                    gt_trajectory_raw, intrinsic, w, h, normalize=True
-                )
-                print(f"Projected GT trajectory to 2D: {gt_trajectory_2d.shape}")
-        
-        # Convert prediction trajectory to 2D if needed
-        if args.task_type == '2d':
-            pred_trajectory_2d = pred_trajectory
-        else:
-            # Project 3D prediction to 2D
-            pred_trajectory_2d = project_3d_trajectory_to_2d(
-                pred_trajectory, intrinsic, w, h, normalize=True
+            # Project 3D ground truth to 2D for visualization
+            gt_trajectory_2d = project_3d_trajectory_to_2d(
+                gt_trajectory_raw, intrinsic, w, h, normalize=True
             )
-            print(f"Projected prediction trajectory to 2D: {pred_trajectory_2d.shape}")
+            print(f"Projected GT trajectory to 2D: {gt_trajectory_2d.shape}")
+        
+        # Project 3D prediction to 2D for visualization
+        pred_trajectory_2d = project_3d_trajectory_to_2d(
+            pred_trajectory, intrinsic, w, h, normalize=True
+        )
+        print(f"Projected prediction trajectory to 2D: {pred_trajectory_2d.shape}")
         
         # Compute metrics if requested (after both trajectories are in 2D)
         if gt_trajectory_2d is not None and args.save_metrics:
@@ -796,16 +887,16 @@ def main():
         sanitized_prompt = sanitize_filename(prompt[:50])
         suffix = "_with_gt" if gt_trajectory_2d is not None else ""
         mode_tag = "direct" if is_direct_prediction else "fm"
-        out_filename = f"{args.task_type}d_traj_{mode_tag}_{sanitized_task}_{idx+1}{suffix}.jpg"
+        out_filename = f"3d_traj_{mode_tag}_{sanitized_task}_{idx+1}{suffix}.jpg"
         out_path = output_dir / out_filename
         
         visualized_image.save(out_path)
         print(f"Saved visualization to {out_path}")
         
-        # Save 3D trajectory data if requested (only for 3D tasks)
-        if args.task_type == '3d' and args.save_3d_trajectory:
+        # Save 3D trajectory data if requested
+        if args.save_3d_trajectory:
             # Save both predicted and ground truth 3D trajectories
-            traj_filename = f"{args.task_type}d_traj_{mode_tag}_{sanitized_task}_{idx+1}.npz"
+            traj_filename = f"3d_traj_{mode_tag}_{sanitized_task}_{idx+1}.npz"
             traj_path = output_dir / traj_filename
             
             save_data = {

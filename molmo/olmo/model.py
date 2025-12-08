@@ -2643,6 +2643,8 @@ class Molmo(nn.Module):
         noisy_actions: Optional[torch.Tensor] = None,
         action_timestep: Optional[torch.Tensor] = None,
         proprio_state: Optional[torch.Tensor] = None,
+        # Prefix KV cache for efficient ODE integration (flow matching inference)
+        prefix_kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> OLMoOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -2907,6 +2909,9 @@ class Molmo(nn.Module):
                 # with the original causal mask, as desired.
                 merged_attention_bias[:, :, prefix_len + proprio_len:, :] = 0.0
             
+            # Check if we have cached prefix KV (for efficient ODE integration)
+            use_prefix_cache = prefix_kv_cache is not None and len(prefix_kv_cache) == len(self.transformer.blocks)
+            
             for block_idx, (vlm_block, action_block) in enumerate(zip(
                 self.transformer.blocks,
                 self.action_expert.blocks
@@ -2918,25 +2923,36 @@ class Molmo(nn.Module):
                 
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
                 
-                # Step 1: Run VLM block forward with return_qkv=True
-                # The attention mask ensures VLM block behaves as if action expert doesn't exist
-                if should_checkpoint_block(self.activation_checkpointing_strategy, block_idx):
-                    prefix_result = self._activation_checkpoint_fn(
-                        vlm_block, prefix_hidden, attention_bias=attention_bias, position_ids=position_ids, 
-                        drop_mask=response_mask, layer_past=layer_past, use_cache=use_cache, 
-                        return_qkv=True
+                if use_prefix_cache:
+                    # Use cached prefix K, V - skip VLM block processing entirely
+                    prefix_k, prefix_v = prefix_kv_cache[block_idx]
+                    # Create dummy prefix_q (zeros) since we only care about action attention output
+                    prefix_q = torch.zeros(
+                        batch_size, action_block.config.n_heads, prefix_len,
+                        prefix_k.shape[-1],  # head_dim
+                        device=prefix_k.device, dtype=prefix_k.dtype
                     )
+                    prefix_cache = None  # No new cache when using cached values
                 else:
-                    prefix_result = vlm_block(
-                        prefix_hidden,
-                        attention_bias=attention_bias,  # This mask isolates prefix tokens
-                        position_ids=position_ids,
-                        drop_mask=response_mask,
-                        layer_past=layer_past,
-                        use_cache=use_cache,
-                        return_qkv=True
-                    )
-                prefix_hidden, prefix_cache, (prefix_q, prefix_k, prefix_v) = prefix_result
+                    # Step 1: Run VLM block forward with return_qkv=True
+                    # The attention mask ensures VLM block behaves as if action expert doesn't exist
+                    if should_checkpoint_block(self.activation_checkpointing_strategy, block_idx):
+                        prefix_result = self._activation_checkpoint_fn(
+                            vlm_block, prefix_hidden, attention_bias=attention_bias, position_ids=position_ids, 
+                            drop_mask=response_mask, layer_past=layer_past, use_cache=use_cache, 
+                            return_qkv=True
+                        )
+                    else:
+                        prefix_result = vlm_block(
+                            prefix_hidden,
+                            attention_bias=attention_bias,  # This mask isolates prefix tokens
+                            position_ids=position_ids,
+                            drop_mask=response_mask,
+                            layer_past=layer_past,
+                            use_cache=use_cache,
+                            return_qkv=True
+                        )
+                    prefix_hidden, prefix_cache, (prefix_q, prefix_k, prefix_v) = prefix_result
                 
                 # Step 2: Get action block's Q, K, V
                 action_q, action_k, action_v = action_block.get_qkv(action_hidden)
@@ -2953,7 +2969,6 @@ class Molmo(nn.Module):
                 
                 # Step 4: Split attention output by position and apply to action block
                 # att_multi_head shape: (B, nh, prefix_len+action_len, head_dim)
-                prefix_len = prefix_hidden.shape[1]
                 action_len = action_hidden.shape[1]
                 
                 action_att_mh = att_multi_head[:, :, prefix_len:prefix_len+action_len, :]  # (B, nh, action_len, head_dim)
@@ -2980,9 +2995,11 @@ class Molmo(nn.Module):
                 # VLM block already applied FFN in its forward pass
                 action_hidden = action_block.apply_ffn(action_hidden, action_hidden)
                 
-                # Cache handling
+                # Cache handling: save (prefix_k, prefix_v) for reuse in subsequent ODE steps
+                # These are the K, V values actually used in shared attention (with RoPE applied)
+                # Note: This is different from prefix_cache which may have q_norm/k_norm applied
                 if attn_key_values is not None:
-                    attn_key_values.append(prefix_cache if prefix_cache is not None else cache)
+                    attn_key_values.append((prefix_k, prefix_v))
                         
             # After all layers, compute velocity predictions from action_hidden (before projection)
             # This uses action_expert_d_model directly, avoiding unnecessary projection to d_model
@@ -3105,12 +3122,13 @@ class Molmo(nn.Module):
         initial_noise: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         proprio_state: Optional[torch.Tensor] = None,
+        use_kv_cache: bool = True,
     ) -> torch.Tensor:
         """
         Sample actions using flow matching with ODE integration OR direct prediction.
         
         This implements the inference procedure from openpi's Pi0:
-        1. Cache the prefix (text/image) keys and values
+        1. Cache the prefix (text/image) keys and values (on first step)
         2. Start from noise at t=1
         3. Integrate ODE with Euler steps: x_t = x_t + dt * v_t
         4. Return denoised actions at t=0
@@ -3128,6 +3146,7 @@ class Molmo(nn.Module):
             initial_noise: Optional initial noise (default: sample from N(0,1))
             position_ids: Position IDs for tokens (batch_size, seq_len)
             proprio_state: Optional proprioceptive state (batch_size, proprio_dim)
+            use_kv_cache: Whether to use KV caching for prefix (default: True for efficiency)
             
         Returns:
             actions: Predicted actions (batch_size, action_horizon, action_dim)
@@ -3169,37 +3188,71 @@ class Molmo(nn.Module):
         dt = -1.0 / num_steps
         time = 1.0
         
-        # ODE integration loop
-        # NOTE: We don't use KV caching here because it would require storing
-        # keys/values for ~2000-3000 tokens (text + image patches) across all layers,
-        # which consumes 2-3GB of memory. Instead, we re-process the prefix each step,
-        # which trades computation for memory efficiency.
-        for step in range(num_steps):
-            # Current time
-            t = torch.full((batch_size,), time, device=device)
+        # Use KV caching for efficiency: compute prefix K,V once and reuse
+        if use_kv_cache and self.action_expert is not None:
+            prefix_kv_cache = None
             
-            # Forward pass with current noisy actions
-            # The prefix (text/images) is re-processed each step for memory efficiency
-            with torch.autocast("cuda", enabled=False):
-                output = self(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    images=images,
-                    image_masks=image_masks,
-                    image_input_idx=image_input_idx,
-                    position_ids=position_ids,
-                    use_cache=False,  # No caching to save memory
-                    noisy_actions=x_t,
-                    action_timestep=t,
-                    proprio_state=proprio_state,
-                )
-            
-            # Get predicted velocity
-            v_t = output.velocity_output  # (batch_size, action_horizon, action_dim)
-            
-            # Euler step: x_t = x_t + dt * v_t
-            x_t = x_t + dt * v_t
-            time = time + dt
+            for step in range(num_steps):
+                t = torch.full((batch_size,), time, device=device)
+                
+                with torch.autocast("cuda", enabled=False):
+                    if step == 0:
+                        # First step: compute with images and cache prefix KV
+                        output = self(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            images=images,
+                            image_masks=image_masks,
+                            image_input_idx=image_input_idx,
+                            position_ids=position_ids,
+                            use_cache=True,  # Enable caching to get prefix KV
+                            noisy_actions=x_t,
+                            action_timestep=t,
+                            proprio_state=proprio_state,
+                        )
+                        # Save the prefix KV cache for subsequent steps
+                        prefix_kv_cache = output.attn_key_values
+                    else:
+                        # Subsequent steps: use cached prefix KV, skip VLM processing
+                        output = self(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            images=images,  # Still passed but VLM blocks are skipped
+                            image_masks=image_masks,
+                            image_input_idx=image_input_idx,
+                            position_ids=position_ids,
+                            use_cache=False,
+                            noisy_actions=x_t,
+                            action_timestep=t,
+                            proprio_state=proprio_state,
+                            prefix_kv_cache=prefix_kv_cache,  # Use cached prefix KV
+                        )
+                
+                v_t = output.velocity_output
+                x_t = x_t + dt * v_t
+                time = time + dt
+        else:
+            # Fallback: re-process prefix each step (less efficient but more general)
+            for step in range(num_steps):
+                t = torch.full((batch_size,), time, device=device)
+                
+                with torch.autocast("cuda", enabled=False):
+                    output = self(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        images=images,
+                        image_masks=image_masks,
+                        image_input_idx=image_input_idx,
+                        position_ids=position_ids,
+                        use_cache=False,
+                        noisy_actions=x_t,
+                        action_timestep=t,
+                        proprio_state=proprio_state,
+                    )
+                
+                v_t = output.velocity_output
+                x_t = x_t + dt * v_t
+                time = time + dt
         
         return x_t
 

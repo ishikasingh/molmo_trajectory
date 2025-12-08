@@ -250,8 +250,10 @@ class TrajectoryDataset(Dataset):
                 if part_dir.exists():
                     split_dirs.append(part_dir)
         elif self.split == "test":
-            # split_dirs = [self.data_dir / "test"]
-            split_dirs = [self.data_dir / "small_test"]
+            split_dirs = [self.data_dir / "test"]
+            # split_dirs = [self.data_dir / "small_test"]
+        elif self.split == "test_pick_and_place":
+            split_dirs = [self.data_dir / "test_pick_and_place"]
         elif self.split == "overfit":
             print("!!Using overfit split")
             split_dirs = [self.data_dir / "very_small_test"]
