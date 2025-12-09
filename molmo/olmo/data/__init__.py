@@ -387,7 +387,7 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
             normalize_coordinates=bool(stats_file),
             stats_file=stats_file,
             output_format="flow_matching",
-            frame_downsampling_ratio=30,
+            frame_downsampling_ratio=10,
             trajectory_representation="delta" # default to be delta, as it works 
         )
     
