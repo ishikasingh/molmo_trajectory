@@ -278,6 +278,11 @@ if __name__ == "__main__":
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
         data_split = "overfit"
+    elif args.mixture == "trajectory_3d_fm_pick_and_place":
+        # Flow matching based 3D trajectory prediction with delta representation
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
+        data_split = "train_pick_and_place"
     elif args.mixture == "robo_casa_affordance":
         # eval_tasks = ["robo_casa_affordance"]
         eval_tasks = []

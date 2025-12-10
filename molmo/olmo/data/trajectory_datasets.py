@@ -252,6 +252,8 @@ class TrajectoryDataset(Dataset):
         elif self.split == "test":
             split_dirs = [self.data_dir / "test"]
             # split_dirs = [self.data_dir / "small_test"]
+        elif self.split == "train_pick_and_place":
+            split_dirs = [self.data_dir / "part_pick_and_place"]
         elif self.split == "test_pick_and_place":
             split_dirs = [self.data_dir / "test_pick_and_place"]
         elif self.split == "overfit":
