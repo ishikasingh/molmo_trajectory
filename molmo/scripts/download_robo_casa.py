@@ -9,7 +9,8 @@ from huggingface_hub import HfApi
 
 import lerobot
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.constants import HF_LEROBOT_HOME
+# from lerobot.constants import HF_LEROBOT_HOME
+HF_LEROBOT_HOME = Path("/root/.cache/huggingface/lerobot")
 
 def ensure_git_lfs():
     """Ensure git lfs is installed and initialized."""

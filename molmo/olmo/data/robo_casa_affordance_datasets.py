@@ -1,337 +1,244 @@
-import json
+#!/usr/bin/env python3
+"""
+RoboCasa Affordance Dataset for VLA Training
+
+This module provides a dataset implementation for RoboCasa trajectory prediction.
+Currently uses dummy data for debugging the training pipeline.
+TODO: Implement actual data loading from RoboCasa dataset.
+"""
+
+import os
 import numpy as np
-import datasets
-from PIL import Image, ImageDraw, ImageFont
-from olmo.data.dataset import Dataset
-from pathlib import Path
-from pprint import pprint
-import time
-import random
-# import matplotlib.pyplot as plt
-import cv2
-import warnings
 import torch
+from pathlib import Path
+from typing import Dict, List, Optional
+from PIL import Image
+from olmo.data.dataset import Dataset
 
-# import lerobot
-# from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-warnings.filterwarnings("ignore", message=".*video decoding and encoding capabilities.*", category=UserWarning)
 
-class RobotCasaHandPositioningDataset(Dataset):
-    def __init__(self, use_new_output_format=False, ignore_wrist=False):
-        """
-        data_path: Path to your dataset
-        split: "train", "validation", or "test"
-        max_retries: Maximum number of retry attempts for loading dataset
-        retry_delay: Base delay between retries (will be randomized with jitter)
-        """
-        self.repo_id = "ishika/robocasa_gr1_tabletop_tasks_fingertips_corrected"
-        
-        # Load metadata with retry logic
-        self.metadata = LeRobotDatasetMetadata(self.repo_id)
-        # Load dataset with retry logic
-        self.data = LeRobotDataset(self.repo_id, video_backend="pyav")
-        self.use_new_output_format = use_new_output_format
-        self.ignore_wrist = ignore_wrist
-
-    def __len__(self):
-        return len(self.data)
+class RoboCasaTrajectoryDataset(Dataset):
+    """PyTorch Dataset for RoboCasa trajectory prediction training (3D flow matching only)."""
     
-    def get(self, item, rng):
-        example = self.data[item]
-        image_tensor = example["observation.images.egoview"]  # torch [3, 256, 256]
-        # Convert torch tensor to PIL Image
-        image = Image.fromarray(
-            (image_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        )
-
-        # Get image dimensions for normalization
-        img_h, img_w = image.size[1], image.size[0]  # PIL Image size is (width, height)
-
-        hand_position_2d = example["observation.condition_2D_current_camera_frame"].reshape(12, 2)  # torch [12, 2]
-
-        # swap the order of the fingers to match the order in the affordance_datsets.py
-        left_fingers = hand_position_2d[5:10]
-        right_fingers = hand_position_2d[0:5]
-        left_wrist = hand_position_2d[10:11]
-        right_wrist = hand_position_2d[11:12]
-        # note: the order for each keypoint is:
-        # [left hand, left thumb, left index, left middle, left ring, left pinky, right hand, right thumb, right index, right middle, right ring, right pinky]
-        if self.ignore_wrist:
-            hand_positions = np.concatenate([left_fingers, right_fingers], axis=0)
-        else:
-            hand_positions = np.concatenate([left_wrist, left_fingers, right_wrist, right_fingers], axis=0)
-        if self.ignore_wrist:
-            assert hand_positions.shape == (10, 2)
-        else:
-            assert hand_positions.shape == (12, 2)
+    # Class-level parameter for limiting examples in overfit split
+    overfit_num_examples: Optional[int] = 10
+    
+    def __init__(
+        self,
+        data_dir: str = None,
+        split: str = "train",
+        action_chunking_horizon: int = 30,
+        joint_names: Optional[List[str]] = None,
+        normalize_coordinates: bool = True,
+        stats_file: Optional[str] = None,
+        trajectory_representation: str = "absolute",  # "absolute" or "delta"
+        load_images: bool = True,
+        # Dummy data configuration
+        dummy_num_samples: int = 1000,
+        dummy_image_size: tuple = (256, 256),
+    ):
+        """
+        Initialize RoboCasa Trajectory Dataset (3D flow matching only).
         
-        # Normalize the hand positions to percentage coordinates (vectorized)
-        hand_positions = (hand_positions / [img_w, img_h]) * 100.0
-
-        language_instruction = example["task"]
-        # language_instruction = self.language_mapping(language_instruction)
+        Args:
+            data_dir: Path to data directory (not used in dummy mode)
+            split: Dataset split ('train', 'test', 'overfit')
+            action_chunking_horizon: Number of frames in action chunks
+            joint_names: List of joint names to use
+            normalize_coordinates: Whether to normalize coordinates
+            stats_file: Path to stats file for normalization
+            trajectory_representation: 'absolute' or 'delta'
+            load_images: Whether to load images
+            dummy_num_samples: Number of dummy samples to generate
+            dummy_image_size: Size of dummy images (H, W)
+        """
+        self.data_dir = Path(data_dir) if data_dir is not None else None
+        self.split = split
+        self.action_chunking_horizon = action_chunking_horizon
+        self.normalize_coordinates = normalize_coordinates
+        self.stats_file = stats_file
+        self.trajectory_representation = trajectory_representation
+        self.overfit_num_examples = type(self).overfit_num_examples
+        self.load_images = load_images
+        self.dummy_image_size = dummy_image_size
+        
+        # Validate parameters
+        assert trajectory_representation in ["absolute", "delta"], \
+            f"trajectory_representation must be 'absolute' or 'delta', got {trajectory_representation}"
+        
+        # Load normalization stats if needed
+        if self.normalize_coordinates and self.stats_file is not None and os.path.exists(self.stats_file):
+            print(f"Loading trajectory normalization stats from {self.stats_file}...")
+            stats = torch.load(self.stats_file)
+            self.stats_mean = stats["mean"].float() if isinstance(stats["mean"], torch.Tensor) else torch.tensor(stats["mean"]).float()
+            self.stats_std = stats["std"].float() if isinstance(stats["std"], torch.Tensor) else torch.tensor(stats["std"]).float()
+        else:
+            self.stats_mean = None
+            self.stats_std = None
+        
+        # Default joint names matching TrajectoryDataset
+        if joint_names is None:
+            self.joint_names = [
+                'leftThumbTip', 'leftIndexFingerTip', 'leftMiddleFingerTip', 'leftRingFingerTip', 'leftLittleFingerTip',
+                'rightThumbTip', 'rightIndexFingerTip', 'rightMiddleFingerTip', 'rightRingFingerTip', 'rightLittleFingerTip'
+            ]
+        else:
+            self.joint_names = joint_names
+        
+        self.num_joints = len(self.joint_names)
+        self.coord_dim = 3  # Always 3D
+        
+        # Calculate number of samples based on split
+        if self.split == "overfit" and self.overfit_num_examples is not None:
+            self.num_samples = self.overfit_num_examples
+        elif self.split == "test":
+            self.num_samples = min(100, dummy_num_samples)
+        else:
+            self.num_samples = dummy_num_samples
+        
+        # Dummy task instructions
+        self.dummy_instructions = [
+            "Pick up the object on the placemat and place it on the shelf",
+            "Pick up the object on the cutting board and place it in the basket",
+            "Pick up the bottle and place it in the cabinet",
+            "Pick up the object on the tray and place it on the plate",
+            "Pick up the cup and place it in the drawer",
+            "Move the object from the counter to the table",
+            "Grasp the item and transfer it to the container",
+            "Pick up the food item and place it in the pan",
+        ]
+        
+        print(f"[RoboCasaTrajectoryDataset] Initialized with {self.num_samples} DUMMY samples for {split} split")
+        print(f"  - action_chunking_horizon: {action_chunking_horizon}")
+        print(f"  - trajectory_representation: {trajectory_representation}")
+        print(f"  - num_joints: {self.num_joints}, coord_dim: {self.coord_dim}")
+        print("  - WARNING: Using dummy data! Implement actual data loading for real training.")
+    
+    def __len__(self):
+        return self.num_samples
+    
+    def get(self, idx, rng):
+        """Get a single training example with dummy data."""
+        # Use idx as seed for reproducibility
+        np.random.seed(idx)
+        
+        # Generate dummy image
+        if self.load_images:
+            image = self._generate_dummy_image(idx)
+        else:
+            image = Image.fromarray(np.zeros((1, 1, 3), dtype=np.uint8))
+        
+        # Generate dummy trajectory: shape (action_chunking_horizon, num_joints, 3)
+        trajectory = self._generate_dummy_trajectory(idx)
+        
+        # Get initial state (first frame, flattened)
+        initial_state = trajectory[0].reshape(-1).astype(np.float32)
+        
+        # Convert to delta representation if requested
+        if self.trajectory_representation == "delta":
+            trajectory = self._convert_to_delta_representation(trajectory)
+        
+        # Get instruction
+        instruction = self.dummy_instructions[idx % len(self.dummy_instructions)]
+        
+        # Flatten trajectory: [num_steps, num_joints, 3] -> [num_steps, num_joints*3]
+        num_steps = trajectory.shape[0]
+        trajectory_flattened = trajectory.reshape(num_steps, -1).astype(np.float32)
         
         return {
-            "image": image,
-            "message_list": [
+            'image': image,
+            'state': initial_state,
+            'message_list': [
                 {
-                    "label": language_instruction,
-                    "points": hand_positions,
-                    "point_scale": 100,  # Our coordinates are already in percentage (0-100)
-                    "style": "affordance" if not self.use_new_output_format else "affordance_new"
+                    'label': instruction,
+                    'points': trajectory,
+                    'point_scale': None,
+                    'style': 'trajectory_3d_fm',
+                    'state': initial_state,
                 }
             ],
-            "metadata": {
-                # "image": image,  # Add this line - put image in metadata too
-                # "image_path": safe_get(example, "image_path", ""),
-                # "hand_data": example["hand_positions"],  # Keep original for debugging
-                # "video_id": safe_get(metadata, "video_id", ""),
-                # "frame_idx": safe_get(metadata, "frame_idx", 0),
-                # "image_size": safe_get(metadata, "image_size", [1920, 1080])
+            'trajectory_target': trajectory_flattened,
+            'trajectory_shape': trajectory.shape,
+            'metadata': {
+                'image': image,
+                'task_name': f'dummy_task_{idx % len(self.dummy_instructions)}',
+                'frame_idx': idx,
+                'output_2d_trajectory': False,
+                'trajectory_representation': self.trajectory_representation,
             }
         }
     
-    # def visualize_hand_positions(self, item, save_path=None):
-    #     """
-    #     Visualize hand positions on the image for a given item.
+    def _generate_dummy_image(self, idx: int) -> Image.Image:
+        """Generate a dummy image with some visual features for debugging."""
+        h, w = self.dummy_image_size
+        image = np.zeros((h, w, 3), dtype=np.uint8)
         
-    #     Args:
-    #         item: Index of the item to visualize
-    #         save_path: Optional path to save the visualization
-    #     """
-    #     data = self.get(item, None)
-    #     image = data["image"]
-    #     hand_positions = data["message_list"][0]["points"]
-    #     instruction = data["message_list"][0]["label"]
+        # Background gradient
+        for i in range(h):
+            for j in range(w):
+                image[i, j, 0] = int((i / h) * 128 + (idx % 128))
+                image[i, j, 1] = int((j / w) * 128 + ((idx * 7) % 128))
+                image[i, j, 2] = int(((i + j) / (h + w)) * 128 + ((idx * 13) % 128))
         
-    #     # Convert percentage coordinates back to pixel coordinates
-    #     img_w, img_h = image.size
-    #     pixel_positions = (hand_positions / 100.0) * np.array([img_w, img_h])
+        # Add a simple "object" rectangle
+        obj_x = (idx * 17) % (w - 40) + 20
+        obj_y = (idx * 23) % (h - 40) + 20
+        image[obj_y:obj_y+30, obj_x:obj_x+30] = [255, 200, 100]
         
-    #     # Create a copy of the image for drawing
-    #     vis_image = image.copy()
-    #     draw = ImageDraw.Draw(vis_image)
+        return Image.fromarray(image)
+    
+    def _generate_dummy_trajectory(self, idx: int) -> np.ndarray:
+        """
+        Generate a dummy 3D trajectory for debugging.
         
-    #     # Define colors for different hand parts (12 points total)
-    #     colors = [
-    #         (255, 0, 0),    # Red - thumb tip
-    #         (255, 100, 0),  # Orange - thumb IP
-    #         (255, 200, 0),  # Yellow - thumb MCP
-    #         (0, 255, 0),    # Green - index tip
-    #         (0, 255, 100),  # Light green - index PIP
-    #         (0, 255, 200),  # Lighter green - index MCP
-    #         (0, 0, 255),    # Blue - middle tip
-    #         (100, 0, 255),  # Purple - middle PIP
-    #         (200, 0, 255),  # Magenta - middle MCP
-    #         (255, 0, 255),  # Pink - ring tip
-    #         (255, 100, 255), # Light pink - ring PIP
-    #         (255, 200, 255)  # Lighter pink - ring MCP
-    #     ]
+        Returns:
+            np.ndarray of shape (action_chunking_horizon, num_joints, 3)
+        """
+        num_steps = self.action_chunking_horizon
+        t = np.linspace(0, 2 * np.pi, num_steps)
         
-    #     # Draw hand position points
-    #     point_radius = 3
-    #     for i, (x, y) in enumerate(pixel_positions):
-    #         color = colors[i % len(colors)]
-    #         # Draw filled circle
-    #         draw.ellipse([x - point_radius, y - point_radius, 
-    #                      x + point_radius, y + point_radius], 
-    #                     fill=color, outline=(255, 255, 255))
-    #         # Add point number
-    #         draw.text((x + 5, y - 5), str(i), fill=(255, 255, 255))
+        trajectory = np.zeros((num_steps, self.num_joints, 3), dtype=np.float32)
         
-    #     # Add instruction text
-    #     try:
-    #         # Try to use a default font
-    #         font = ImageFont.load_default()
-    #     except:
-    #         font = None
+        for j in range(self.num_joints):
+            phase = (idx + j) * 0.5
+            amplitude = 0.1 + 0.05 * (j % 5)
+            
+            # 3D trajectory in camera frame (meter scale)
+            start_x = 0.0 + 0.05 * (j % 5)
+            start_y = 0.1 + 0.05 * (j // 5)
+            start_z = 0.5 + 0.02 * j
+            
+            trajectory[:, j, 0] = start_x + amplitude * np.sin(t + phase)
+            trajectory[:, j, 1] = start_y + amplitude * np.cos(t + phase * 0.7)
+            trajectory[:, j, 2] = start_z + amplitude * 0.5 * np.sin(t * 0.5 + phase)
         
-    #     # Add text at the top of the image
-    #     text_y = 10
-    #     draw.text((10, text_y), f"Instruction: {instruction}", 
-    #              fill=(255, 255, 255), font=font)
-    #     draw.text((10, text_y + 20), f"Hand positions (12 points):", 
-    #              fill=(255, 255, 255), font=font)
-        
-    #     # Print coordinate information
-    #     print(f"\n=== Item {item} ===")
-    #     print(f"Instruction: {instruction}")
-    #     print(f"Image size: {img_w} x {img_h}")
-    #     print("Hand positions (pixel coordinates):")
-    #     for i, (x, y) in enumerate(pixel_positions):
-    #         print(f"  Point {i}: ({x:.1f}, {y:.1f})")
-        
-    #     if save_path:
-    #         vis_image.save(save_path)
-    #         print(f"Visualization saved to: {save_path}")
-        
-    #     return vis_image
+        return trajectory
+    
+    def _convert_to_delta_representation(self, trajectory: np.ndarray) -> np.ndarray:
+        """Convert absolute positions to delta positions (velocities)."""
+        deltas = trajectory[1:] - trajectory[:-1]
+        last_delta = deltas[-1:]
+        return np.concatenate([deltas, last_delta], axis=0)
 
-    # def visualize_hand_positions_video(self, start_idx, num_frames=30, fps=10, save_path="hand_positions_video.mp4"):
-    #     """
-    #     Create a video visualization of hand positions across consecutive frames.
-        
-    #     Args:
-    #         start_idx: Starting index for the sequence
-    #         num_frames: Number of consecutive frames to include
-    #         fps: Frames per second for the video
-    #         save_path: Path to save the video file
-    #     """
-    #     # Get video dimensions from first frame
-    #     first_data = self.get(start_idx, None)
-    #     first_image = first_data["image"]
-    #     img_w, img_h = first_image.size
-        
-    #     # Initialize video writer
-    #     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    #     video_writer = cv2.VideoWriter(save_path, fourcc, fps, (img_w, img_h))
-        
-    #     print(f"Creating video with {num_frames} frames starting from index {start_idx}")
-    #     print(f"Video settings: {img_w}x{img_h}, {fps} FPS")
-        
-    #     for i in range(num_frames):
-    #         frame_idx = start_idx + i
-    #         if frame_idx >= len(self.data):
-    #             print(f"Reached end of dataset at frame {i}")
-    #             break
-                
-    #         print(f"Processing frame {i+1}/{num_frames} (dataset index {frame_idx})")
-            
-    #         # Get data for this frame
-    #         data = self.get(frame_idx, None)
-    #         image = data["image"]
-    #         hand_positions = data["message_list"][0]["points"]
-    #         instruction = data["message_list"][0]["label"]
-            
-    #         # Convert percentage coordinates back to pixel coordinates
-    #         pixel_positions = (hand_positions / 100.0) * np.array([img_w, img_h])
-            
-    #         # Create a copy of the image for drawing
-    #         vis_image = image.copy()
-    #         draw = ImageDraw.Draw(vis_image)
-            
-    #         # Define colors for different hand parts (12 points total)
-    #         colors = [
-    #             (255, 0, 0),    # Red - thumb tip
-    #             (255, 100, 0),  # Orange - thumb IP
-    #             (255, 200, 0),  # Yellow - thumb MCP
-    #             (0, 255, 0),    # Green - index tip
-    #             (0, 255, 100),  # Light green - index PIP
-    #             (0, 255, 200),  # Lighter green - index MCP
-    #             (0, 0, 255),    # Blue - middle tip
-    #             (100, 0, 255),  # Purple - middle PIP
-    #             (200, 0, 255),  # Magenta - middle MCP
-    #             (255, 0, 255),  # Pink - ring tip
-    #             (255, 100, 255), # Light pink - ring PIP
-    #             (255, 200, 255)  # Lighter pink - ring MCP
-    #         ]
-            
-    #         # Draw hand position points
-    #         point_radius = 3
-    #         for j, (x, y) in enumerate(pixel_positions):
-    #             color = colors[j % len(colors)]
-    #             # Draw filled circle
-    #             draw.ellipse([x - point_radius, y - point_radius, 
-    #                          x + point_radius, y + point_radius], 
-    #                         fill=color, outline=(255, 255, 255))
-    #             # Add point number
-    #             draw.text((x + 5, y - 5), str(j), fill=(255, 255, 255))
-            
-    #         # Add instruction text and frame info
-    #         try:
-    #             font = ImageFont.load_default()
-    #         except:
-    #             font = None
-            
-    #         # Add text at the top of the image
-    #         text_y = 10
-    #         draw.text((10, text_y), f"Frame: {frame_idx} | Instruction: {instruction}", 
-    #                  fill=(255, 255, 255), font=font)
-    #         draw.text((10, text_y + 20), f"Hand positions (12 points) - Frame {i+1}/{num_frames}", 
-    #                  fill=(255, 255, 255), font=font)
-            
-    #         # Convert PIL image to OpenCV format (RGB to BGR)
-    #         vis_array = np.array(vis_image)
-    #         vis_bgr = cv2.cvtColor(vis_array, cv2.COLOR_RGB2BGR)
-            
-    #         # Write frame to video
-    #         video_writer.write(vis_bgr)
-        
-    #     # Release video writer
-    #     video_writer.release()
-    #     print(f"Video saved to: {save_path}")
-        
-    #     return save_path
 
-    def language_mapping(self, language_instruction):
-        mapping_mapping = {
-            "PosttrainPnPNovelFromPlacematToTieredshelfSplitA": "Pick up the object on the placemat and place it on the shelf",
-            "PosttrainPnPNovelFromCuttingboardToBasketSplitA": "Pick up the object on the cutting board and place it in the basket",
-            "PosttrainPnPNovelFromTrayToTieredshelfSplitA": "Pick up the object on the tray and place it on the tiered shelf",
-            "PnPBottleToCabinetClose": "Pick up the bottle and place it in the cabinet",
-            "PosttrainPnPNovelFromCuttingboardToTieredbasketSplitA": "Pick up the object on the cutting board and place it in the basket",
-            "PosttrainPnPNovelFromCuttingboardToCardboardboxSplitA": "Pick up the object on the cutting board and place it in the cardboard box",
-            "PosttrainPnPNovelFromPlateToPanSplitA": "Pick up the object on the plate and place it on the pan",
-            "PosttrainPnPNovelFromPlacematToBasketSplitA": "Pick up the object on the placemat and place it in the basket",
-            "PosttrainPnPNovelFromTrayToCardboardboxSplitA": "Pick up the object on the tray and place it in the cardboard box",
-            "PosttrainPnPNovelFromCuttingboardToPotSplitA": "Pick up the object on the cutting board and place it in the pot",
-            "PnPWineToCabinetClose": "Pick up the wine and place it in the cabinet",
-            "PosttrainPnPNovelFromTrayToPotSplitA": "Pick up the object on the tray and place it in the pot",
-            "PosttrainPnPNovelFromPlateToBowlSplitA": "Pick up the object on the plate and place it in the bowl",
-            "PosttrainPnPNovelFromTrayToPlateSplitA": "Pick up the object on the tray and place it on the plate",
-            "PnPMilkToMicrowaveClose": "Pick up the milk and place it in the microwave",
-            "PnPPotatoToMicrowaveClose": "Pick up the potato and place it in the microwave",
-            "PosttrainPnPNovelFromCuttingboardToPanSplitA": "Pick up the object on the cutting board and place it on the pan",
-            "PosttrainPnPNovelFromPlacematToPlateSplitA": "Pick up the object on the placemat and place it on the plate",
-            "PnPCupToDrawerClose": "Pick up the cup and place it in the drawer",
-            "PnPCanToDrawerClose": "Pick up the can and place it in the drawer"
-        }
-        return mapping_mapping[language_instruction]
+# Alias for backwards compatibility
+RobotCasaHandPositioningDataset = RoboCasaTrajectoryDataset
+
 
 if __name__ == "__main__":
-    dataset = RobotCasaHandPositioningDataset(ignore_wrist=True, use_new_output_format=True)
-    print(dataset.get(0, None))
+    print("Testing RoboCasaTrajectoryDataset with dummy data...\n")
     
-    # Option 1: Create a video from consecutive frames
-    # print("Creating video from consecutive frames...")
-    # video_path = dataset.visualize_hand_positions_video(
-    #     start_idx=0, 
-    #     num_frames=1000,  # 30 consecutive frames
-    #     fps=30,         # 10 frames per second
-    #     save_path="hand_positions_sequence.mp4"
-    # )
+    dataset = RoboCasaTrajectoryDataset(
+        split="overfit",
+        action_chunking_horizon=30,
+        dummy_num_samples=100,
+    )
     
-    # Option 2: Save individual frames as images
-    # print("\nSaving individual frames...")
-    # dataset.visualize_hand_positions_sequence(
-    #     start_idx=0,
-    #     num_frames=10,  # 10 consecutive frames
-    #     save_dir="frame_sequence"
-    # )
-    
-    # # Option 3: Visualize a few individual examples (original functionality)
-    # print("\nVisualizing individual examples...")
-    # num_examples = 3
-    # for i in range(min(num_examples, len(dataset))):
-    #     print(f"\n{'='*50}")
-    #     print(f"Visualizing example {i}")
-    #     print(f"{'='*50}")
-        
-    #     # Create visualization
-    #     vis_image = dataset.visualize_hand_positions(i, save_path=f"hand_positions_example_{i}.png")
-        
-    #     # Display the image (if matplotlib is available)
-    #     try:
-    #         plt.figure(figsize=(12, 8))
-    #         plt.imshow(vis_image)
-    #         plt.title(f"Hand Positions - Example {i}")
-    #         plt.axis('off')
-    #         plt.show()
-    #     except Exception as e:
-    #         print(f"Could not display image: {e}")
-    #         print("Image saved as PNG file instead.")
-    
-    # print(f"\nAll visualizations complete!")
-    # print(f"- Video: {video_path}")
-    # print(f"- Individual frames: frame_sequence/")
-    # print(f"- Individual examples: hand_positions_example_*.png")
+    sample = dataset.get(0, None)
+    print(f"\nSample output:")
+    print(f"  Image shape: {np.array(sample['image']).shape}")
+    print(f"  State shape: {sample['state'].shape}")
+    print(f"  Trajectory target shape: {sample['trajectory_target'].shape}")
+    print(f"  Trajectory original shape: {sample['trajectory_shape']}")
+    print(f"  Style: {sample['message_list'][0]['style']}")
+    print(f"  Label: {sample['message_list'][0]['label']}")
+    print(f"\nDummy data generation working correctly!")

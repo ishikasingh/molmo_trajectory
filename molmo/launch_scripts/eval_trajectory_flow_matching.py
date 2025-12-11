@@ -500,10 +500,10 @@ def main():
                        help="Trajectory representation mode: 'absolute' positions or 'delta' (velocity)")
     parser.add_argument("--save_3d_trajectory", action="store_true",
                        help="Save 3D trajectory data to .npz file")
-    parser.add_argument("--normalize_coordinates", action="store_true",
+    parser.add_argument("--normalize_coordinates", action="store_true", default=True,
                        help="Whether the model was trained with normalized coordinates (requires TRAJECTORY_STATS_FILE env var)")
     parser.add_argument("--num_inference_samples", type=int, default=1,
-                       help="Number of inference samples to generate. When > 1, selects the sample with minimum MSE to ground truth (useful for multi-modal tasks)")
+                       help="Number of inference samples to generate and choose the best one. When > 1, selects the sample with minimum MSE to ground truth (useful for multi-modal tasks)")
     parser.add_argument("--inference_seed", type=int, default=None,
                        help="Random seed for reproducible inference sampling (optional)")
     parser.add_argument("--split", type=str, default="test",
@@ -536,6 +536,9 @@ def main():
     
     print("Building preprocessor...")
     preprocessor = build_mm_preprocessor(model.config, for_inference=True, is_training=False)
+    
+    # Get tokenizer for decoding input tokens to text
+    tokenizer = model.config.get_tokenizer()
     
     # Load camera intrinsic and stats
     intrinsic = None
@@ -598,6 +601,17 @@ def main():
             "point_scale": example_row.get("point_scale"),
         }
         batch = preprocessor(example)
+        
+        # Decode and print the text prompt (VLM input)
+        input_tokens = batch["input_tokens"]
+        # Get image token positions to filter them out
+        image_positions = set(batch["image_input_idx"].flatten().tolist()) if "image_input_idx" in batch else set()
+        # Filter out image tokens and negative/padding tokens
+        text_tokens = [t for i, t in enumerate(input_tokens) if t >= 0 and i not in image_positions]
+        decoded_prompt = tokenizer.decode(text_tokens)
+        print(f"\n--- VLM Text Prompt ---")
+        print(decoded_prompt)
+        print(f"--- End of Prompt ---\n")
         
         # Move tensors to device
         device = torch.device(args.device)
