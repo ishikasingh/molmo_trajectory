@@ -115,6 +115,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_transitions", default=False, action="store_true",
                         help="whether to use transitions in the affordance dataset, transitions\
                         means whether the hand is from grasp to release or release to grasp")
+    parser.add_argument("--freeze_vlm", default=False, action="store_true",
+                        help="whether to freeze the VLM model")
     parser.add_argument(
         "--action_horizon",
         type=int,
@@ -442,8 +444,8 @@ if __name__ == "__main__":
             pin_memory=True,
             seed=50189
         ),
-        ft_connector=True,
-        ft_llm=True,
+        ft_connector=not args.freeze_vlm,
+        ft_llm=not args.freeze_vlm,
         # ft_vit=True,
         # ft_connector=False,
         # ft_llm=False,
