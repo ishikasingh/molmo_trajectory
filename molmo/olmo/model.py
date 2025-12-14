@@ -1994,16 +1994,22 @@ class OLMoOutput(NamedTuple):
 
     velocity_output: Optional[torch.FloatTensor] = None
     """
-    VELOCITY PREDICTIONS for flow matching (NOT the trajectory itself).
+    Model output for flow matching (NOT the trajectory itself during velocity mode).
     
     Shape: (batch_size, action_horizon, action_dim)
     
-    During training: Predicted velocity field, used to compute flow matching loss.
-                     Regressed against (noise - target) via MSE loss.
+    The interpretation depends on `flow_matching_prediction_type`:
     
-    During inference: Predicted velocity at current denoising step.
-                      Integrated via ODE to obtain clean trajectory.
-                      See sample_actions_flow_matching() for ODE integration.
+    When prediction_type == "velocity":
+        During training: Predicted velocity field, regressed against (noise - target) via MSE.
+        During inference: Predicted velocity at current denoising step.
+    
+    When prediction_type == "x0":
+        During training: Predicted clean target x0, regressed against target via MSE.
+        During inference: Predicted x0, converted to velocity as v = (x_t - x0_pred) / t.
+    
+    Both modes use ODE integration to obtain the final clean trajectory.
+    See sample_actions_flow_matching() for ODE integration.
     
     Only populated if `use_action_expert` is enabled.
     """
@@ -2433,12 +2439,23 @@ class Molmo(nn.Module):
         if config.vision_backbone is not None:
             self.vision_backbone = MolmoVisionBackbone.build(config)
 
-        # Action expert transformer for flow matching (OpenPI-style)
-        self.action_expert: Optional[ActionExpertTransformer] = None
+        # Action expert transformer(s) for flow matching (OpenPI-style)
+        # Supports multiple experts for different trajectory types (e.g., human vs robot)
+        # Always use action_experts ModuleList, even for single expert (simpler code path)
+        self.action_experts: Optional[nn.ModuleList] = None
+        self.num_action_experts: int = 0
+        
         if config.use_action_expert:
-            # Separate transformer for action processing
-            # Note: velocity_head is now inside ActionExpertTransformer
-            self.action_expert = ActionExpertTransformer(config, init_params=init_params)
+            num_experts = config.num_action_experts if config.num_action_experts else 1
+            self.num_action_experts = num_experts
+            
+            # Always create ModuleList, even for single expert
+            self.action_experts = nn.ModuleList([
+                ActionExpertTransformer(config, init_params=init_params)
+                for _ in range(num_experts)
+            ])
+            if num_experts > 1:
+                log.info(f"Created {num_experts} action experts for multi-expert mode")
 
         self.__num_fwd_flops: Optional[int] = None
 
@@ -2482,8 +2499,9 @@ class Molmo(nn.Module):
         if self.vision_backbone is not None:
             self.vision_backbone.set_activation_checkpointing(strategy)
         
-        if self.action_expert is not None:
-            self.action_expert.set_activation_checkpointing(strategy)
+        if self.action_experts is not None:
+            for expert in self.action_experts:
+                expert.set_activation_checkpointing(strategy)
     
     @staticmethod
     def get_connector_parameters():
@@ -2519,7 +2537,7 @@ class Molmo(nn.Module):
     def get_flow_matching_parameters():
         return tuple(
             [
-                "action_expert",
+                "action_experts",
             ]
         )
 
@@ -2610,8 +2628,9 @@ class Molmo(nn.Module):
         # Note: velocity_head is now inside ActionExpertTransformer and initialized there
 
         # Initialize action expert parameters (if exists)
-        if self.action_expert is not None:
-            self.action_expert.reset_parameters()
+        if self.action_experts is not None:
+            for expert in self.action_experts:
+                expert.reset_parameters()
 
         # Let the blocks handle themselves.
         if self.config.block_group_size == 1:
@@ -2621,6 +2640,315 @@ class Molmo(nn.Module):
             for block_group in self.transformer.block_groups:
                 block_group.reset_parameters()
 
+    def _route_velocity_prediction(
+        self, 
+        velocity_hidden: torch.Tensor, 
+        expert_type: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Route velocity prediction to appropriate expert(s) based on expert_type.
+        
+        Args:
+            velocity_hidden: (batch_size, action_horizon, action_expert_d_model)
+                Hidden states for velocity prediction
+            expert_type: (batch_size,) 
+                Expert index for each sample (0=human, 1=robot, etc.)
+                
+        Returns:
+            velocity_output: (batch_size, action_horizon, action_dim)
+                Combined velocity predictions from all experts
+        """
+        batch_size = velocity_hidden.shape[0]
+        device = velocity_hidden.device
+        dtype = velocity_hidden.dtype
+        
+        # Initialize output tensor
+        velocity_output = torch.zeros(
+            batch_size, 
+            self.config.action_horizon, 
+            self.config.action_dim,
+            device=device, 
+            dtype=dtype
+        )
+        
+        # Route each sample to its corresponding expert
+        for expert_id in range(self.num_action_experts):
+            mask = (expert_type == expert_id)
+            if mask.any():
+                expert = self.action_experts[expert_id]
+                # Process subset through this expert's velocity prediction
+                velocity_output[mask] = expert.predict_velocity(velocity_hidden[mask])
+        
+        return velocity_output
+
+    def _route_output_projection(
+        self, 
+        action_hidden: torch.Tensor, 
+        expert_type: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Route output projection through different experts based on expert_type.
+        
+        Args:
+            action_hidden: (batch_size, action_seq_len, action_expert_d_model)
+            expert_type: (batch_size,) Expert index for each sample
+                
+        Returns:
+            action_hidden_projected: (batch_size, action_seq_len, d_model)
+        """
+        batch_size = action_hidden.shape[0]
+        seq_len = action_hidden.shape[1]
+        device = action_hidden.device
+        dtype = action_hidden.dtype
+        
+        # Initialize output tensor with d_model dimension
+        action_hidden_projected = torch.zeros(
+            batch_size, 
+            seq_len,
+            self.config.d_model,
+            device=device, 
+            dtype=dtype
+        )
+        
+        for expert_id in range(self.num_action_experts):
+            mask = (expert_type == expert_id)
+            if mask.any():
+                expert = self.action_experts[expert_id]
+                action_hidden_projected[mask] = expert.output_proj(action_hidden[mask])
+        
+        return action_hidden_projected
+
+    def _embed_actions_multi_expert(
+        self,
+        noisy_actions: torch.Tensor,
+        action_timestep: torch.Tensor,
+        expert_type: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Embed noisy actions through different expert embedding layers based on expert_type.
+        
+        Args:
+            noisy_actions: (batch_size, action_horizon, action_dim)
+            action_timestep: (batch_size,)
+            expert_type: (batch_size,) Expert index for each sample
+            
+        Returns:
+            action_hidden: (batch_size, action_horizon, action_expert_d_model)
+        """
+        batch_size = noisy_actions.shape[0]
+        device = noisy_actions.device
+        dtype = noisy_actions.dtype
+        
+        # Initialize output tensor
+        action_hidden = torch.zeros(
+            batch_size,
+            self.config.action_horizon,
+            self.config.action_expert_d_model,
+            device=device,
+            dtype=dtype
+        )
+        
+        for expert_id in range(self.num_action_experts):
+            mask = (expert_type == expert_id)
+            if mask.any():
+                expert = self.action_experts[expert_id]
+                action_hidden[mask] = expert.embed_actions_with_time(
+                    noisy_actions[mask], action_timestep[mask]
+                )
+        
+        return action_hidden
+
+    def _embed_trajectory_queries_multi_expert(
+        self,
+        batch_size: int,
+        expert_type: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Get trajectory queries from different experts based on expert_type.
+        
+        Args:
+            batch_size: Total batch size
+            expert_type: (batch_size,) Expert index for each sample
+            
+        Returns:
+            action_hidden: (batch_size, action_horizon, action_expert_d_model)
+        """
+        device = expert_type.device
+        
+        # Initialize output tensor
+        action_hidden = torch.zeros(
+            batch_size,
+            self.config.action_horizon,
+            self.config.action_expert_d_model,
+            device=device,
+            dtype=torch.float32
+        )
+        
+        for expert_id in range(self.num_action_experts):
+            mask = (expert_type == expert_id)
+            n_samples = mask.sum().item()
+            if n_samples > 0:
+                expert = self.action_experts[expert_id]
+                action_hidden[mask] = expert.embed_trajectory_queries(n_samples)
+        
+        return action_hidden
+
+    def _embed_proprio_multi_expert(
+        self,
+        proprio_state: torch.Tensor,
+        expert_type: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Embed proprioceptive state through different expert embedding layers.
+        
+        Args:
+            proprio_state: (batch_size, proprio_dim)
+            expert_type: (batch_size,) Expert index for each sample
+            
+        Returns:
+            proprio_hidden: (batch_size, 1, action_expert_d_model)
+        """
+        batch_size = proprio_state.shape[0]
+        device = proprio_state.device
+        dtype = proprio_state.dtype
+        
+        # Initialize output tensor
+        proprio_hidden = torch.zeros(
+            batch_size,
+            1,
+            self.config.action_expert_d_model,
+            device=device,
+            dtype=dtype
+        )
+        
+        for expert_id in range(self.num_action_experts):
+            mask = (expert_type == expert_id)
+            if mask.any():
+                expert = self.action_experts[expert_id]
+                proprio_hidden[mask] = expert.embed_proprio(proprio_state[mask])
+        
+        return proprio_hidden
+
+    def _process_action_layer_multi_expert(
+        self,
+        block_idx: int,
+        action_hidden: torch.Tensor,
+        prefix_q: torch.Tensor,
+        prefix_k: torch.Tensor,
+        prefix_v: torch.Tensor,
+        prefix_len: int,
+        expert_type: torch.Tensor,
+        merged_attention_bias: Optional[torch.Tensor],
+        merged_position_ids: Optional[torch.Tensor],
+        response_mask: Optional[torch.Tensor],
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        use_cache: bool,
+    ) -> torch.Tensor:
+        """
+        Process action hidden states through multiple expert transformer blocks at a single layer.
+        
+        Routes samples to different expert blocks based on expert_type, processes them separately,
+        and combines results back into a single tensor.
+        
+        Args:
+            block_idx: Current layer index
+            action_hidden: (batch_size, action_seq_len, action_expert_d_model)
+            prefix_q, prefix_k, prefix_v: VLM prefix Q, K, V tensors
+            prefix_len: Length of prefix sequence
+            expert_type: (batch_size,) Expert index for each sample
+            merged_attention_bias: Attention bias for merged sequence
+            merged_position_ids: Position IDs for merged sequence
+            response_mask: Response mask
+            layer_past: Past key-value cache
+            use_cache: Whether to use caching
+            
+        Returns:
+            action_hidden: (batch_size, action_seq_len, action_expert_d_model) after processing
+        """
+        batch_size = action_hidden.shape[0]
+        action_len = action_hidden.shape[1]
+        device = action_hidden.device
+        dtype = action_hidden.dtype
+        
+        # Output tensor to collect results from all experts
+        action_hidden_out = torch.zeros_like(action_hidden)
+        
+        for expert_id in range(self.num_action_experts):
+            mask = (expert_type == expert_id)
+            if not mask.any():
+                continue
+                
+            # Get this expert's action block
+            expert = self.action_experts[expert_id]
+            action_block = expert.blocks[block_idx]
+            
+            # Get indices and subset of action_hidden for this expert
+            indices = mask.nonzero(as_tuple=True)[0]
+            action_hidden_subset = action_hidden[mask]  # (N_expert, action_len, d)
+            n_expert = action_hidden_subset.shape[0]
+            
+            # Subset prefix Q, K, V for samples belonging to this expert
+            # prefix_q shape: (B, nh, prefix_len, head_dim)
+            prefix_q_subset = prefix_q[mask]  # (N_expert, nh, prefix_len, head_dim)
+            prefix_k_subset = prefix_k[mask]
+            prefix_v_subset = prefix_v[mask]
+            
+            # Subset attention bias if present
+            merged_attention_bias_subset = None
+            if merged_attention_bias is not None:
+                if merged_attention_bias.shape[0] == batch_size:
+                    merged_attention_bias_subset = merged_attention_bias[mask]
+                else:
+                    # Broadcast case: attention bias is shared (e.g., shape [1, 1, L, L])
+                    merged_attention_bias_subset = merged_attention_bias
+            
+            # Subset position IDs if present
+            merged_position_ids_subset = None
+            if merged_position_ids is not None:
+                merged_position_ids_subset = merged_position_ids[mask]
+            
+            # Step 2: Get action block's Q, K, V for this expert's samples
+            action_q, action_k, action_v = action_block.get_qkv(action_hidden_subset)
+            
+            # Step 3: Shared attention with concatenated Q,K,V (OpenPI pattern)
+            att_multi_head, cache = action_block.shared_attention_multi_expert(
+                [(prefix_q_subset, prefix_k_subset, prefix_v_subset), (action_q, action_k, action_v)],
+                attention_bias=merged_attention_bias_subset,
+                position_ids=merged_position_ids_subset,
+                drop_mask=response_mask,
+                layer_past=layer_past,
+                use_cache=use_cache
+            )
+            
+            # Step 4: Split attention output by position
+            # att_multi_head shape: (N_expert, nh, prefix_len+action_len, head_dim)
+            action_att_mh = att_multi_head[:, :, prefix_len:prefix_len+action_len, :]
+            
+            # Step 5: Apply action block's output projection and residual
+            # Reshape to (N_expert, action_len, nh * head_dim)
+            N, nh, _, head_dim = action_att_mh.size()
+            action_att = action_att_mh.transpose(1, 2).contiguous().view(N, action_len, nh * head_dim)
+            
+            # Apply per-expert output projection
+            action_att_out = action_block.attn_out(action_att)
+            
+            # Optional post-attention norm
+            if action_block.config.norm_after:
+                if action_block._activation_checkpoint_fn is not None:
+                    action_att_out = action_block._activation_checkpoint_fn(action_block.attn_norm, action_att_out)
+                else:
+                    action_att_out = action_block.attn_norm(action_att_out)
+            
+            # Apply residual connection and dropout
+            action_hidden_subset = action_hidden_subset + action_block.dropout(action_att_out, drop_mask=None)
+            
+            # Step 6: Apply feed-forward network (per-expert)
+            action_hidden_subset = action_block.apply_ffn(action_hidden_subset, action_hidden_subset)
+            
+            # Store results back at the correct indices
+            action_hidden_out[mask] = action_hidden_subset
+        
+        return action_hidden_out
 
     def forward(
         self,
@@ -2643,6 +2971,8 @@ class Molmo(nn.Module):
         noisy_actions: Optional[torch.Tensor] = None,
         action_timestep: Optional[torch.Tensor] = None,
         proprio_state: Optional[torch.Tensor] = None,
+        # Expert type for multi-expert routing (0=human, 1=robot, etc.)
+        expert_type: Optional[torch.Tensor] = None,
         # Prefix KV cache for efficient ODE integration (flow matching inference)
         prefix_kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> OLMoOutput:
@@ -2775,26 +3105,45 @@ class Molmo(nn.Module):
             x = x * (self.config.d_model ** 0.5)
 
         # Flow matching: Prepare action expert processing (OpenPI-style)
-        has_action_tokens = (noisy_actions is not None or self.config.use_direct_trajectory_prediction) and self.action_expert is not None
+        has_action_tokens = (noisy_actions is not None or self.config.use_direct_trajectory_prediction) and self.action_experts is not None
         action_hidden = None
         action_position_ids = None
         velocity_output = None  # Will be set during action expert processing if has_action_tokens
         
         if has_action_tokens:
+            # Check if we need multi-expert routing for embeddings
+            use_multi_expert_embed = (
+                self.num_action_experts > 1 and 
+                expert_type is not None and 
+                self.action_experts is not None
+            )
+            
             if self.config.use_direct_trajectory_prediction:
                 # Direct trajectory prediction: use learnable queries
-                action_hidden = self.action_expert.embed_trajectory_queries(batch_size)
+                if use_multi_expert_embed:
+                    # Route trajectory queries through different experts
+                    action_hidden = self._embed_trajectory_queries_multi_expert(batch_size, expert_type)
+                else:
+                    action_hidden = self.action_experts[0].embed_trajectory_queries(batch_size)
             else:
                 # Embed noisy actions through action expert's input layers
                 # This gives us action embeddings in action_expert_d_model dimension
-                action_hidden = self.action_expert.embed_actions_with_time(
-                    noisy_actions, action_timestep
-                )  # (batch_size, action_horizon, action_expert_d_model)
+                if use_multi_expert_embed:
+                    # Route action embeddings through different experts
+                    action_hidden = self._embed_actions_multi_expert(noisy_actions, action_timestep, expert_type)
+                else:
+                    action_hidden = self.action_experts[0].embed_actions_with_time(
+                        noisy_actions, action_timestep
+                    )  # (batch_size, action_horizon, action_expert_d_model)
 
             # Add proprioception if enabled (goes before actions)
             proprio_len = 0
             if self.config.include_proprio and proprio_state is not None:
-                proprio_hidden = self.action_expert.embed_proprio(proprio_state)
+                if use_multi_expert_embed:
+                    # Route proprio embeddings through different experts
+                    proprio_hidden = self._embed_proprio_multi_expert(proprio_state, expert_type)
+                else:
+                    proprio_hidden = self.action_experts[0].embed_proprio(proprio_state)
                 action_hidden = torch.cat([proprio_hidden, action_hidden], dim=1)
                 proprio_len = proprio_hidden.shape[1]
 
@@ -2871,6 +3220,14 @@ class Molmo(nn.Module):
         if has_action_tokens and self.config.block_group_size == 1:
             # OpenPI pattern: Separate expert processing with shared attention
             # Each expert has its own weights (different widths) but same attention head structure
+            #
+            # Multi-expert mode (num_action_experts > 1, e.g., separate_human_robot):
+            # - VLM processing is shared across all samples (same prefix_hidden)
+            # - Action expert processing is FULLY SEPARATE per expert:
+            #   - Each expert has its own transformer blocks (get_qkv, attn_out, ffn)
+            #   - Samples are routed to their respective expert's blocks based on expert_type
+            #   - Implemented in _process_action_layer_multi_expert()
+            # - Velocity prediction is also routed to expert-specific heads
             prefix_hidden = x  # (B, prefix_len, d_model)
             prefix_len = prefix_hidden.shape[1]  # Save for later: separate prefix from action tokens
             # action_hidden already initialized above: (B, action_horizon, action_expert_d_model)
@@ -2912,23 +3269,30 @@ class Molmo(nn.Module):
             # Check if we have cached prefix KV (for efficient ODE integration)
             use_prefix_cache = prefix_kv_cache is not None and len(prefix_kv_cache) == len(self.transformer.blocks)
             
-            for block_idx, (vlm_block, action_block) in enumerate(zip(
-                self.transformer.blocks,
-                self.action_expert.blocks
-            )):
+            # Determine if we need multi-expert routing at the block level
+            use_multi_expert_blocks = (
+                self.num_action_experts > 1 and 
+                expert_type is not None and 
+                self.action_experts is not None
+            )
+            
+            for block_idx, vlm_block in enumerate(self.transformer.blocks):
                 if output_hidden_states:
                     # Concatenate for output
-                    combined = self.action_expert.output_proj(action_hidden)
+                    combined = self.action_experts[0].output_proj(action_hidden)
                     all_hidden_states.append(torch.cat([prefix_hidden, combined], dim=1))
                 
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
                 
+                # Get prefix Q, K, V (shared across all experts)
                 if use_prefix_cache:
                     # Use cached prefix K, V - skip VLM block processing entirely
                     prefix_k, prefix_v = prefix_kv_cache[block_idx]
                     # Create dummy prefix_q (zeros) since we only care about action attention output
+                    # Use first expert's block config for n_heads (all experts have same config)
+                    action_block_ref = self.action_experts[0].blocks[block_idx]
                     prefix_q = torch.zeros(
-                        batch_size, action_block.config.n_heads, prefix_len,
+                        batch_size, action_block_ref.config.n_heads, prefix_len,
                         prefix_k.shape[-1],  # head_dim
                         device=prefix_k.device, dtype=prefix_k.dtype
                     )
@@ -2954,46 +3318,67 @@ class Molmo(nn.Module):
                         )
                     prefix_hidden, prefix_cache, (prefix_q, prefix_k, prefix_v) = prefix_result
                 
-                # Step 2: Get action block's Q, K, V
-                action_q, action_k, action_v = action_block.get_qkv(action_hidden)
+                # Step 2-6: Process action through expert blocks
+                if use_multi_expert_blocks:
+                    # Multi-expert mode: route samples to different expert blocks
+                    action_hidden = self._process_action_layer_multi_expert(
+                        block_idx=block_idx,
+                        action_hidden=action_hidden,
+                        prefix_q=prefix_q,
+                        prefix_k=prefix_k,
+                        prefix_v=prefix_v,
+                        prefix_len=prefix_len,
+                        expert_type=expert_type,
+                        merged_attention_bias=merged_attention_bias,
+                        merged_position_ids=merged_position_ids,
+                        response_mask=response_mask,
+                        layer_past=layer_past,
+                        use_cache=use_cache,
+                    )
+                else:
+                    # Single expert mode: use self.action_experts[0].blocks
+                    action_block = self.action_experts[0].blocks[block_idx]
+                    
+                    # Step 2: Get action block's Q, K, V
+                    action_q, action_k, action_v = action_block.get_qkv(action_hidden)
+                    
+                    # Step 3: Shared attention with concatenated Q,K,V (OpenPI pattern)
+                    att_multi_head, cache = action_block.shared_attention_multi_expert(
+                        [(prefix_q, prefix_k, prefix_v), (action_q, action_k, action_v)],
+                        attention_bias=merged_attention_bias,
+                        position_ids=merged_position_ids,
+                        drop_mask=response_mask,
+                        layer_past=layer_past,
+                        use_cache=use_cache
+                    )
+                    
+                    # Step 4: Split attention output by position and apply to action block
+                    # att_multi_head shape: (B, nh, prefix_len+action_len, head_dim)
+                    action_len = action_hidden.shape[1]
+                    
+                    action_att_mh = att_multi_head[:, :, prefix_len:prefix_len+action_len, :]  # (B, nh, action_len, head_dim)
+                    
+                    # Step 5: Apply action block's output projection and residual
+                    # Reshape to (B, T, nh * head_dim) first
+                    B, nh, _, head_dim = action_att_mh.size()
+                    action_att = action_att_mh.transpose(1, 2).contiguous().view(B, action_len, nh * head_dim)
+                    
+                    # Apply per-expert output projection
+                    action_att_out = action_block.attn_out(action_att)
+                    
+                    # Optional post-attention norm (mirrors VLM block when norm_after=True)
+                    if action_block.config.norm_after:
+                        if action_block._activation_checkpoint_fn is not None:
+                            action_att_out = action_block._activation_checkpoint_fn(action_block.attn_norm, action_att_out)  # type: ignore[arg-type]
+                        else:
+                            action_att_out = action_block.attn_norm(action_att_out)
+                    
+                    # Apply residual connection and dropout for attention
+                    action_hidden = action_hidden + action_block.dropout(action_att_out, drop_mask=None)
                 
-                # Step 3: Shared attention with concatenated Q,K,V (OpenPI pattern)
-                att_multi_head, cache = action_block.shared_attention_multi_expert(
-                    [(prefix_q, prefix_k, prefix_v), (action_q, action_k, action_v)],
-                    attention_bias=merged_attention_bias,
-                    position_ids=merged_position_ids,
-                    drop_mask=response_mask,
-                    layer_past=layer_past,
-                    use_cache=use_cache
-                )
-                
-                # Step 4: Split attention output by position and apply to action block
-                # att_multi_head shape: (B, nh, prefix_len+action_len, head_dim)
-                action_len = action_hidden.shape[1]
-                
-                action_att_mh = att_multi_head[:, :, prefix_len:prefix_len+action_len, :]  # (B, nh, action_len, head_dim)
-                
-                # Step 5: Apply action block's output projection and residual
-                # Reshape to (B, T, nh * head_dim) first
-                B, nh, _, head_dim = action_att_mh.size()
-                action_att = action_att_mh.transpose(1, 2).contiguous().view(B, action_len, nh * head_dim)
-                
-                # Apply per-expert output projection
-                action_att_out = action_block.attn_out(action_att)
-                
-                # Optional post-attention norm (mirrors VLM block when norm_after=True)
-                if action_block.config.norm_after:
-                    if action_block._activation_checkpoint_fn is not None:
-                        action_att_out = action_block._activation_checkpoint_fn(action_block.attn_norm, action_att_out)  # type: ignore[arg-type]
-                    else:
-                        action_att_out = action_block.attn_norm(action_att_out)
-                
-                # Apply residual connection and dropout for attention
-                action_hidden = action_hidden + action_block.dropout(action_att_out, drop_mask=None)
-            
-                # Step 6: Apply feed-forward networks (per-expert)
-                # VLM block already applied FFN in its forward pass
-                action_hidden = action_block.apply_ffn(action_hidden, action_hidden)
+                    # Step 6: Apply feed-forward networks (per-expert)
+                    # VLM block already applied FFN in its forward pass
+                    action_hidden = action_block.apply_ffn(action_hidden, action_hidden)
                 
                 # Cache handling: save (prefix_k, prefix_v) for reuse in subsequent ODE steps
                 # These are the K, V values actually used in shared attention (with RoPE applied)
@@ -3011,10 +3396,17 @@ class Molmo(nn.Module):
             else:
                 velocity_hidden = action_hidden
             
-            velocity_output = self.action_expert.predict_velocity(velocity_hidden)
+            # Route velocity prediction and output projection to appropriate expert(s)
+            if self.num_action_experts > 1 and expert_type is not None:
+                # Multi-expert mode with per-sample routing
+                velocity_output = self._route_velocity_prediction(velocity_hidden, expert_type)
+                action_hidden_projected = self._route_output_projection(action_hidden, expert_type)
+            else:
+                # Single expert mode (shared) - use action_experts[0]
+                velocity_output = self.action_experts[0].predict_velocity(velocity_hidden)
+                action_hidden_projected = self.action_experts[0].output_proj(action_hidden)
             
-            # Project action_hidden to main model dimension and concatenate (for other uses if needed)
-            action_hidden_projected = self.action_expert.output_proj(action_hidden)
+            # Concatenate for other uses if needed
             x = torch.cat([prefix_hidden, action_hidden_projected], dim=1)
             
         # Standard processing when no action tokens or using block groups
@@ -3122,6 +3514,7 @@ class Molmo(nn.Module):
         initial_noise: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         proprio_state: Optional[torch.Tensor] = None,
+        expert_type: Optional[torch.Tensor] = None,
         use_kv_cache: bool = True,
     ) -> torch.Tensor:
         """
@@ -3146,6 +3539,7 @@ class Molmo(nn.Module):
             initial_noise: Optional initial noise (default: sample from N(0,1))
             position_ids: Position IDs for tokens (batch_size, seq_len)
             proprio_state: Optional proprioceptive state (batch_size, proprio_dim)
+            expert_type: Expert type for multi-expert routing (batch_size,) - 0=human, 1=robot
             use_kv_cache: Whether to use KV caching for prefix (default: True for efficiency)
             
         Returns:
@@ -3165,6 +3559,7 @@ class Molmo(nn.Module):
                     noisy_actions=None,
                     action_timestep=None,
                     proprio_state=proprio_state,
+                    expert_type=expert_type,
                 )
             return output.velocity_output
 
@@ -3188,8 +3583,11 @@ class Molmo(nn.Module):
         dt = -1.0 / num_steps
         time = 1.0
         
+        # Check if using x0 prediction (model predicts clean target directly)
+        use_x0_prediction = getattr(self.config, 'flow_matching_prediction_type', 'velocity') == 'x0'
+        
         # Use KV caching for efficiency: compute prefix K,V once and reuse
-        if use_kv_cache and self.action_expert is not None:
+        if use_kv_cache and self.action_experts is not None:
             prefix_kv_cache = None
             
             for step in range(num_steps):
@@ -3209,6 +3607,7 @@ class Molmo(nn.Module):
                             noisy_actions=x_t,
                             action_timestep=t,
                             proprio_state=proprio_state,
+                            expert_type=expert_type,
                         )
                         # Save the prefix KV cache for subsequent steps
                         prefix_kv_cache = output.attn_key_values
@@ -3225,10 +3624,24 @@ class Molmo(nn.Module):
                             noisy_actions=x_t,
                             action_timestep=t,
                             proprio_state=proprio_state,
+                            expert_type=expert_type,
                             prefix_kv_cache=prefix_kv_cache,  # Use cached prefix KV
                         )
                 
-                v_t = output.velocity_output
+                if use_x0_prediction:
+                    # Model predicts x0 (clean target) directly
+                    # Path: x_t = t * noise + (1 - t) * target
+                    # From path: noise = (x_t - (1-t) * target) / t
+                    # Velocity: v = noise - target = (x_t - target) / t
+                    # So: v = (x_t - x0_pred) / t
+                    x0_pred = output.velocity_output
+                    t_expanded = t.view(batch_size, 1, 1)
+                    t_clamped = t_expanded.clamp(min=1e-6)
+                    v_t = (x_t - x0_pred) / t_clamped
+                else:
+                    # Model predicts velocity directly
+                    v_t = output.velocity_output
+                    
                 x_t = x_t + dt * v_t
                 time = time + dt
         else:
@@ -3248,9 +3661,23 @@ class Molmo(nn.Module):
                         noisy_actions=x_t,
                         action_timestep=t,
                         proprio_state=proprio_state,
+                        expert_type=expert_type,
                     )
                 
-                v_t = output.velocity_output
+                if use_x0_prediction:
+                    # Model predicts x0 (clean target) directly
+                    # Path: x_t = t * noise + (1 - t) * target
+                    # From path: noise = (x_t - (1-t) * target) / t
+                    # Velocity: v = noise - target = (x_t - target) / t
+                    # So: v = (x_t - x0_pred) / t
+                    x0_pred = output.velocity_output
+                    t_expanded = t.view(batch_size, 1, 1)
+                    t_clamped = t_expanded.clamp(min=1e-6)
+                    v_t = (x_t - x0_pred) / t_clamped
+                else:
+                    # Model predicts velocity directly
+                    v_t = output.velocity_output
+                    
                 x_t = x_t + dt * v_t
                 time = time + dt
         
@@ -3650,6 +4077,15 @@ class Molmo(nn.Module):
         for key in list(state_dict.keys()):
             state_dict[(new_key := key.replace("_fsdp_wrapped_module.", ""))] = state_dict.pop(key)
             new_keys_to_og_keys[new_key] = key
+
+        # For backward compatibility with old checkpoints that used action_expert (single expert)
+        # instead of action_experts (ModuleList). Transform action_expert.* -> action_experts.0.*
+        for key in list(state_dict.keys()):
+            if key.startswith("action_expert."):
+                new_key = "action_experts.0." + key[len("action_expert."):]
+                state_dict[new_key] = state_dict.pop(key)
+                og_key = new_keys_to_og_keys.pop(key, key)
+                new_keys_to_og_keys[new_key] = og_key
 
         # For backwards compatibility prior to fixing https://github.com/allenai/LLM/issues/222
         if self.config.block_type == BlockType.sequential:

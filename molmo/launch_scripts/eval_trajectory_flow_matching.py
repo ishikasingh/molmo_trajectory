@@ -421,7 +421,7 @@ def load_test_examples(num_examples: int = 10,
         normalize_coordinates=False, # Set to be False as in inference time, the trajectory itself is only for visualization, but this only works for delta representation.
         output_format="flow_matching",  # Use flow matching format
         trajectory_representation=trajectory_representation,
-        frame_downsampling_ratio=30,
+        frame_downsampling_ratio=10,
     )
     
     print(f"Loaded '{split}' dataset with {len(dataset)} examples")
@@ -609,9 +609,9 @@ def main():
         # Filter out image tokens and negative/padding tokens
         text_tokens = [t for i, t in enumerate(input_tokens) if t >= 0 and i not in image_positions]
         decoded_prompt = tokenizer.decode(text_tokens)
-        print(f"\n--- VLM Text Prompt ---")
-        print(decoded_prompt)
-        print(f"--- End of Prompt ---\n")
+        # print(f"\n--- VLM Text Prompt ---")
+        # print(decoded_prompt)
+        # print(f"--- End of Prompt ---\n")
         
         # Move tensors to device
         device = torch.device(args.device)
@@ -633,6 +633,16 @@ def main():
         if "proprio_state" in batch:
             print("Using proprioceptive state for trajectory prediction")
             proprio_state = torch.tensor(batch["proprio_state"], dtype=torch.float32).unsqueeze(0).to(device)
+        
+        # Extract expert_type from batch if available (for multi-expert routing)
+        # Default to 0 (human expert) if not present
+        expert_type = None
+        if "expert_type" in batch:
+            expert_type = torch.tensor([batch["expert_type"]], dtype=torch.long).to(device)
+        elif hasattr(model.config, "num_action_experts") and model.config.num_action_experts > 1:
+            # Multi-expert mode but no expert_type in batch - default to 0
+            expert_type = torch.tensor([0], dtype=torch.long).to(device)
+            print("WARNING: Multi-expert mode but no expert_type in batch. Defaulting to expert 0 (human).")
         
         # Generate trajectory
         is_direct_prediction = getattr(model.config, "use_direct_trajectory_prediction", False)
@@ -677,6 +687,7 @@ def main():
                     initial_noise=initial_noise,
                     position_ids=position_ids,
                     proprio_state=proprio_state,
+                    expert_type=expert_type,
                 )
             all_pred_trajectories.append(pred_traj_sample)
         

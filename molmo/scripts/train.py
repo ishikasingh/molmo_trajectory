@@ -186,11 +186,13 @@ def main(cfg: TrainConfig) -> None:
                 del state_dict
                 
                 # Initialize action expert parameters if they weren't in the checkpoint
-                if olmo_model.action_expert is not None:
+                if olmo_model.action_experts is not None:
+                    # Check for both old (action_expert.*) and new (action_experts.*) key formats
                     action_expert_keys = [k for k in loaded_keys if k.startswith("action_expert")]
                     if len(action_expert_keys) == 0:
                         log.info("Action expert parameters not found in checkpoint, initializing from scratch...")
-                        olmo_model.action_expert.reset_parameters()
+                        for expert in olmo_model.action_experts:
+                            expert.reset_parameters()
                     else:
                         log.info(f"Action expert parameters loaded from checkpoint ({len(action_expert_keys)} keys)")
             else:

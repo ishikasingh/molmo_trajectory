@@ -45,7 +45,7 @@ class MMCollator:
 
     TEXT_KEYS = ["input_tokens", "target_tokens", "loss_masks", "subsegment_ids", "position_ids"]
     IMAGE_KEYS = ["images", "image_masks", "image_input_idx",]
-    TRAJECTORY_KEYS = ["trajectory_target", "proprio_state"]
+    TRAJECTORY_KEYS = ["trajectory_target", "proprio_state", "expert_type"]
 
     def __init__(self, max_sequence_length=None, include_metadata=True, pad=None,
                  max_crops=None):
@@ -93,9 +93,12 @@ class MMCollator:
                         traj = ex[key]
                         if isinstance(traj, np.ndarray):
                             traj = torch.from_numpy(traj)
+                        elif isinstance(traj, (int, float)):
+                            # Handle scalar values like expert_type
+                            traj = torch.tensor(traj)
                         trajectory_tensors.append(traj)
                 if trajectory_tensors:
-                    # Stack along batch dimension: (batch_size, action_horizon, action_dim)
+                    # Stack along batch dimension: (batch_size, action_horizon, action_dim) or (batch_size,) for scalars
                     out[key] = torch.stack(trajectory_tensors, dim=0)
         
         out["input_ids"] = out.pop("input_tokens")

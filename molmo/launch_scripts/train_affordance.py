@@ -141,6 +141,25 @@ if __name__ == "__main__":
         default=None,
         help="Override max_crops parameter for the VLM model (default: None means no override)",
     )
+    parser.add_argument(
+        "--action_expert_mode",
+        type=str,
+        default="shared",
+        choices=["disabled", "shared", "separate_human_robot"],
+        help="Action expert architecture mode: "
+             "'disabled' (no action expert), "
+             "'shared' (single expert for all trajectories), "
+             "'separate_human_robot' (separate experts with per-sample routing)",
+    )
+    parser.add_argument(
+        "--flow_matching_prediction_type",
+        type=str,
+        default="velocity",
+        choices=["velocity", "x0"],
+        help="Prediction type for flow matching: "
+             "'velocity' (predict velocity field v = noise - target), "
+             "'x0' (predict clean target x0 directly)",
+    )
     args, other_args = parser.parse_known_args()
 
     # Default training split
@@ -285,6 +304,11 @@ if __name__ == "__main__":
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
         data_split = "train_pick_and_place"
+    elif args.mixture == "trajectory_3d_direct_pick_and_place":
+        # Direct 3D trajectory prediction (regression) using action expert architecture
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
+        data_split = "train_pick_and_place"
     elif args.mixture == "robo_casa_affordance":
         # eval_tasks = ["robo_casa_affordance"]
         eval_tasks = []
@@ -353,7 +377,24 @@ if __name__ == "__main__":
 
     # Enable flow matching for trajectory prediction tasks
     if "_fm" in args.mixture or "trajectory_3d_direct" in args.mixture:
-        model_cfg.use_action_expert = True
+        # Set action expert mode and derive settings
+        model_cfg.action_expert_mode = args.action_expert_mode
+        
+        if args.action_expert_mode == "disabled":
+            model_cfg.use_action_expert = False
+            model_cfg.num_action_experts = 0
+            log.info("Action expert disabled - using VLM text-only output")
+        elif args.action_expert_mode == "shared":
+            model_cfg.use_action_expert = True
+            model_cfg.num_action_experts = 1
+            log.info("Using shared action expert for all trajectory types")
+        elif args.action_expert_mode == "separate_human_robot":
+            model_cfg.use_action_expert = True
+            model_cfg.num_action_experts = 2
+            log.info("Using separate action experts for human (expert 0) and robot (expert 1) trajectories")
+        else:
+            raise ValueError(f"Unknown action_expert_mode: {args.action_expert_mode}")
+        
         # Configure action dimensions based on task
         # action_horizon: number of timesteps to predict (e.g., 30)
         # action_dim: flattened coordinate dimension = num_joints * num_coordinates
@@ -365,6 +406,8 @@ if __name__ == "__main__":
         model_cfg.use_adarms_flow_matching = False  # Use Pi0-style MLP conditioning
         model_cfg.flow_matching_loss_weight = 1.0
         model_cfg.flow_matching_num_steps = 10  # ODE integration steps during inference
+        model_cfg.flow_matching_prediction_type = args.flow_matching_prediction_type
+        log.info(f"Flow matching prediction type: {args.flow_matching_prediction_type}")
         
         if "trajectory_3d_direct" in args.mixture:
             model_cfg.use_direct_trajectory_prediction = True
@@ -395,6 +438,8 @@ if __name__ == "__main__":
 
     else:
         model_cfg.use_action_expert = False
+        model_cfg.action_expert_mode = "disabled"
+        model_cfg.num_action_experts = 0
 
     root_size_mixture: List[RootSizeMixture] = []
     for name, submixture, rate in tasks:
@@ -412,7 +457,7 @@ if __name__ == "__main__":
         )
         evaluation.data.persistent_workers = True
         evaluations.append(evaluation)
-    save_interval_unsharded = 20000 if not args.finetune else 7500
+    save_interval_unsharded = 15000 if not args.finetune else 7500
     cfg = TrainConfig(
         run_name="affordance_train",
         no_pre_train_checkpoint=True,
@@ -487,7 +532,7 @@ if __name__ == "__main__":
         ),
         load_path=None,
         initial_model_checkpoint=None if "debug" in args.checkpoint else args.checkpoint,
-        save_interval=5000,
+        save_interval=20000,
         save_num_checkpoints_to_keep=1,
         # save_interval_unsharded="${max_duration}",
         save_interval_unsharded=save_interval_unsharded,

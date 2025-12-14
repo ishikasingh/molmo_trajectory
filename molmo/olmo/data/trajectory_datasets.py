@@ -411,6 +411,7 @@ class TrajectoryDataset(Dataset):
             ],
             'trajectory_target': trajectory_flattened_joints,  # For flow matching: shape (num_steps, num_joints*coords) = (action_horizon, action_dim)
             'trajectory_shape': final_trajectory.shape,  # Store original shape for potential reshaping later
+            'expert_type': 0,  # Human trajectory expert (for multi-expert routing)
             'metadata': {
                 'image': image,
                 'task_name': mapping['task_name'],

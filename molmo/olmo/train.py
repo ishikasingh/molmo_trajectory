@@ -300,8 +300,10 @@ class Trainer:
         # BEFORE FSDP wrapping to ensure proper weight synchronization across nodes
         self.trajectory_loss_fn: Optional[FlowMatchingTrajectoryLoss] = None
         if self.model.config.use_action_expert:
-            self.trajectory_loss_fn = FlowMatchingTrajectoryLoss()
+            prediction_type = getattr(self.model.config, 'flow_matching_prediction_type', 'velocity')
+            self.trajectory_loss_fn = FlowMatchingTrajectoryLoss(prediction_type=prediction_type)
             self.trajectory_loss_fn = self.trajectory_loss_fn.to(self.device)
+            log.info(f"Initialized FlowMatchingTrajectoryLoss with prediction_type='{prediction_type}'")
 
     @property
     def dataset(self) -> IterableDataset:
@@ -864,6 +866,7 @@ class Trainer:
                 noisy_actions=noisy_actions,
                 action_timestep=action_timestep,
                 proprio_state=batch.get("proprio_state"),
+                expert_type=batch.get("expert_type"),  # For multi-expert routing
             )
             logits = output.logits
         
@@ -961,7 +964,7 @@ class Trainer:
                 if torch.isnan(velocity_pred).any() or torch.isinf(velocity_pred).any():
                     log.error(f"[FLOW MATCHING ERROR] velocity_pred contains NaN or Inf! NaN: {torch.isnan(velocity_pred).sum().item()}, Inf: {torch.isinf(velocity_pred).sum().item()}")
                 trajectory_loss = self.trajectory_loss_fn(
-                    predicted_velocity=velocity_pred,
+                    model_output=velocity_pred,
                     trajectory_target=trajectory_target,
                     t=t,
                     noise=noise

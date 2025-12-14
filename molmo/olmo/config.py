@@ -31,7 +31,9 @@ from .util import StrEnum
 __all__ = [
     "ActivationType",
     "ActivationCheckpointingStrategy",
+    "ActionExpertMode",
     "BlockType",
+    "FlowMatchingPredictionType",
     "LayerNormType",
     "VisionBackboneType",
     "VisionBackboneConfig",
@@ -267,6 +269,36 @@ class AttentionType(StrEnum):
     sdpa = "sdpa"
     direct = "direct"
     flash = "flash"
+
+
+class ActionExpertMode(StrEnum):
+    """Mode for action expert architecture in flow matching trajectory prediction."""
+    disabled = "disabled"
+    """No action expert - VLM text-only output."""
+    
+    shared = "shared"
+    """Single shared expert for all trajectory types (human and robot)."""
+    
+    separate_human_robot = "separate_human_robot"
+    """Separate experts for human and robot trajectories with per-sample routing."""
+
+
+class FlowMatchingPredictionType(StrEnum):
+    """Prediction type for flow matching trajectory prediction."""
+    velocity = "velocity"
+    """
+    Predict the velocity field: v = noise - target (diffusion convention).
+    This is the standard approach where the model learns to predict the direction
+    from noisy state to clean state.
+    """
+    
+    x0 = "x0"
+    """
+    Predict x0 (the clean target) directly from the noisy input.
+    The velocity is then computed as: v = (x0_pred - x_t) / (1 - t).
+    This can be more stable for some tasks as the model directly predicts
+    the final clean trajectory.
+    """
 
 
 @dataclass
@@ -775,6 +807,22 @@ class ModelConfig(BaseConfig):
     When True, the model can process action tokens for flow matching.
     """
 
+    action_expert_mode: str = "shared"
+    """
+    Action expert architecture mode:
+    - "disabled": No action expert (VLM text-only)
+    - "shared": Single action expert for all trajectory types (default)
+    - "separate_human_robot": Separate experts for human and robot trajectories with routing
+    """
+
+    num_action_experts: int = 1
+    """
+    Number of action experts. Set based on action_expert_mode:
+    - disabled: 0
+    - shared: 1
+    - separate_human_robot: 2
+    """
+
     use_direct_trajectory_prediction: bool = False
     """
     If True, use the action expert to predict the trajectory directly instead of flow matching velocity.
@@ -798,6 +846,17 @@ class ModelConfig(BaseConfig):
     use_adarms_flow_matching: bool = False
     """
     Whether to use adaRMS-style timestep conditioning (Pi0.5) or MLP-style (Pi0).
+    """
+
+    flow_matching_prediction_type: str = "velocity"
+    """
+    Prediction type for flow matching:
+    - "velocity": Predict the velocity field v = noise - target (default, diffusion convention)
+    - "x0": Predict x0 (clean target) directly, then compute velocity as v = (x_t - x0_pred) / t
+    
+    Path definition: x_t = t * noise + (1 - t) * target
+    At t=0: x_0 = target (clean data)
+    At t=1: x_1 = noise
     """
 
     flow_matching_loss_weight: float = 1.0

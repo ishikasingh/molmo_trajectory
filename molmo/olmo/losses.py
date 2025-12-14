@@ -44,15 +44,28 @@ class FlowMatchingTrajectoryLoss(nn.Module):
     Flow matching loss for continuous trajectory prediction.
     
     Uses affine (Conditional OTP) flow matching to train a model to predict
-    the velocity field of trajectories interpolating between noise and ground truth.
+    either the velocity field or the clean target (x0) directly.
+    
+    Supports two prediction types:
+    - "velocity": Model predicts the velocity field v = noise - target
+    - "x0": Model predicts x0 (clean target) directly
     """
 
-    def __init__(self):
+    def __init__(self, prediction_type: str = "velocity"):
+        """
+        Args:
+            prediction_type: "velocity" or "x0"
+                - "velocity": Model predicts velocity field (noise - target)
+                - "x0": Model predicts clean target x0 directly
+        """
         super().__init__()
+        if prediction_type not in ("velocity", "x0"):
+            raise ValueError(f"prediction_type must be 'velocity' or 'x0', got {prediction_type}")
+        self.prediction_type = prediction_type
 
     def forward(
         self,
-        predicted_velocity: torch.Tensor,
+        model_output: torch.Tensor,
         trajectory_target: torch.Tensor,
         t: torch.Tensor,
         noise: torch.Tensor,
@@ -71,20 +84,23 @@ class FlowMatchingTrajectoryLoss(nn.Module):
             At t=0: X_0 = target (data)
             At t=1: X_1 = noise (noise)
         
-        Velocity (what we train to predict):
-            dX_t/dt = X_0 - X_1 = noise - target
+        For velocity prediction:
+            Model predicts: v = noise - target
+            Loss: MSE(v_pred, noise - target)
+        
+        For x0 prediction:
+            Model predicts: x0 = target (clean data)
+            Loss: MSE(x0_pred, target)
+            During inference, velocity is computed as: v = (x_t - x0_pred) / t
         
         Inference uses NEGATIVE time steps (t: 1 → 0):
             dt = -1.0 / num_steps
             x_t = x_t + dt * v_t  (moves backward in time)
-        
-        Alternative (standard flow matching papers):
-            Would use X_t = (1-t) * noise + t * target with dX_t/dt = target - noise
-            and integrate forward (t: 0 → 1). This is mathematically equivalent but
-            uses opposite time direction. We follow OpenPI/diffusion convention for compatibility.
 
         Args:
-            predicted_velocity: Model prediction of velocity, shape (batch_size, action_horizon, action_dim)
+            model_output: Model prediction, shape (batch_size, action_horizon, action_dim)
+                - For velocity prediction: predicted velocity
+                - For x0 prediction: predicted clean target x0
             trajectory_target: Ground truth trajectory (X_1), shape (batch_size, action_horizon, action_dim)
             t: Time samples in [0, 1], shape (batch_size,)
             noise: Noise samples (X_0), shape (batch_size, action_horizon, action_dim)
@@ -92,17 +108,19 @@ class FlowMatchingTrajectoryLoss(nn.Module):
         Returns:
             Scalar loss value
         """
-        # For Conditional OTP with diffusion convention, the true velocity is simply X_0 - X_1
-        # which is noise - target. This is because:
-        # X_t = t * noise + (1-t) * target
-        # dX_t/dt = noise - target (constant velocity field for linear path)
-        true_velocity = noise - trajectory_target
-
-        # MSE loss between predicted and true velocity
-        velocity_loss = F.mse_loss(predicted_velocity, true_velocity, reduction="none")
+        if self.prediction_type == "velocity":
+            # For velocity prediction, the true velocity is noise - target
+            # X_t = t * noise + (1-t) * target
+            # dX_t/dt = noise - target (constant velocity field for linear path)
+            true_velocity = noise - trajectory_target
+            loss = F.mse_loss(model_output, true_velocity, reduction="none")
+        else:  # x0 prediction
+            # For x0 prediction, we directly regress to the clean target
+            # The model predicts x0 (the denoised/clean trajectory)
+            loss = F.mse_loss(model_output, trajectory_target, reduction="none")
 
         # Check if loss is reasonable before returning
-        mean_loss = velocity_loss.mean()
+        mean_loss = loss.mean()
         
         # If loss is extremely large (> 1e6), something is wrong
         if mean_loss > 1e6:
@@ -110,7 +128,7 @@ class FlowMatchingTrajectoryLoss(nn.Module):
             warnings.warn(
                 f"Flow matching loss is extremely large ({mean_loss.item():.2e}). "
                 f"This usually indicates:\n"
-                f"  1. Very large velocity predictions (check model initialization)\n"
+                f"  1. Very large predictions (check model initialization)\n"
                 f"  2. Unnormalized trajectory data (should be in [-10, 10] range ideally)\n"
                 f"  3. Learning rate too high\n"
                 f"Clipping loss to 1e6 to prevent inf, but you should investigate the root cause."

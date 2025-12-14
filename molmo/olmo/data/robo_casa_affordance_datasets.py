@@ -158,6 +158,7 @@ class RoboCasaTrajectoryDataset(Dataset):
             ],
             'trajectory_target': trajectory_flattened,
             'trajectory_shape': trajectory.shape,
+            'expert_type': 1,  # Robot trajectory expert (for multi-expert routing)
             'metadata': {
                 'image': image,
                 'task_name': f'dummy_task_{idx % len(self.dummy_instructions)}',
