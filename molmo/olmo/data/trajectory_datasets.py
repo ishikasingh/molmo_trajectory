@@ -183,8 +183,8 @@ class TrajectoryDataset(Dataset):
                 full_index = cached_data['index_mapping']
                 print(f"Successfully loaded {len(full_index)} samples from cache")
                 
-                # Apply downsampling filter if needed (only for training split)
-                if self.frame_downsampling_ratio > 1 and (self.split == "train" or self.split == "overfit"):
+                # Apply downsampling filter if needed
+                if self.frame_downsampling_ratio > 1:
                     filtered_index = self._apply_downsampling_filter(full_index)
                     print(f"Applied downsampling ratio {self.frame_downsampling_ratio}: {len(full_index)} -> {len(filtered_index)} samples")
                     return filtered_index
@@ -319,8 +319,8 @@ class TrajectoryDataset(Dataset):
         # Save full index to cache for future use
         self._save_index_to_cache(index_mapping)
         
-        # Apply downsampling filter if needed (only for training split)
-        if self.frame_downsampling_ratio > 1 and (self.split == "train" or self.split == "overfit"):
+        # Apply downsampling filter if needed
+        if self.frame_downsampling_ratio > 1:
             filtered_index = self._apply_downsampling_filter(index_mapping)
             print(f"Applied downsampling ratio {self.frame_downsampling_ratio}: {len(index_mapping)} -> {len(filtered_index)} samples")
             return filtered_index
@@ -643,6 +643,142 @@ class TrajectoryDataset(Dataset):
         delta_trajectory = torch.cat([deltas, last_delta], dim=0)  # Shape: (num_steps, num_joints, coords)
         
         return delta_trajectory
+
+    def get_videos_info(self) -> List[Dict]:
+        """
+        Get information about all videos in the dataset, grouped by video path.
+        
+        Returns:
+            List of dictionaries, each containing:
+                - video_path: Path to the video file
+                - hdf5_path: Path to the corresponding HDF5 file
+                - task_name: Name of the task
+                - num_frames: Number of available frames in this video
+                - frame_indices: List of frame indices available in the dataset
+        """
+        from collections import defaultdict
+        
+        # Group frames by video path
+        video_to_frames = defaultdict(list)
+        for idx, mapping in enumerate(self.index_mapping):
+            video_path = mapping['video_path']
+            video_to_frames[video_path].append({
+                'dataset_idx': idx,
+                'frame_idx': mapping['frame_idx'],
+                'task_name': mapping['task_name'],
+                'hdf5_path': mapping['hdf5_path'],
+            })
+        
+        # Sort frames within each video by frame_idx and build info list
+        videos_info = []
+        for video_path, frames in video_to_frames.items():
+            frames_sorted = sorted(frames, key=lambda x: x['frame_idx'])
+            videos_info.append({
+                'video_path': video_path,
+                'hdf5_path': frames_sorted[0]['hdf5_path'],
+                'task_name': frames_sorted[0]['task_name'],
+                'num_frames': len(frames_sorted),
+                'frame_indices': [f['frame_idx'] for f in frames_sorted],
+                '_frames_data': frames_sorted,  # Internal use for iter_video_frames
+            })
+        
+        # Sort videos by path for consistent ordering
+        videos_info.sort(key=lambda x: x['video_path'])
+        
+        return videos_info
+
+    def iter_video_frames(self, 
+                          video_info: Dict,
+                          rng: Optional[np.random.RandomState] = None) -> List[Dict]:
+        """
+        Load all frames from a specific video.
+        
+        Note: Frame downsampling is controlled by the dataset's frame_downsampling_ratio
+        parameter, so all frames in the index_mapping for this video are loaded.
+        
+        Args:
+            video_info: Video info dictionary from get_videos_info()
+            rng: Random state for dataset.get() (optional)
+            
+        Returns:
+            List of frame data dictionaries, each containing:
+                - image: numpy array of the image
+                - prompt: instruction text
+                - ground_truth_trajectory: trajectory points
+                - point_scale: scale for points
+                - style: data style
+                - task_name: name of the task
+                - frame_idx: original frame index in video
+                - state: initial state
+                - trajectory_representation: 'absolute' or 'delta'
+        """
+        if rng is None:
+            rng = np.random.RandomState(42)
+        
+        frames_data = video_info.get('_frames_data', [])
+        if not frames_data:
+            return []
+        
+        result_frames = []
+        for frame_info in frames_data:
+            dataset_idx = frame_info['dataset_idx']
+            
+            # Load the example from dataset
+            example_data = self.get(dataset_idx, rng=rng)
+            
+            # Extract data
+            image = example_data["image"]
+            message_list = example_data["message_list"]
+            metadata = example_data.get("metadata", {})
+            
+            if message_list and len(message_list) > 0:
+                instruction = message_list[0].get("label", "")
+                gt_trajectory = message_list[0].get("points", None)
+                point_scale = message_list[0].get("point_scale", None)
+                style = message_list[0].get("style", "")
+                state = message_list[0].get("state", None)
+                
+                # Convert image to numpy if needed
+                if hasattr(image, 'save'):  # PIL Image
+                    image_np = np.array(image)
+                else:
+                    image_np = image
+                
+                frame_data = {
+                    "image": image_np,
+                    "prompt": instruction,
+                    "ground_truth_trajectory": gt_trajectory,
+                    "point_scale": point_scale,
+                    "style": style,
+                    "task_name": metadata.get("task_name", "unknown"),
+                    "frame_idx": frame_info['frame_idx'],
+                    "state": state,
+                    "trajectory_representation": metadata.get("trajectory_representation", "absolute"),
+                }
+                
+                result_frames.append(frame_data)
+        
+        return result_frames
+
+    def sample_videos(self, num_videos: int) -> List[Dict]:
+        """
+        Sample videos evenly from the dataset.
+        
+        Args:
+            num_videos: Number of videos to sample
+            
+        Returns:
+            List of video info dictionaries (subset of get_videos_info())
+        """
+        all_videos = self.get_videos_info()
+        
+        if not all_videos:
+            return []
+        
+        # Sample evenly across the available videos
+        indices = np.linspace(0, len(all_videos) - 1, min(num_videos, len(all_videos)), dtype=int)
+        
+        return [all_videos[i] for i in indices]
 
 
 def build_and_save_index_offline(

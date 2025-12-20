@@ -3,6 +3,10 @@
 Evaluation script for 3D trajectory predictions.
 Supports both flow matching (ODE sampling) and direct regression modes.
 Trajectories are projected to 2D for visualization on images.
+
+Evaluation modes:
+- Image mode (default): Randomly samples frames and generates individual visualization images
+- Video mode: Samples videos, evaluates consecutive frames, and generates output videos
 """
 
 import argparse
@@ -15,6 +19,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional
 import json
+import cv2
 
 from olmo.model import Molmo
 from olmo.data.model_preprocessor import load_image
@@ -476,13 +481,334 @@ def load_test_examples(num_examples: int = 10,
     return examples
 
 
+def load_video_examples(num_videos: int = 5,
+                        action_chunking_horizon: int = 10,
+                        trajectory_representation: str = "absolute",
+                        split: str = "test",
+                        frame_downsampling_ratio: int = 10) -> List[Dict]:
+    """
+    Load all frames from multiple videos for video evaluation.
+    
+    Args:
+        num_videos: Number of videos to sample
+        action_chunking_horizon: Number of timesteps in trajectory
+        trajectory_representation: Either 'absolute' or 'delta' for trajectory representation
+        split: Dataset split to load (e.g., train, test)
+        frame_downsampling_ratio: Frame downsampling ratio (e.g., 10 = every 10th frame)
+    
+    Returns:
+        List of video dictionaries, each containing frames and metadata
+    """
+    from olmo.data.trajectory_datasets import TrajectoryDataset
+    
+    # Load dataset with specified downsampling ratio
+    dataset = TrajectoryDataset(
+        split=split,
+        action_chunking_horizon=action_chunking_horizon,
+        output_2d_trajectory=False,
+        normalize_coordinates=False,
+        output_format="flow_matching",
+        trajectory_representation=trajectory_representation,
+        frame_downsampling_ratio=frame_downsampling_ratio,
+    )
+    
+    print(f"Loaded '{split}' dataset with {len(dataset)} examples (downsampling ratio: {frame_downsampling_ratio})")
+    
+    # Use dataset's built-in video sampling methods
+    sampled_videos = dataset.sample_videos(num_videos=num_videos)
+    
+    print(f"Found {len(dataset.get_videos_info())} unique videos")
+    print(f"Sampled {len(sampled_videos)} videos")
+    
+    if not sampled_videos:
+        print(f"WARNING: No videos found in dataset.")
+        return []
+    
+    # Load all frames for each sampled video
+    video_examples = []
+    for vid_idx, video_info in enumerate(sampled_videos):
+        frames = dataset.iter_video_frames(video_info=video_info)
+        
+        video_data = {
+            'video_path': video_info['video_path'],
+            'task_name': video_info['task_name'],
+            'frames': frames,
+        }
+        
+        print(f"Loaded video {vid_idx + 1}/{len(sampled_videos)}: {Path(video_info['video_path']).name} with {len(frames)} frames")
+        video_examples.append(video_data)
+    
+    return video_examples
+
+
+def create_video_from_frames(frames: List[Image.Image], 
+                             output_path: str,
+                             fps: int = 10,
+                             codec: str = 'mp4v') -> bool:
+    """
+    Create a video from a list of PIL Image frames.
+    
+    Args:
+        frames: List of PIL Image frames
+        output_path: Path to save the output video
+        fps: Frames per second for the output video
+        codec: Video codec to use (default: 'mp4v' for .mp4 files)
+    
+    Returns:
+        True if video was created successfully, False otherwise
+    """
+    if not frames:
+        print("ERROR: No frames to create video")
+        return False
+    
+    # Get frame dimensions from the first frame
+    first_frame = frames[0]
+    if isinstance(first_frame, Image.Image):
+        width, height = first_frame.size
+    else:
+        height, width = first_frame.shape[:2]
+    
+    # Create video writer
+    fourcc = cv2.VideoWriter_fourcc(*codec)
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    if not out.isOpened():
+        print(f"ERROR: Could not create video writer for {output_path}")
+        return False
+    
+    try:
+        for i, frame in enumerate(frames):
+            # Convert PIL Image to numpy array
+            if isinstance(frame, Image.Image):
+                frame_np = np.array(frame)
+            else:
+                frame_np = frame
+            
+            # Convert RGB to BGR for OpenCV
+            if len(frame_np.shape) == 3 and frame_np.shape[2] == 3:
+                frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+            else:
+                frame_bgr = frame_np
+            
+            # Ensure frame is the correct size
+            if frame_bgr.shape[1] != width or frame_bgr.shape[0] != height:
+                frame_bgr = cv2.resize(frame_bgr, (width, height))
+            
+            out.write(frame_bgr)
+        
+        print(f"Created video with {len(frames)} frames at {fps} FPS: {output_path}")
+        return True
+        
+    except Exception as e:
+        print(f"ERROR: Failed to write video: {e}")
+        return False
+        
+    finally:
+        out.release()
+
+
+def evaluate_video(model, preprocessor, tokenizer, video_data: Dict,
+                   args, intrinsic: np.ndarray,
+                   stats_mean: Optional[np.ndarray] = None,
+                   stats_std: Optional[np.ndarray] = None) -> Tuple[List[Image.Image], List[Dict]]:
+    """
+    Evaluate all frames in a video and return visualized frames.
+    
+    Args:
+        model: The trajectory prediction model
+        preprocessor: Data preprocessor
+        tokenizer: Tokenizer for decoding
+        video_data: Dictionary containing video frames and metadata
+        args: Command-line arguments
+        intrinsic: Camera intrinsic matrix
+        stats_mean: Mean for denormalization (optional)
+        stats_std: Std for denormalization (optional)
+    
+    Returns:
+        Tuple of (list of visualized PIL Images, list of metrics dictionaries)
+    """
+    device = torch.device(args.device)
+    visualized_frames = []
+    frame_metrics = []
+    
+    is_direct_prediction = getattr(model.config, "use_direct_trajectory_prediction", False)
+    
+    for frame_idx, frame_data in enumerate(video_data['frames']):
+        image_np = frame_data["image"]
+        prompt = frame_data["prompt"]
+        gt_trajectory_raw = frame_data.get("ground_truth_trajectory", None)
+        style = frame_data.get("style", "trajectory_3d_fm")
+        
+        h, w = image_np.shape[:2]
+        
+        # Prepare example for model
+        # Save image temporarily for preprocessing
+        temp_image_path = f"temp_video_frame_{frame_idx}.jpg"
+        Image.fromarray(image_np).save(temp_image_path)
+        
+        example = {
+            "image": image_np,
+            "prompt": prompt,
+            "style": style,
+            "state": frame_data.get("state"),
+            "point_scale": frame_data.get("point_scale"),
+        }
+        batch = preprocessor(example)
+        
+        # Move tensors to device
+        input_ids = torch.tensor(batch["input_tokens"], dtype=torch.long).unsqueeze(0).to(device)
+        attention_mask = (input_ids != -1).to(device)
+        images = torch.tensor(batch["images"], dtype=torch.float32).unsqueeze(0).to(device)
+        image_input_idx = torch.tensor(batch["image_input_idx"], dtype=torch.long).unsqueeze(0).to(device)
+        image_masks = None
+        if "image_masks" in batch:
+            image_masks = torch.tensor(batch["image_masks"]).unsqueeze(0).to(device)
+        
+        position_ids = None
+        if "position_ids" in batch:
+            position_ids = torch.tensor(batch["position_ids"], dtype=torch.long).unsqueeze(0).to(device)
+        
+        proprio_state = None
+        if "proprio_state" in batch:
+            proprio_state = torch.tensor(batch["proprio_state"], dtype=torch.float32).unsqueeze(0).to(device)
+        
+        expert_type = None
+        if "expert_type" in batch:
+            expert_type = torch.tensor([batch["expert_type"]], dtype=torch.long).to(device)
+        elif hasattr(model.config, "num_action_experts") and model.config.num_action_experts > 1:
+            expert_type = torch.tensor([0], dtype=torch.long).to(device)
+        
+        # Generate trajectory
+        with torch.no_grad():
+            if is_direct_prediction:
+                pred_trajectory = model.predict_actions_direct(
+                    input_ids=input_ids,
+                    attention_mask=None,
+                    images=images,
+                    image_masks=image_masks,
+                    image_input_idx=image_input_idx,
+                    position_ids=position_ids,
+                    proprio_state=proprio_state,
+                    expert_type=expert_type,
+                )
+            else:
+                initial_noise = torch.randn(
+                    1,
+                    model.config.action_horizon,
+                    model.config.action_dim,
+                    device=device
+                )
+                pred_trajectory = model.sample_actions_flow_matching(
+                    input_ids=input_ids,
+                    attention_mask=None,
+                    images=images,
+                    image_masks=image_masks,
+                    image_input_idx=image_input_idx,
+                    num_steps=args.num_ode_steps,
+                    initial_noise=initial_noise,
+                    position_ids=position_ids,
+                    proprio_state=proprio_state,
+                    expert_type=expert_type,
+                )
+        
+        # Convert to numpy and process
+        if isinstance(pred_trajectory, torch.Tensor):
+            pred_trajectory = pred_trajectory.cpu().numpy()
+        
+        # Denormalize if stats available
+        if stats_mean is not None and stats_std is not None:
+            pred_trajectory = pred_trajectory * stats_std + stats_mean
+        
+        # Reshape from (batch_size, action_horizon, action_dim) to (action_horizon, num_joints, 3)
+        batch_size, action_horizon, action_dim = pred_trajectory.shape
+        pred_trajectory = pred_trajectory.squeeze(0)
+        num_joints = action_dim // 3
+        pred_trajectory = pred_trajectory.reshape(action_horizon, num_joints, 3)
+        
+        # Convert delta to absolute if needed
+        trajectory_rep = frame_data.get("trajectory_representation", "absolute")
+        if trajectory_rep == "delta":
+            initial_state = frame_data.get("state")
+            if initial_state is not None:
+                if len(initial_state.shape) == 1:
+                    num_joints_state = initial_state.shape[0] // 3
+                    initial_state = initial_state.reshape(num_joints_state, 3)
+                pred_trajectory = convert_delta_to_absolute(pred_trajectory, initial_state)
+        
+        # Process ground truth trajectory
+        gt_trajectory_2d = None
+        if gt_trajectory_raw is not None:
+            if isinstance(gt_trajectory_raw, torch.Tensor):
+                gt_trajectory_raw = gt_trajectory_raw.numpy()
+            
+            if len(gt_trajectory_raw.shape) == 3 and gt_trajectory_raw.shape[0] == 1:
+                gt_trajectory_raw = gt_trajectory_raw.squeeze(0)
+            
+            if len(gt_trajectory_raw.shape) == 2:
+                gt_action_horizon, gt_action_dim = gt_trajectory_raw.shape
+                gt_num_joints = gt_action_dim // 3
+                gt_trajectory_raw = gt_trajectory_raw.reshape(gt_action_horizon, gt_num_joints, 3)
+            
+            if trajectory_rep == "delta":
+                initial_state = frame_data.get("state")
+                if initial_state is not None:
+                    if len(initial_state.shape) == 1:
+                        num_joints_state = initial_state.shape[0] // 3
+                        initial_state = initial_state.reshape(num_joints_state, 3)
+                    gt_trajectory_raw = convert_delta_to_absolute(gt_trajectory_raw, initial_state)
+            
+            gt_trajectory_2d = project_3d_trajectory_to_2d(
+                gt_trajectory_raw, intrinsic, w, h, normalize=True
+            )
+        
+        # Project prediction to 2D
+        pred_trajectory_2d = project_3d_trajectory_to_2d(
+            pred_trajectory, intrinsic, w, h, normalize=True
+        )
+        
+        # Compute metrics
+        metrics = {
+            "frame_idx": frame_data['frame_idx'],
+            "video_frame_idx": frame_idx,
+        }
+        
+        if gt_trajectory_2d is not None:
+            mse = np.mean((pred_trajectory_2d - gt_trajectory_2d) ** 2)
+            ade = np.mean(np.linalg.norm(pred_trajectory_2d - gt_trajectory_2d, axis=-1))
+            fde = np.linalg.norm(pred_trajectory_2d[-1] - gt_trajectory_2d[-1], axis=-1).mean()
+            metrics["mse"] = float(mse)
+            metrics["ade"] = float(ade)
+            metrics["fde"] = float(fde)
+        
+        # Visualize
+        visualized_image = visualize_trajectory_on_image(
+            image_np,
+            pred_trajectory=pred_trajectory_2d,
+            gt_trajectory=gt_trajectory_2d,
+            is_normalized=True,
+            prompt=prompt
+        )
+        
+        visualized_frames.append(visualized_image)
+        frame_metrics.append(metrics)
+        
+        # Clean up temp file
+        if os.path.exists(temp_image_path):
+            try:
+                os.remove(temp_image_path)
+            except:
+                pass
+    
+    return visualized_frames, frame_metrics
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Evaluate 3D trajectory predictions (flow matching or direct regression)"
     )
     parser.add_argument("checkpoint", type=str, help="Path to model checkpoint directory")
     parser.add_argument("--num_examples", type=int, default=10,
-                       help="Number of test examples to visualize")
+                       help="Number of test examples to visualize (image mode)")
     parser.add_argument("--action_chunking_horizon", type=int, default=30,
                        help="Number of timesteps in trajectory")
     parser.add_argument("--num_ode_steps", type=int, default=10,
@@ -510,21 +836,39 @@ def main():
                        choices=["train", "test", "test_pick_and_place", "overfit"],
                        help="Dataset split to load examples from")
     
+    # Video evaluation mode arguments
+    parser.add_argument("--eval_mode", type=str, default="image",
+                       choices=["image", "video"],
+                       help="Evaluation mode: 'image' generates individual images, 'video' generates evaluation videos")
+    parser.add_argument("--num_videos", type=int, default=5,
+                       help="Number of videos to sample (video mode only)")
+    parser.add_argument("--frame_downsampling_ratio", type=int, default=10,
+                       help="Frame downsampling ratio for video mode (e.g., 10 = every 10th frame)")
+    parser.add_argument("--video_fps", type=int, default=3,
+                       help="Frames per second for output videos (video mode only)")
+    
     args = parser.parse_args()
     
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
     
-    # Load examples
-    print(f"Loading {args.num_examples} examples from split '{args.split}' for 3D trajectory task...")
+    print(f"\n{'='*80}")
+    print(f"Evaluation mode: {args.eval_mode.upper()}")
     print(f"Trajectory representation: {args.trajectory_representation}")
-    examples = load_test_examples(args.num_examples, args.action_chunking_horizon, 
-                                  args.trajectory_representation, args.split)
+    print(f"Split: {args.split}")
+    print(f"{'='*80}\n")
     
-    if not examples:
-        print("No examples loaded. Exiting.")
-        return
+    # Load examples only for image mode (video mode loads its own examples)
+    examples = None
+    if args.eval_mode == "image":
+        print(f"Loading {args.num_examples} examples from split '{args.split}' for 3D trajectory task...")
+        examples = load_test_examples(args.num_examples, args.action_chunking_horizon, 
+                                      args.trajectory_representation, args.split)
+        
+        if not examples:
+            print("No examples loaded. Exiting.")
+            return
     
     # Load model and preprocessor
     model = None
@@ -568,6 +912,125 @@ def main():
                              [0., 0., 1.]])
         print("Using default EgoDex camera intrinsic")
     
+    # Branch based on evaluation mode
+    if args.eval_mode == "video":
+        # VIDEO EVALUATION MODE
+        print(f"\n{'='*80}")
+        print(f"VIDEO EVALUATION MODE")
+        print(f"Number of videos: {args.num_videos}")
+        print(f"Frame downsampling ratio: {args.frame_downsampling_ratio}")
+        print(f"Output FPS: {args.video_fps}")
+        print(f"{'='*80}\n")
+        
+        # Load video examples
+        video_examples = load_video_examples(
+            num_videos=args.num_videos,
+            action_chunking_horizon=args.action_chunking_horizon,
+            trajectory_representation=args.trajectory_representation,
+            split=args.split,
+            frame_downsampling_ratio=args.frame_downsampling_ratio,
+        )
+        
+        if not video_examples:
+            print("No video examples loaded. Exiting.")
+            return
+        
+        all_video_metrics = []
+        
+        # Process each video
+        for vid_idx, video_data in enumerate(video_examples):
+            video_path = video_data['video_path']
+            task_name = video_data['task_name']
+            
+            print(f"\n{'='*80}")
+            print(f"Processing video {vid_idx+1}/{len(video_examples)}")
+            print(f"Video: {Path(video_path).name}")
+            print(f"Task: {task_name}")
+            print(f"Frames: {len(video_data['frames'])}")
+            print(f"{'='*80}")
+            
+            # Evaluate all frames in the video
+            start_time = time.time()
+            visualized_frames, frame_metrics = evaluate_video(
+                model=model,
+                preprocessor=preprocessor,
+                tokenizer=tokenizer,
+                video_data=video_data,
+                args=args,
+                intrinsic=intrinsic,
+                stats_mean=stats_mean,
+                stats_std=stats_std,
+            )
+            end_time = time.time()
+            
+            print(f"Evaluated {len(visualized_frames)} frames in {end_time - start_time:.2f} seconds "
+                  f"({(end_time - start_time) / len(visualized_frames):.2f} s/frame)")
+            
+            # Create output video
+            sanitized_task = sanitize_filename(task_name)
+            video_filename = f"eval_video_{sanitized_task}_{vid_idx+1}.mp4"
+            video_output_path = str(output_dir / video_filename)
+            
+            success = create_video_from_frames(
+                frames=visualized_frames,
+                output_path=video_output_path,
+                fps=args.video_fps,
+            )
+            
+            if success:
+                print(f"Saved evaluation video to {video_output_path}")
+            else:
+                print(f"WARNING: Failed to create video {video_output_path}")
+            
+            # Aggregate metrics for this video
+            video_metrics = {
+                "video_idx": vid_idx,
+                "video_path": video_path,
+                "task_name": task_name,
+                "num_frames": len(visualized_frames),
+                "video_output_file": video_filename if success else None,
+                "frame_metrics": frame_metrics,
+            }
+            
+            # Compute video-level aggregate metrics
+            if frame_metrics and all(m.get("mse") is not None for m in frame_metrics):
+                video_metrics["mean_mse"] = float(np.mean([m["mse"] for m in frame_metrics]))
+                video_metrics["mean_ade"] = float(np.mean([m["ade"] for m in frame_metrics]))
+                video_metrics["mean_fde"] = float(np.mean([m["fde"] for m in frame_metrics]))
+                
+                print(f"Video metrics - MSE: {video_metrics['mean_mse']:.6f}, "
+                      f"ADE: {video_metrics['mean_ade']:.6f}, "
+                      f"FDE: {video_metrics['mean_fde']:.6f}")
+            
+            all_video_metrics.append(video_metrics)
+        
+        # Save video metrics to JSON
+        if args.save_metrics and all_video_metrics:
+            metrics_path = output_dir / "video_evaluation_metrics.json"
+            with open(metrics_path, 'w') as f:
+                json.dump(all_video_metrics, f, indent=2)
+            print(f"\nSaved video evaluation metrics to {metrics_path}")
+            
+            # Print summary statistics
+            videos_with_metrics = [v for v in all_video_metrics if v.get("mean_mse") is not None]
+            if videos_with_metrics:
+                mses = [v["mean_mse"] for v in videos_with_metrics]
+                ades = [v["mean_ade"] for v in videos_with_metrics]
+                fdes = [v["mean_fde"] for v in videos_with_metrics]
+                
+                print(f"\nSummary Statistics (across {len(videos_with_metrics)} videos):")
+                print(f"  MSE - Mean: {np.mean(mses):.6f}, Std: {np.std(mses):.6f}")
+                print(f"  ADE - Mean: {np.mean(ades):.6f}, Std: {np.std(ades):.6f}")
+                print(f"  FDE - Mean: {np.mean(fdes):.6f}, Std: {np.std(fdes):.6f}")
+        
+        print(f"\n{'='*80}")
+        print(f"Video evaluation complete! {len(video_examples)} videos processed.")
+        print(f"Output saved to {output_dir}")
+        print(f"{'='*80}")
+        
+        return
+    
+    # IMAGE EVALUATION MODE (original behavior)
     # Store evaluation metrics
     all_metrics = []
     
