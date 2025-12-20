@@ -19,6 +19,7 @@ from olmo.data.affordance_datsets import HandPositioningDataset
 from olmo.data.robo_casa_affordance_datasets import RobotCasaHandPositioningDataset
 from olmo.torch_util import get_global_rank, get_world_size
 from olmo.data.trajectory_datasets import TrajectoryDataset
+from olmo.data.robo_casa_affordance_datasets import RoboCasaTrajectoryDataset
 
 log = logging.getLogger(__name__)
 
@@ -389,6 +390,19 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
             output_format="flow_matching",
             frame_downsampling_ratio=10,
             trajectory_representation="delta" # default to be delta, as it works 
+        )
+    elif dataset_name == "robocasa_3d_fm":
+        data_dir = os.environ.get("ROBOCASA_DATA_DIR")
+        stats_file = os.environ.get("ROBOCASA_STATS_FILE")
+        return RoboCasaTrajectoryDataset(
+            data_dir=data_dir,
+            split=split,
+            action_chunking_horizon=horizon,
+            output_2d_trajectory=False,
+            normalize_coordinates=bool(stats_file),
+            stats_file=stats_file,
+            trajectory_representation="delta", # default to be delta, as it works better for flow matching
+            frame_downsampling_ratio=10, # robocasa dataset is recorded at 20 fps, while egodex is recorded at 30 fps
         )
     
     # Delta (velocity) representation variants

@@ -160,6 +160,8 @@ if __name__ == "__main__":
              "'velocity' (predict velocity field v = noise - target), "
              "'x0' (predict clean target x0 directly)",
     )
+    parser.add_argument("--slow_warmup", action="store_true", default=False,
+                        help="Whether to use slow warmup for the model")
     args, other_args = parser.parse_known_args()
 
     # Default training split
@@ -294,6 +296,10 @@ if __name__ == "__main__":
         # Direct 3D trajectory prediction (regression) using action expert architecture
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
+    elif args.mixture == "trajectory_3d_human_robot_fm":
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_3d_fm"], 0.5],
+                 ["robo_casa", ["robo_casa_affordance"], 0.5]]
     elif args.mixture == "trajectory_3d_fm_overfit":
         # Flow matching based 3D trajectory prediction with delta representation
         eval_tasks = []
@@ -499,7 +505,7 @@ if __name__ == "__main__":
             name=OptimizerType.adamw,
             connector_learning_rate=5e-6,
             vit_learning_rate=5e-6,
-            llm_learning_rate=1e-5,
+            llm_learning_rate=1e-5 if not args.slow_warmup else 5e-6,
             flow_matching_learning_rate=5e-4,
             connector_weight_decay=0.0,
             vit_weight_decay=0.0,
@@ -518,9 +524,9 @@ if __name__ == "__main__":
         ),
         scheduler=SchedulerConfig(
             name=SchedulerType.multimodal,
-            connector_t_warmup=200,
-            vit_t_warmup=200,
-            llm_t_warmup=200,
+            connector_t_warmup=200 if not args.slow_warmup else 30000,
+            vit_t_warmup=200 if not args.slow_warmup else 30000,
+            llm_t_warmup=200 if not args.slow_warmup else 30000,
             flow_matching_t_warmup=200,
             alpha_f=0.1,
             warmup_min_lr=0.0
