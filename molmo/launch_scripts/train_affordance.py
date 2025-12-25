@@ -129,11 +129,42 @@ if __name__ == "__main__":
         default=False,
         help="Exclude proprioceptive information (current finger positions) from trajectory prediction",
     )
+    # Per-expert dimension arguments for separate_human_robot mode
     parser.add_argument(
-        "--proprio_dim",
+        "--human_action_dim",
         type=int,
         default=30,
-        help="Dimension of proprioceptive state vector",
+        help="Action/trajectory dimension for human expert (EgoDex: 10 joints * 3 coords = 30)",
+    )
+    parser.add_argument(
+        "--human_proprio_dim",
+        type=int,
+        default=30,
+        help="Proprioception dimension for human expert (EgoDex: 10 joints * 3 coords = 30)",
+    )
+    parser.add_argument(
+        "--robot_action_dim",
+        type=int,
+        default=24,
+        help="Action dimension for robot expert (RoboCasa: 24 for bimanual action command)",
+    )
+    parser.add_argument(
+        "--robot_proprio_dim",
+        type=int,
+        default=24,
+        help="Proprioception dimension for robot expert (RoboCasa: robot state dim)",
+    )
+    parser.add_argument(
+        "--robot_trajectory_dim",
+        type=int,
+        default=30,
+        help="Fingertip trajectory dimension for robot expert (RoboCasa: 10 keypoints * 3 coords = 30)",
+    )
+    parser.add_argument(
+        "--robot_use_joint_action",
+        action="store_true",
+        default=False,
+        help="If set, robot expert predicts joint actions instead of fingertip trajectories (default: False, uses trajectories)",
     )
     parser.add_argument(
         "--max_crops",
@@ -297,9 +328,15 @@ if __name__ == "__main__":
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
     elif args.mixture == "trajectory_3d_human_robot_fm":
+        # Human (EgoDex) + Robot (RoboCasa) trajectory prediction with fingertip trajectories
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d_fm"], 0.5],
-                 ["robo_casa", ["robo_casa_affordance"], 0.5]]
+                 ["robo_casa", ["robocasa_3d_fm"], 0.5]]
+    elif args.mixture == "trajectory_3d_human_robot_action_fm":
+        # Human (EgoDex) + Robot (RoboCasa) with robot using joint actions instead of fingertip trajectory
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_3d_fm"], 0.5],
+                 ["robo_casa", ["robocasa_action_fm"], 0.5]]
     elif args.mixture == "trajectory_3d_fm_overfit":
         # Flow matching based 3D trajectory prediction with delta representation
         eval_tasks = []
@@ -402,13 +439,11 @@ if __name__ == "__main__":
             raise ValueError(f"Unknown action_expert_mode: {args.action_expert_mode}")
         
         # Configure action dimensions based on task
-        # action_horizon: number of timesteps to predict (e.g., 30)
+        # action_horizon: number of timesteps to predict (e.g., 30) - shared across experts
         # action_dim: flattened coordinate dimension = num_joints * num_coordinates
         #   For 2D trajectories: num_joints * 2
         #   For 3D trajectories: num_joints * 3
-        # Example: 10 joints * 3 coords = 30 dimensions
         model_cfg.action_horizon = args.action_horizon
-        model_cfg.action_dim = 30      # num_joints * coordinates (currently assuming 10 joints * 3 for 3D)
         model_cfg.use_adarms_flow_matching = False  # Use Pi0-style MLP conditioning
         model_cfg.flow_matching_loss_weight = 1.0
         model_cfg.flow_matching_num_steps = 10  # ODE integration steps during inference
@@ -418,6 +453,50 @@ if __name__ == "__main__":
         if "trajectory_3d_direct" in args.mixture:
             model_cfg.use_direct_trajectory_prediction = True
             log.info("Enabled direct trajectory prediction mode (regression)")
+        
+        # Configure per-expert dimensions for multi-expert mode
+        # Human expert (expert_type=0): EgoDex hand trajectories
+        model_cfg.human_action_dim = args.human_action_dim
+        model_cfg.human_proprio_dim = args.human_proprio_dim
+        
+        # Robot expert (expert_type=1): RoboCasa robot actions/trajectories
+        model_cfg.robot_action_dim = args.robot_action_dim
+        model_cfg.robot_proprio_dim = args.robot_proprio_dim
+        model_cfg.robot_trajectory_dim = args.robot_trajectory_dim
+        
+        # Determine robot action mode: use trajectory (default) or joint actions
+        model_cfg.robot_use_trajectory_as_action = not args.robot_use_joint_action
+        
+        # Determine effective robot action dim based on mode
+        effective_robot_action_dim = (
+            args.robot_trajectory_dim if not args.robot_use_joint_action 
+            else args.robot_action_dim
+        )
+        
+        if args.action_expert_mode == "shared":
+            # Shared mode: use MAX dimensions across human and robot
+            # This ensures the single shared expert can handle both data types
+            # The collator will pad smaller samples to max dimensions
+            # The loss will mask out padded dimensions using *_dims tensors
+            max_action_dim = max(args.human_action_dim, effective_robot_action_dim)
+            max_proprio_dim = max(args.human_proprio_dim, args.robot_proprio_dim)
+            
+            model_cfg.action_dim = max_action_dim
+            model_cfg.proprio_dim = max_proprio_dim
+            
+            log.info(f"Shared expert mode (padded to max dims):")
+            log.info(f"  action_dim={max_action_dim} (human={args.human_action_dim}, robot={effective_robot_action_dim})")
+            log.info(f"  proprio_dim={max_proprio_dim} (human={args.human_proprio_dim}, robot={args.robot_proprio_dim})")
+        else:
+            # separate_human_robot mode: each expert has its own dimensions
+            # Set defaults for backward compatibility (used as fallback)
+            model_cfg.action_dim = args.human_action_dim
+            model_cfg.proprio_dim = args.human_proprio_dim
+            
+            log.info(f"Separate expert mode dimensions:")
+            log.info(f"  Human expert (id=0): action_dim={args.human_action_dim}, proprio_dim={args.human_proprio_dim}")
+            log.info(f"  Robot expert (id=1): action_dim={effective_robot_action_dim}, proprio_dim={args.robot_proprio_dim}")
+            log.info(f"  Robot uses {'joint actions' if args.robot_use_joint_action else 'trajectory'}")
         
         # Configure action expert to be smaller than VLM (OpenPI-style)
         # This reduces memory while maintaining head_dim compatibility
@@ -433,14 +512,12 @@ if __name__ == "__main__":
         # (it uses VLM's head_dim directly, not computed from action_expert_d_model)
         # This allows different d_model values while maintaining head_dim compatibility (OpenPI pattern)
         
-        log.info("Flow matching trajectory head enabled with action_horizon=%d, action_dim=%d", 
-                 model_cfg.action_horizon, model_cfg.action_dim)
+        log.info("Flow matching trajectory head enabled with action_horizon=%d", model_cfg.action_horizon)
         
         # Proprioception settings
         model_cfg.include_proprio = not args.exclude_proprio
-        model_cfg.proprio_dim = args.proprio_dim
         if not args.exclude_proprio:
-            log.info(f"Proprioception enabled with dimension {args.proprio_dim}")
+            log.info(f"Proprioception enabled")
 
     else:
         model_cfg.use_action_expert = False
@@ -545,7 +622,7 @@ if __name__ == "__main__":
         global_train_batch_size=global_batch_size,
         device_inf_eval_batch_size=args.device_inf_batch_size,
         device_eval_batch_size=args.device_eval_batch_size,
-        device_train_microbatch_size=args.device_train_batch_size,
+        device_train_microbatch_size=args.device_train_batch_size if not args.debug else 1,
         time_limit=None,
         max_duration=duration,
         stop_at="${max_duration}",

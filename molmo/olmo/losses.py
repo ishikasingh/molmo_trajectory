@@ -69,6 +69,7 @@ class FlowMatchingTrajectoryLoss(nn.Module):
         trajectory_target: torch.Tensor,
         t: torch.Tensor,
         noise: torch.Tensor,
+        action_dim_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Compute flow matching loss.
@@ -98,12 +99,17 @@ class FlowMatchingTrajectoryLoss(nn.Module):
             x_t = x_t + dt * v_t  (moves backward in time)
 
         Args:
-            model_output: Model prediction, shape (batch_size, action_horizon, action_dim)
+            model_output: Model prediction, shape (batch_size, action_horizon, max_action_dim)
                 - For velocity prediction: predicted velocity
                 - For x0 prediction: predicted clean target x0
-            trajectory_target: Ground truth trajectory (X_1), shape (batch_size, action_horizon, action_dim)
+                May be padded to max_action_dim in multi-expert mode
+            trajectory_target: Ground truth trajectory (X_1), shape (batch_size, action_horizon, max_action_dim)
+                May be padded to max_action_dim in multi-expert mode
             t: Time samples in [0, 1], shape (batch_size,)
-            noise: Noise samples (X_0), shape (batch_size, action_horizon, action_dim)
+            noise: Noise samples (X_0), shape (batch_size, action_horizon, max_action_dim)
+                May be padded to max_action_dim in multi-expert mode
+            action_dim_mask: Optional, shape (batch_size,) - valid action_dim for each sample
+                If provided, only computes loss for valid dimensions (for multi-expert mode)
 
         Returns:
             Scalar loss value
@@ -119,8 +125,20 @@ class FlowMatchingTrajectoryLoss(nn.Module):
             # The model predicts x0 (the denoised/clean trajectory)
             loss = F.mse_loss(model_output, trajectory_target, reduction="none")
 
-        # Check if loss is reasonable before returning
-        mean_loss = loss.mean()
+        # Handle multi-expert mode with different action dimensions per sample
+        if action_dim_mask is not None:
+            # Create mask: (batch_size, action_horizon, max_action_dim)
+            batch_size, action_horizon, max_action_dim = loss.shape
+            mask = torch.zeros_like(loss)
+            for i in range(batch_size):
+                valid_dim = action_dim_mask[i].item()
+                mask[i, :, :valid_dim] = 1.0
+            
+            # Apply mask and compute mean over valid dimensions only
+            masked_loss = loss * mask
+            mean_loss = masked_loss.sum() / mask.sum()
+        else:
+            mean_loss = loss.mean()
         
         # If loss is extremely large (> 1e6), something is wrong
         if mean_loss > 1e6:

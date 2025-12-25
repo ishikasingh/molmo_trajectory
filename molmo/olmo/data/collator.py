@@ -83,10 +83,13 @@ class MMCollator:
             if any(key in ex for ex in batch):
                 out[key] = _collate([ex.get(key) for ex in batch], self.max_crops, pad=self.pad)
         
-        # Handle trajectory targets (now 2D: action_horizon x action_dim)
+        # Handle trajectory targets and proprioception states
+        # In multi-expert mode (shared mode with human+robot), dimensions may vary per sample
+        # - trajectory_target: 2D tensor (action_horizon x action_dim)
+        # - proprio_state: 1D tensor (proprio_dim)
+        # - expert_type: scalar (0=human, 1=robot)
         for key in self.TRAJECTORY_KEYS:
             if any(key in ex for ex in batch):
-                # Stack trajectory targets - they should all be (action_horizon, action_dim)
                 trajectory_tensors = []
                 for ex in batch:
                     if key in ex:
@@ -98,8 +101,57 @@ class MMCollator:
                             traj = torch.tensor(traj)
                         trajectory_tensors.append(traj)
                 if trajectory_tensors:
-                    # Stack along batch dimension: (batch_size, action_horizon, action_dim) or (batch_size,) for scalars
-                    out[key] = torch.stack(trajectory_tensors, dim=0)
+                    # Check if all tensors have the same shape (for stacking)
+                    # Case 1: Scalar tensors (like expert_type) - dim() == 0
+                    if trajectory_tensors[0].dim() == 0:
+                        out[key] = torch.stack(trajectory_tensors, dim=0)
+                    
+                    # Case 2: All tensors have the same shape - simple stack
+                    elif all(t.shape == trajectory_tensors[0].shape for t in trajectory_tensors):
+                        out[key] = torch.stack(trajectory_tensors, dim=0)
+                    
+                    # Case 3: 1D tensors with different sizes (proprio_state in shared mode)
+                    elif trajectory_tensors[0].dim() == 1:
+                        # Find max dimension
+                        max_dim = max(t.shape[0] for t in trajectory_tensors)
+                        
+                        # Pad each tensor to max dimension
+                        padded_tensors = []
+                        dim_mask = []  # Track valid dimensions per sample
+                        for t in trajectory_tensors:
+                            padded = torch.zeros(max_dim, dtype=t.dtype)
+                            padded[:t.shape[0]] = t
+                            padded_tensors.append(padded)
+                            dim_mask.append(t.shape[0])
+                        
+                        out[key] = torch.stack(padded_tensors, dim=0)
+                        # Store actual dimension per sample for masking
+                        out[f"{key}_dims"] = torch.tensor(dim_mask)
+                    
+                    # Case 4: 2D+ tensors with different shapes (trajectory_target in shared mode)
+                    else:
+                        # Find max dimensions across all axes
+                        max_dims = list(trajectory_tensors[0].shape)
+                        for t in trajectory_tensors[1:]:
+                            for i in range(len(max_dims)):
+                                max_dims[i] = max(max_dims[i], t.shape[i])
+                        
+                        # Pad each tensor to max dimensions
+                        padded_tensors = []
+                        action_dim_mask = []  # Track valid action_dim (last dim) per sample
+                        for t in trajectory_tensors:
+                            # Create padded tensor filled with zeros
+                            padded = torch.zeros(max_dims, dtype=t.dtype)
+                            # Copy original tensor into padded tensor
+                            slices = [slice(0, s) for s in t.shape]
+                            padded[slices] = t
+                            padded_tensors.append(padded)
+                            # Store actual action_dim for this sample (last dimension)
+                            action_dim_mask.append(t.shape[-1])
+                        
+                        out[key] = torch.stack(padded_tensors, dim=0)
+                        # Store action_dim per sample for loss masking
+                        out[f"{key}_dims"] = torch.tensor(action_dim_mask)
         
         out["input_ids"] = out.pop("input_tokens")
         if "target_tokens" in out:

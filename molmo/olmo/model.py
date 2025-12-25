@@ -1738,19 +1738,64 @@ class ActionExpertTransformer(nn.Module):
     
     The action expert uses its own weights but attends to vision/language context
     via merged K,V attention at each layer (OpenPI-style).
+    
+    Each expert can have its own action_dim and proprio_dim based on expert_id:
+    - expert_id=0: Human expert (uses human_action_dim, human_proprio_dim)
+    - expert_id=1: Robot expert (uses robot_action_dim/robot_trajectory_dim, robot_proprio_dim)
     """
     
-    def __init__(self, config: ModelConfig, init_params: bool = True):
+    def __init__(self, config: ModelConfig, expert_id: int = 0, init_params: bool = True):
         super().__init__()
         self.config = config
+        self.expert_id = expert_id
         
         # Ensure action_expert_d_model is set (default to VLM d_model)
         if config.action_expert_d_model is None:
             config.action_expert_d_model = config.d_model
         
         self.d_model = config.action_expert_d_model
-        self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
+        
+        # Determine action_dim and proprio_dim based on expert_id
+        # For multi-expert mode with separate_human_robot:
+        #   expert_id=0 -> Human (EgoDex)
+        #   expert_id=1 -> Robot (RoboCasa)
+        # 
+        # BACKWARD COMPATIBILITY: Use getattr with defaults for new config fields
+        # that may not exist in old checkpoints
+        action_expert_mode = getattr(config, 'action_expert_mode', 'shared')
+        
+        if action_expert_mode == "separate_human_robot":
+            if expert_id == 0:
+                # Human expert
+                human_action_dim = getattr(config, 'human_action_dim', None)
+                human_proprio_dim = getattr(config, 'human_proprio_dim', None)
+                self.action_dim = human_action_dim
+                self.proprio_dim = human_proprio_dim
+                log.info(f"Human expert (id={expert_id}): action_dim={self.action_dim}, proprio_dim={self.proprio_dim}")
+            elif expert_id == 1:
+                # Robot expert - can use either trajectory or joint actions
+                robot_use_trajectory = getattr(config, 'robot_use_trajectory_as_action', True)
+                robot_trajectory_dim = getattr(config, 'robot_trajectory_dim', None)
+                robot_action_dim = getattr(config, 'robot_action_dim', None)
+                robot_proprio_dim = getattr(config, 'robot_proprio_dim', None)
+                
+                if robot_use_trajectory:
+                    self.action_dim = robot_trajectory_dim
+                else:
+                    self.action_dim = robot_action_dim
+                self.proprio_dim = robot_proprio_dim
+                log.info(f"Robot expert (id={expert_id}): action_dim={self.action_dim}, proprio_dim={self.proprio_dim}, "
+                         f"using {'trajectory' if robot_use_trajectory else 'joint actions'}")
+            else:
+                # Fallback for additional experts
+                self.action_dim = config.action_dim
+                self.proprio_dim = config.proprio_dim
+                log.warning(f"Unknown expert_id={expert_id}, using default dims: action_dim={self.action_dim}, proprio_dim={self.proprio_dim}")
+        else:
+            # Shared mode or single expert - use default dimensions (backward compatible)
+            self.action_dim = config.action_dim
+            self.proprio_dim = config.proprio_dim
         
         # Determine number of layers (default to same as main model)
         n_layers = config.action_expert_n_layers if config.action_expert_n_layers is not None else config.n_layers
@@ -1758,16 +1803,18 @@ class ActionExpertTransformer(nn.Module):
         
         # Input projection: action_dim -> action_expert_d_model
         self.action_in_proj = nn.Linear(
-            config.action_dim, 
+            self.action_dim, 
             config.action_expert_d_model,
             bias=config.include_bias,
             device=config.init_device
         )
 
         # Proprioception projection: proprio_dim -> action_expert_d_model
-        if config.include_proprio:
+        # BACKWARD COMPATIBILITY: Use getattr for include_proprio (default True for old configs)
+        self.include_proprio = getattr(config, 'include_proprio', True)
+        if self.include_proprio:
             self.proprio_in_proj = nn.Linear(
-                config.proprio_dim,
+                self.proprio_dim,
                 config.action_expert_d_model,
                 bias=config.include_bias,
                 device=config.init_device
@@ -1812,9 +1859,10 @@ class ActionExpertTransformer(nn.Module):
         
         # Velocity prediction head: action_expert_d_model -> action_dim
         # Maps action hidden states directly to velocity predictions for flow matching
+        # Uses per-expert action_dim
         self.velocity_head = nn.Linear(
             config.action_expert_d_model,
-            config.action_dim,
+            self.action_dim,
             bias=config.include_bias,
             device=config.init_device
         )
@@ -1839,11 +1887,11 @@ class ActionExpertTransformer(nn.Module):
             type_of_module=ModuleType.emb
         )
 
-        if self.config.include_proprio:
+        if self.include_proprio:
             init_weights(
                 self.config,
                 self.proprio_in_proj,
-                d=self.config.proprio_dim,
+                d=self.proprio_dim,  # Use per-expert proprio_dim
                 layer_id=None,
                 type_of_module=ModuleType.emb
             )
@@ -2450,9 +2498,10 @@ class Molmo(nn.Module):
             self.num_action_experts = num_experts
             
             # Always create ModuleList, even for single expert
+            # Pass expert_id so each expert can have its own dimensions
             self.action_experts = nn.ModuleList([
-                ActionExpertTransformer(config, init_params=init_params)
-                for _ in range(num_experts)
+                ActionExpertTransformer(config, expert_id=i, init_params=init_params)
+                for i in range(num_experts)
             ])
             if num_experts > 1:
                 log.info(f"Created {num_experts} action experts for multi-expert mode")
@@ -2648,6 +2697,10 @@ class Molmo(nn.Module):
         """
         Route velocity prediction to appropriate expert(s) based on expert_type.
         
+        In multi-expert mode with different action_dims per expert, the output is padded
+        to the maximum action_dim across all experts. The valid dimensions are tracked
+        and should be used for loss masking.
+        
         Args:
             velocity_hidden: (batch_size, action_horizon, action_expert_d_model)
                 Hidden states for velocity prediction
@@ -2655,18 +2708,26 @@ class Molmo(nn.Module):
                 Expert index for each sample (0=human, 1=robot, etc.)
                 
         Returns:
-            velocity_output: (batch_size, action_horizon, action_dim)
-                Combined velocity predictions from all experts
+            velocity_output: (batch_size, action_horizon, max_action_dim)
+                Combined velocity predictions from all experts, padded to max_action_dim
         """
         batch_size = velocity_hidden.shape[0]
         device = velocity_hidden.device
         dtype = velocity_hidden.dtype
         
-        # Initialize output tensor
+        # In multi-expert mode, determine max action_dim across all experts
+        # BACKWARD COMPATIBILITY: Use getattr for action_expert_mode
+        action_expert_mode = getattr(self.config, 'action_expert_mode', 'shared')
+        if action_expert_mode == "separate_human_robot" and self.num_action_experts > 1:
+            max_action_dim = max(expert.action_dim for expert in self.action_experts)
+        else:
+            max_action_dim = self.config.action_dim
+        
+        # Initialize output tensor with max_action_dim
         velocity_output = torch.zeros(
             batch_size, 
             self.config.action_horizon, 
-            self.config.action_dim,
+            max_action_dim,
             device=device, 
             dtype=dtype
         )
@@ -2677,7 +2738,10 @@ class Molmo(nn.Module):
             if mask.any():
                 expert = self.action_experts[expert_id]
                 # Process subset through this expert's velocity prediction
-                velocity_output[mask] = expert.predict_velocity(velocity_hidden[mask])
+                # expert.predict_velocity returns (N, action_horizon, expert.action_dim)
+                expert_velocity = expert.predict_velocity(velocity_hidden[mask])
+                # Copy to output (may be smaller than max_action_dim)
+                velocity_output[mask, :, :expert.action_dim] = expert_velocity
         
         return velocity_output
 
@@ -2727,8 +2791,12 @@ class Molmo(nn.Module):
         """
         Embed noisy actions through different expert embedding layers based on expert_type.
         
+        In multi-expert mode with different action_dims, noisy_actions may be padded to
+        max_action_dim. Each expert only uses its relevant dimensions ([:expert.action_dim]).
+        
         Args:
-            noisy_actions: (batch_size, action_horizon, action_dim)
+            noisy_actions: (batch_size, action_horizon, max_action_dim) 
+                May be padded to max_action_dim in multi-expert mode
             action_timestep: (batch_size,)
             expert_type: (batch_size,) Expert index for each sample
             
@@ -2752,8 +2820,11 @@ class Molmo(nn.Module):
             mask = (expert_type == expert_id)
             if mask.any():
                 expert = self.action_experts[expert_id]
+                # In multi-expert mode, each expert has its own action_dim
+                # Extract only the relevant dimensions for this expert
+                expert_actions = noisy_actions[mask, :, :expert.action_dim]
                 action_hidden[mask] = expert.embed_actions_with_time(
-                    noisy_actions[mask], action_timestep[mask]
+                    expert_actions, action_timestep[mask]
                 )
         
         return action_hidden
@@ -2801,8 +2872,12 @@ class Molmo(nn.Module):
         """
         Embed proprioceptive state through different expert embedding layers.
         
+        In multi-expert mode with different proprio_dims, proprio_state may be padded to
+        max_proprio_dim. Each expert only uses its relevant dimensions ([:expert.proprio_dim]).
+        
         Args:
-            proprio_state: (batch_size, proprio_dim)
+            proprio_state: (batch_size, max_proprio_dim)
+                May be padded to max_proprio_dim in multi-expert mode
             expert_type: (batch_size,) Expert index for each sample
             
         Returns:
@@ -2825,7 +2900,10 @@ class Molmo(nn.Module):
             mask = (expert_type == expert_id)
             if mask.any():
                 expert = self.action_experts[expert_id]
-                proprio_hidden[mask] = expert.embed_proprio(proprio_state[mask])
+                # In multi-expert mode, each expert has its own proprio_dim
+                # Extract only the relevant dimensions for this expert
+                expert_proprio = proprio_state[mask, :expert.proprio_dim]
+                proprio_hidden[mask] = expert.embed_proprio(expert_proprio)
         
         return proprio_hidden
 
@@ -3137,8 +3215,10 @@ class Molmo(nn.Module):
                     )  # (batch_size, action_horizon, action_expert_d_model)
 
             # Add proprioception if enabled (goes before actions)
+            # BACKWARD COMPATIBILITY: Use getattr for include_proprio
             proprio_len = 0
-            if self.config.include_proprio and proprio_state is not None:
+            include_proprio = getattr(self.config, 'include_proprio', True)
+            if include_proprio and proprio_state is not None:
                 if use_multi_expert_embed:
                     # Route proprio embeddings through different experts
                     proprio_hidden = self._embed_proprio_multi_expert(proprio_state, expert_type)
@@ -3389,7 +3469,7 @@ class Molmo(nn.Module):
             # After all layers, compute velocity predictions from action_hidden (before projection)
             # This uses action_expert_d_model directly, avoiding unnecessary projection to d_model
             # If proprioception is included, exclude it from velocity prediction
-            if self.config.include_proprio and proprio_state is not None:
+            if include_proprio and proprio_state is not None:
                 # action_hidden shape: (B, S+A, D)
                 # We want only the last A tokens (action tokens)
                 velocity_hidden = action_hidden[:, proprio_len:]

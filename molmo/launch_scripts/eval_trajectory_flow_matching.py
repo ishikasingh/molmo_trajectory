@@ -440,15 +440,24 @@ def load_test_examples(num_examples: int = 10,
         
         # Extract data
         image = example_data["image"]
-        message_list = example_data["message_list"]
         metadata = example_data.get("metadata", {})
         
-        if message_list and len(message_list) > 0:
+        # Handle both message_list (text-based) and top-level fields (flow matching)
+        if "message_list" in example_data and example_data["message_list"] and len(example_data["message_list"]) > 0:
+            # Text-based mode: read from message_list
+            message_list = example_data["message_list"]
             instruction = message_list[0].get("label", "")
-            gt_trajectory = message_list[0].get("points", None)  # For flow matching format
+            gt_trajectory = message_list[0].get("points", None)
             point_scale = message_list[0].get("point_scale", None)
             style = message_list[0].get("style", "")
             state = message_list[0].get("state", None)
+        else:
+            # Flow matching mode: read from top-level fields
+            instruction = example_data.get("label", "")
+            gt_trajectory = example_data.get("trajectory_target", None)  # Use trajectory_target for flow matching
+            point_scale = None  # Not used for flow matching
+            style = example_data.get("style", "")
+            state = example_data.get("state", None)
             
             # Save image temporarily for processing
             temp_image_path = f"temp_trajectory_image_{idx}.jpg"

@@ -786,6 +786,10 @@ class Trainer:
             
             # Validate trajectory shape matches config
             # After collator fix, should be 3D: (batch_size, action_horizon, action_dim)
+            # In multi-expert mode, each expert may have different action_dim, so we only validate action_horizon
+            # BACKWARD COMPATIBILITY: Use getattr for action_expert_mode (may not exist in old configs)
+            is_multi_expert_mode = getattr(self.cfg.model, 'action_expert_mode', 'shared') == "separate_human_robot"
+            
             if trajectory_target.dim() == 3:
                 # Proper 3D tensor from fixed collator - validate dimensions
                 if trajectory_target.shape[1] != self.cfg.model.action_horizon:
@@ -793,11 +797,14 @@ class Trainer:
                         f"trajectory_target action_horizon {trajectory_target.shape[1]} "
                         f"does not match config action_horizon {self.cfg.model.action_horizon}"
                     )
-                if trajectory_target.shape[2] != self.cfg.model.action_dim:
-                    raise ValueError(
-                        f"trajectory_target action_dim {trajectory_target.shape[2]} "
-                        f"does not match config action_dim {self.cfg.model.action_dim}"
-                    )
+                # In multi-expert mode, action_dim can vary per expert, so skip strict validation
+                # The model will handle dimension mismatch at the expert level
+                if not is_multi_expert_mode:
+                    if trajectory_target.shape[2] != self.cfg.model.action_dim:
+                        raise ValueError(
+                            f"trajectory_target action_dim {trajectory_target.shape[2]} "
+                            f"does not match config action_dim {self.cfg.model.action_dim}"
+                        )
             elif trajectory_target.dim() == 2:
                 # Backward compatibility: old 2D format (batch_size, action_horizon*action_dim)
                 # Try to reshape to (batch_size, action_horizon, action_dim)
@@ -810,6 +817,12 @@ class Trainer:
                         self.cfg.model.action_dim
                     )
                 else:
+                    # In multi-expert mode, this 2D format is not supported - must use 3D
+                    if is_multi_expert_mode:
+                        raise ValueError(
+                            f"In multi-expert mode, trajectory_target must be 3D with shape "
+                            f"(batch_size, action_horizon, action_dim). Got 2D with shape {trajectory_target.shape}"
+                        )
                     raise ValueError(
                         f"trajectory_target 2D shape {trajectory_target.shape} cannot be reshaped to "
                         f"({batch_size}, {self.cfg.model.action_horizon}, {self.cfg.model.action_dim}). "
@@ -951,7 +964,19 @@ class Trainer:
             if self.cfg.model.use_direct_trajectory_prediction:
                 # Direct trajectory prediction loss (MSE against GT)
                 trajectory_target = batch['trajectory_target'].to(torch.float32)
-                trajectory_loss = F.mse_loss(velocity_pred, trajectory_target)
+                action_dim_mask = batch.get('trajectory_target_dims')
+                
+                if action_dim_mask is not None:
+                    # Multi-expert mode with different action dimensions
+                    batch_size, action_horizon, max_action_dim = velocity_pred.shape
+                    loss = F.mse_loss(velocity_pred, trajectory_target, reduction="none")
+                    mask = torch.zeros_like(loss)
+                    for i in range(batch_size):
+                        valid_dim = action_dim_mask[i].item()
+                        mask[i, :, :valid_dim] = 1.0
+                    trajectory_loss = (loss * mask).sum() / mask.sum()
+                else:
+                    trajectory_loss = F.mse_loss(velocity_pred, trajectory_target)
             else:
                 # Get the ground truth actions and the time/noise used during forward pass
                 # These should have been passed to the forward method
@@ -963,11 +988,15 @@ class Trainer:
                 # Check for NaN/Inf before loss computation
                 if torch.isnan(velocity_pred).any() or torch.isinf(velocity_pred).any():
                     log.error(f"[FLOW MATCHING ERROR] velocity_pred contains NaN or Inf! NaN: {torch.isnan(velocity_pred).sum().item()}, Inf: {torch.isinf(velocity_pred).sum().item()}")
+                # Get action_dim_mask for multi-expert mode (if available)
+                action_dim_mask = batch.get('trajectory_target_dims')  # From collator padding
+                
                 trajectory_loss = self.trajectory_loss_fn(
                     model_output=velocity_pred,
                     trajectory_target=trajectory_target,
                     t=t,
-                    noise=noise
+                    noise=noise,
+                    action_dim_mask=action_dim_mask,
                 )
 
             # log.info(f"[FLOW MATCHING DEBUG] Flow matching loss computed: {trajectory_loss.item():.6f}")

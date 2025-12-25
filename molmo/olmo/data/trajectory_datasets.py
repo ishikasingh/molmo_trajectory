@@ -397,19 +397,10 @@ class TrajectoryDataset(Dataset):
         else:
             style = 'trajectory_3d_text' if self.output_format == "text" else 'trajectory_3d_fm'
         
-        return {
+        # Build base result dict
+        result = {
             'image': image,
             'state': initial_state,  # Always use absolute position for state
-            'message_list': [
-                {
-                    'label': instruction,
-                    'points': final_trajectory, # to make it compatible with the data formatter, points means trajectory
-                    'point_scale': 100 if self.normalize_coordinates and self.output_2d_trajectory else None,
-                    'style': style,
-                    'state': initial_state,  # Include the initial robot state so it can be formatted in the prompt
-                }
-            ],
-            'trajectory_target': trajectory_flattened_joints,  # For flow matching: shape (num_steps, num_joints*coords) = (action_horizon, action_dim)
             'trajectory_shape': final_trajectory.shape,  # Store original shape for potential reshaping later
             'expert_type': 0,  # Human trajectory expert (for multi-expert routing)
             'metadata': {
@@ -421,6 +412,26 @@ class TrajectoryDataset(Dataset):
                 'trajectory_representation': self.trajectory_representation,
             }
         }
+        
+        # For text-based modes, use message_list (needed for text output formatting)
+        # For flow matching, use top-level fields (no text output needed)
+        if style in ['trajectory_2d_text', 'trajectory_3d_text']:
+            result['message_list'] = [
+                {
+                    'label': instruction,
+                    'points': final_trajectory,  # For text output formatting
+                    'point_scale': 100 if self.normalize_coordinates and self.output_2d_trajectory else None,
+                    'style': style,
+                    'state': initial_state,  # Include the initial robot state so it can be formatted in the prompt
+                }
+            ]
+        else:
+            # Flow matching mode: use top-level fields for prompt formatting, trajectory_target for training
+            result['label'] = instruction
+            result['style'] = style
+            result['trajectory_target'] = trajectory_flattened_joints  # For flow matching: shape (num_steps, num_joints*coords) = (action_horizon, action_dim)
+        
+        return result
     
     def _load_frame(self, video_path: str, frame_idx: int, max_retries: int = 3) -> Image.Image:
         """
@@ -728,35 +739,44 @@ class TrajectoryDataset(Dataset):
             
             # Extract data
             image = example_data["image"]
-            message_list = example_data["message_list"]
             metadata = example_data.get("metadata", {})
             
-            if message_list and len(message_list) > 0:
+            # Handle both message_list (text-based) and top-level fields (flow matching)
+            if "message_list" in example_data and example_data["message_list"] and len(example_data["message_list"]) > 0:
+                # Text-based mode: read from message_list
+                message_list = example_data["message_list"]
                 instruction = message_list[0].get("label", "")
                 gt_trajectory = message_list[0].get("points", None)
                 point_scale = message_list[0].get("point_scale", None)
                 style = message_list[0].get("style", "")
                 state = message_list[0].get("state", None)
-                
-                # Convert image to numpy if needed
-                if hasattr(image, 'save'):  # PIL Image
-                    image_np = np.array(image)
-                else:
-                    image_np = image
-                
-                frame_data = {
-                    "image": image_np,
-                    "prompt": instruction,
-                    "ground_truth_trajectory": gt_trajectory,
-                    "point_scale": point_scale,
-                    "style": style,
-                    "task_name": metadata.get("task_name", "unknown"),
-                    "frame_idx": frame_info['frame_idx'],
-                    "state": state,
-                    "trajectory_representation": metadata.get("trajectory_representation", "absolute"),
-                }
-                
-                result_frames.append(frame_data)
+            else:
+                # Flow matching mode: read from top-level fields
+                instruction = example_data.get("label", "")
+                gt_trajectory = example_data.get("trajectory_target", None)  # Use trajectory_target for flow matching
+                point_scale = None  # Not used for flow matching
+                style = example_data.get("style", "")
+                state = example_data.get("state", None)
+            
+            # Convert image to numpy if needed
+            if hasattr(image, 'save'):  # PIL Image
+                image_np = np.array(image)
+            else:
+                image_np = image
+            
+            frame_data = {
+                "image": image_np,
+                "prompt": instruction,
+                "ground_truth_trajectory": gt_trajectory,
+                "point_scale": point_scale,
+                "style": style,
+                "task_name": metadata.get("task_name", "unknown"),
+                "frame_idx": frame_info['frame_idx'],
+                "state": state,
+                "trajectory_representation": metadata.get("trajectory_representation", "absolute"),
+            }
+            
+            result_frames.append(frame_data)
         
         return result_frames
 

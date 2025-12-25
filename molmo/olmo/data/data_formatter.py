@@ -600,10 +600,15 @@ class DataFormatter:
         return answer
 
     def format_points(self, example):
+        style = example.get("style", "")
+        
+        # For flow matching, return dummy token even if points is missing (points not needed for text output)
+        if style == "trajectory_3d_fm" and "points" not in example:
+            return self.trajectory_to_dummy_text(None)
+        
         if "points" not in example:
             return None
         points = example["points"]
-        style = example["style"]
         if "label" in example:
             label = example["label"].lower()
         else:

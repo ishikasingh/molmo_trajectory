@@ -831,16 +831,62 @@ class ModelConfig(BaseConfig):
     action_dim: int = 30
     """
     Dimension of each action vector (e.g., 7 joint velocities + 1 gripper).
+    This is used as the default when per-expert dimensions are not specified.
     """
 
     proprio_dim: int = 30
     """
     Dimension of proprioceptive state vector (e.g., joint positions).
+    This is used as the default when per-expert dimensions are not specified.
     """
 
     action_horizon: int = 30
     """
-    Number of action steps to predict.
+    Number of action steps to predict. Shared across all experts.
+    """
+
+    # Per-expert dimensions for multi-expert mode (human vs robot)
+    # When using separate_human_robot mode, each expert can have different dimensions
+    
+    # Human expert (expert_type=0) - typically for EgoDex hand trajectories
+    human_action_dim: Optional[int] = None
+    """
+    Action/trajectory dimension for human expert. If None, uses action_dim.
+    For EgoDex: 30 (10 joints * 3 coords)
+    """
+    
+    human_proprio_dim: Optional[int] = None
+    """
+    Proprioception dimension for human expert. If None, uses proprio_dim.
+    For EgoDex: 30 (10 joints * 3 coords) - initial hand position
+    """
+    
+    # Robot expert (expert_type=1) - typically for RoboCasa robot actions
+    robot_action_dim: Optional[int] = None
+    """
+    Action dimension for robot expert. If None, uses action_dim.
+    For RoboCasa with robot actions: 24 (bimanual action command)
+    For RoboCasa with fingertip trajectory: 36 (12 keypoints * 3 coords)
+    """
+    
+    robot_proprio_dim: Optional[int] = None
+    """
+    Proprioception dimension for robot expert. If None, uses proprio_dim.
+    For RoboCasa: state_dim from HDF5 (robot joint states)
+    """
+    
+    robot_trajectory_dim: Optional[int] = None
+    """
+    Fingertip trajectory dimension for robot expert (alternative to robot_action_dim).
+    If set, robot expert can optionally predict fingertip trajectories instead of joint actions.
+    For RoboCasa: 36 (12 keypoints * 3 coords)
+    """
+    
+    robot_use_trajectory_as_action: bool = True
+    """
+    If True, robot expert predicts fingertip trajectories (robot_trajectory_dim).
+    If False, robot expert predicts joint actions (robot_action_dim).
+    This determines which field is used as the action target for robot data.
     """
 
     use_adarms_flow_matching: bool = False
