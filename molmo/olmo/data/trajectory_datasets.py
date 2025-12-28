@@ -104,6 +104,7 @@ class TrajectoryDataset(Dataset):
         frame_downsampling_ratio: int = 15,  # Sample every n frames (1 = no downsampling, 10 = every 10 frames)
         trajectory_representation: str = "absolute",  # "absolute" or "delta" (velocity: v_t = x_{t+1} - x_t)
         load_images: bool = True,
+        pad_action_chunk: bool = False,  # If True, pad action chunks with repeated last step when near end of trajectory
     ):
         # Get data directory from environment variable if not provided
         if data_dir is None:
@@ -124,6 +125,7 @@ class TrajectoryDataset(Dataset):
         self.trajectory_representation = trajectory_representation
         self.overfit_num_examples = type(self).overfit_num_examples
         self.load_images = load_images
+        self.pad_action_chunk = pad_action_chunk
         
         assert output_format in ["text", "flow_matching"], f"output_format must be 'text' or 'flow_matching', got {output_format}"
         assert frame_downsampling_ratio >= 1, f"frame_downsampling_ratio must be >= 1, got {frame_downsampling_ratio}"
@@ -165,7 +167,11 @@ class TrajectoryDataset(Dataset):
         
     def _get_cache_filepath(self) -> Path:
         """Get the path to the cached index mapping file."""
-        cache_filename = f"index_mapping_{self.split}_horizon{self.action_chunking_horizon}.pkl"
+        # Include pad_action_chunk in cache filename if enabled for backward compatibility
+        if self.pad_action_chunk:
+            cache_filename = f"index_mapping_{self.split}_horizon{self.action_chunking_horizon}_padded.pkl"
+        else:
+            cache_filename = f"index_mapping_{self.split}_horizon{self.action_chunking_horizon}.pkl"
         return self.data_dir / cache_filename
     
     def _load_index_from_cache(self) -> Optional[List[Dict]]:
@@ -179,7 +185,8 @@ class TrajectoryDataset(Dataset):
             # Validate that cache matches current configuration
             if (cached_data.get('split') == self.split and
                 cached_data.get('action_chunking_horizon') == self.action_chunking_horizon and
-                cached_data.get('joint_names') == self.joint_names):
+                cached_data.get('joint_names') == self.joint_names and
+                cached_data.get('pad_action_chunk', False) == self.pad_action_chunk):
                 full_index = cached_data['index_mapping']
                 print(f"Successfully loaded {len(full_index)} samples from cache")
                 
@@ -200,6 +207,7 @@ class TrajectoryDataset(Dataset):
             'split': self.split,
             'action_chunking_horizon': self.action_chunking_horizon,
             'joint_names': self.joint_names,
+            'pad_action_chunk': self.pad_action_chunk,
             'index_mapping': index_mapping,
         }
         
@@ -300,17 +308,37 @@ class TrajectoryDataset(Dataset):
                     #     continue
                         
                     trajectory_length = f[f'transforms/{self.joint_names[0]}'].shape[0]
-                # Always build full index with all frames (ratio=1)
-                for frame_idx in range(trajectory_length - self.action_chunking_horizon):
-                    index_mapping.append({
-                        'video_path': str(video_file),
-                        'hdf5_path': str(hdf5_file),
-                        'frame_idx': frame_idx,
-                        'task_name': task_name,
-                        # 'episode_id': video_file.stem,
-                        # 'total_frames': frame_count,
-                        # 'trajectory_length': trajectory_length
-                    })
+                
+                if self.pad_action_chunk:
+                    # When padding is enabled, include all frames
+                    # Frames near the end will have their action chunks padded with repeated last step
+                    # requires at least action_chunking_horizon frames
+                    if trajectory_length < self.action_chunking_horizon:
+                        continue
+                    
+                    for frame_idx in range(trajectory_length):
+                        index_mapping.append({
+                            'video_path': str(video_file),
+                            'hdf5_path': str(hdf5_file),
+                            'frame_idx': frame_idx,
+                            'task_name': task_name,
+                            'trajectory_length': trajectory_length,  # Store for padding calculation
+                        })
+                else:
+                    # Original behavior: only include frames with enough future steps
+                    if trajectory_length < self.action_chunking_horizon:
+                        continue
+                    
+                    for frame_idx in range(trajectory_length - self.action_chunking_horizon):
+                        index_mapping.append({
+                            'video_path': str(video_file),
+                            'hdf5_path': str(hdf5_file),
+                            'frame_idx': frame_idx,
+                            'task_name': task_name,
+                            # 'episode_id': video_file.stem,
+                            # 'total_frames': frame_count,
+                            # 'trajectory_length': trajectory_length
+                        })
             except Exception as e:
                 print(f"    Error processing {hdf5_file}: {e}")
                 continue
@@ -342,8 +370,10 @@ class TrajectoryDataset(Dataset):
         else:
             # Return dummy image (1x1 pixel black image)
             image = Image.fromarray(np.zeros((1, 1, 3), dtype=np.uint8))
-            
-        trajectory = self._load_trajectory(hdf5_path, mapping['frame_idx'], self.action_chunking_horizon)
+        
+        # Get trajectory_length for padding calculation (only available when pad_action_chunk is enabled)
+        trajectory_length = mapping.get('trajectory_length', None)
+        trajectory = self._load_trajectory(hdf5_path, mapping['frame_idx'], self.action_chunking_horizon, trajectory_length)
         
         if self.output_2d_trajectory:
             final_trajectory = self._project_trajectory_to_2d(hdf5_path, mapping['frame_idx'], trajectory)
@@ -497,7 +527,7 @@ class TrajectoryDataset(Dataset):
             f"after {max_retries} attempts"
         )
     
-    def _load_trajectory(self, hdf5_path: str, start_frame: int, num_steps: int, max_retries: int = 3) -> torch.Tensor:
+    def _load_trajectory(self, hdf5_path: str, start_frame: int, num_steps: int, trajectory_length: int = None, max_retries: int = 3) -> torch.Tensor:
         """
         Load trajectory data from HDF5 file with retry logic for NFS I/O errors.
         
@@ -505,6 +535,7 @@ class TrajectoryDataset(Dataset):
             hdf5_path: Path to the HDF5 file
             start_frame: Starting frame index
             num_steps: Number of steps to load
+            trajectory_length: Total length of the trajectory (for padding calculation)
             max_retries: Maximum number of retry attempts
             
         Returns:
@@ -515,14 +546,29 @@ class TrajectoryDataset(Dataset):
         """
         with hdf5_file_with_retry(hdf5_path, max_retries) as f:
             trajectories = {}
+            
+            # Calculate how many steps we can actually load
+            if trajectory_length is not None:
+                available_steps = min(num_steps, trajectory_length - start_frame)
+            else:
+                available_steps = num_steps
+            
             for joint in self.joint_names:
                 if f'transforms/{joint}' in f:
-                    transforms = f[f'transforms/{joint}'][start_frame:start_frame + num_steps]
+                    transforms = f[f'transforms/{joint}'][start_frame:start_frame + available_steps]
                     positions = transforms[:, :3, 3]
                     trajectories[joint] = positions
             
-            trajectory_list = [trajectories.get(j, np.zeros((num_steps, 3))) for j in self.joint_names]
+            trajectory_list = [trajectories.get(j, np.zeros((available_steps, 3))) for j in self.joint_names]
             trajectory = np.stack(trajectory_list, axis=1)
+            
+            # Pad with repeated last step if we don't have enough steps
+            if self.pad_action_chunk and available_steps < num_steps:
+                padding_needed = num_steps - available_steps
+                last_step = trajectory[-1:]  # Shape: (1, num_joints, 3)
+                padding = np.repeat(last_step, padding_needed, axis=0)
+                trajectory = np.concatenate([trajectory, padding], axis=0)
+            
             return torch.from_numpy(trajectory).float()
     
     def _load_instruction(self, hdf5_path: str, max_retries: int = 3) -> str:
@@ -807,6 +853,7 @@ def build_and_save_index_offline(
     action_chunking_horizon: int = 30,
     joint_names: Optional[List[str]] = None,
     force_rebuild: bool = False,
+    pad_action_chunk: bool = False,
 ):
     """
     Build and save index mapping offline for faster dataset loading.
@@ -820,11 +867,13 @@ def build_and_save_index_offline(
         action_chunking_horizon: Number of frames in action chunks
         joint_names: Optional list of joint names to use
         force_rebuild: If True, rebuild index even if cache exists
+        pad_action_chunk: If True, include all frames and pad action chunks with repeated last step
     """
     print(f"\n{'='*80}")
     print(f"Building index mapping offline for {split} split")
     print(f"Data directory: {data_dir}")
     print(f"Action chunking horizon: {action_chunking_horizon}")
+    print(f"Pad action chunk: {pad_action_chunk}")
     print(f"Note: Building full index with all frames (downsampling applied at load time)")
     print(f"{'='*80}\n")
     
@@ -836,6 +885,7 @@ def build_and_save_index_offline(
         action_chunking_horizon=action_chunking_horizon,
         joint_names=joint_names,
         frame_downsampling_ratio=1,
+        pad_action_chunk=pad_action_chunk,
     )
     
     if force_rebuild:
@@ -850,6 +900,7 @@ def build_and_save_index_offline(
                 action_chunking_horizon=action_chunking_horizon,
                 joint_names=joint_names,
                 frame_downsampling_ratio=1,
+                pad_action_chunk=pad_action_chunk,
             )
     
     print(f"\n{'='*80}")
@@ -894,6 +945,12 @@ if __name__ == "__main__":
         default=False,
         help="Build index for both train and test splits"
     )
+    parser.add_argument(
+        "--pad_action_chunk",
+        action="store_true",
+        default=False,
+        help="Include all frames and pad action chunks with repeated last step when near end of trajectory"
+    )
     
     args = parser.parse_args()
     
@@ -912,6 +969,7 @@ if __name__ == "__main__":
                 split=split,
                 action_chunking_horizon=args.action_chunking_horizon,
                 force_rebuild=args.force_rebuild,
+                pad_action_chunk=args.pad_action_chunk,
             )
     else:
         # Build only the specified split
@@ -920,4 +978,5 @@ if __name__ == "__main__":
             split=args.split,
             action_chunking_horizon=args.action_chunking_horizon,
             force_rebuild=args.force_rebuild,
+            pad_action_chunk=args.pad_action_chunk,
         )

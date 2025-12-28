@@ -86,6 +86,7 @@ def build_torch_mm_eval_dataloader(
         data_config.dataset,
         data_config.split,
         action_chunking_horizon=data_config.action_chunking_horizon,
+        pad_action_chunk=data_config.pad_action_chunk,
     )
     n_pad = 0
     if pad_batches:
@@ -163,7 +164,8 @@ def build_train_dataloader(train_config: TrainConfig, device=None) -> DataLoader
             datasets = [get_dataset_by_name(
                 data_config.dataset,
                 data_config.split,
-                action_chunking_horizon=data_config.action_chunking_horizon)]
+                action_chunking_horizon=data_config.action_chunking_horizon,
+                pad_action_chunk=data_config.pad_action_chunk)]
             rates = [1]
         else:
             if data_config.mixture:
@@ -175,6 +177,7 @@ def build_train_dataloader(train_config: TrainConfig, device=None) -> DataLoader
                             name,
                             data_config.split,
                             action_chunking_horizon=data_config.action_chunking_horizon,
+                            pad_action_chunk=data_config.pad_action_chunk,
                         ),
                         rate,
                     )
@@ -188,6 +191,7 @@ def build_train_dataloader(train_config: TrainConfig, device=None) -> DataLoader
                             name,
                             data_config.split,
                             action_chunking_horizon=data_config.action_chunking_horizon,
+                            pad_action_chunk=data_config.pad_action_chunk,
                         )
                         if as_size is not None:
                             size = as_size
@@ -233,7 +237,7 @@ def build_train_dataloader(train_config: TrainConfig, device=None) -> DataLoader
         raise NotImplementedError(train_config.data.multi_modal)
 
 
-def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
+def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None, pad_action_chunk=False):
     horizon = action_chunking_horizon if action_chunking_horizon is not None else 30
     if dataset_name in ["scifi_document_qa", "pixmo_docs_other"]:
         return PixMoDocs("other", split=split)
@@ -365,7 +369,8 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
             action_chunking_horizon=horizon,
             output_2d_trajectory=True,
             normalize_coordinates=True,
-            output_format="text"
+            output_format="text",
+            pad_action_chunk=pad_action_chunk
         )
     elif dataset_name == "trajectory_3d_text":
         data_dir = os.environ.get("EGODEX_DATA_DIR")
@@ -375,9 +380,10 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
             action_chunking_horizon=horizon,
             output_2d_trajectory=False,
             normalize_coordinates=False,
-            output_format="text"
+            output_format="text",
+            pad_action_chunk=pad_action_chunk
         )
-    elif dataset_name == "trajectory_3d_fm":
+    elif dataset_name == "trajectory_3d":
         data_dir = os.environ.get("EGODEX_DATA_DIR")
         stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
         return TrajectoryDataset(
@@ -389,9 +395,10 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
             stats_file=stats_file,
             output_format="flow_matching",
             frame_downsampling_ratio=10,
-            trajectory_representation="delta" # default to be delta, as it works 
+            trajectory_representation="delta", # default to be delta, as it works
+            pad_action_chunk=pad_action_chunk
         )
-    elif dataset_name == "robocasa_3d_fm":
+    elif dataset_name == "robocasa_3d":
         # RoboCasa dataset with fingertip trajectory as action target
         data_dir = os.environ.get("ROBOCASA_DATA_DIR")
         stats_file = os.environ.get("ROBOCASA_STATS_FILE")
@@ -405,8 +412,9 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
             trajectory_representation="delta", # default to be delta, as it works better for flow matching
             frame_downsampling_ratio=10, # robocasa dataset is recorded at 20 fps, while egodex is recorded at 30 fps
             action_output_mode="trajectory",  # Use fingertip trajectory as action target
+            pad_action_chunk=pad_action_chunk
         )
-    elif dataset_name == "robocasa_action_fm":
+    elif dataset_name == "robocasa_action":
         # RoboCasa dataset with robot joint action command as action target
         data_dir = os.environ.get("ROBOCASA_DATA_DIR")
         stats_file = os.environ.get("ROBOCASA_STATS_FILE")
@@ -420,6 +428,7 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
             trajectory_representation="delta",
             frame_downsampling_ratio=10,
             action_output_mode="robot_action",  # Use robot joint action as action target
+            pad_action_chunk=pad_action_chunk
         )
     
     # Delta (velocity) representation variants
@@ -432,7 +441,8 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
             output_2d_trajectory=True,
             normalize_coordinates=True,
             output_format="text",
-            trajectory_representation="delta"
+            trajectory_representation="delta",
+            pad_action_chunk=pad_action_chunk
         )
     elif dataset_name == "trajectory_3d_delta_text":
         data_dir = os.environ.get("EGODEX_DATA_DIR")
@@ -443,6 +453,7 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None):
             output_2d_trajectory=False,
             normalize_coordinates=False,
             output_format="text",
-            trajectory_representation="delta"
+            trajectory_representation="delta",
+            pad_action_chunk=pad_action_chunk
         )
     raise NotImplementedError(dataset_name, split)

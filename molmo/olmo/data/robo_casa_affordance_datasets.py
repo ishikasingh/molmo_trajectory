@@ -152,6 +152,7 @@ class RoboCasaTrajectoryDataset(Dataset):
         # The training code will choose which to use based on the model configuration.
         # action_output_mode controls which stats are used for normalization.
         action_output_mode: str = "trajectory",
+        pad_action_chunk: bool = False,  # If True, pad action chunks with repeated last step when near end of trajectory
     ):
         """
         Initialize RoboCasa Trajectory Dataset (3D flow matching only).
@@ -189,6 +190,7 @@ class RoboCasaTrajectoryDataset(Dataset):
         self.frame_downsampling_ratio = frame_downsampling_ratio
         self.train_ratio = train_ratio
         self.action_output_mode = action_output_mode
+        self.pad_action_chunk = pad_action_chunk
         
         # Validate parameters
         assert trajectory_representation in ["absolute", "delta"], \
@@ -300,7 +302,11 @@ class RoboCasaTrajectoryDataset(Dataset):
     
     def _get_cache_filepath(self) -> Path:
         """Get the path to the cached index mapping file."""
-        cache_filename = f"robocasa_index_mapping_{self.split}_horizon{self.action_chunking_horizon}_ratio{self.train_ratio}.pkl"
+        # Include pad_action_chunk in cache filename if enabled for backward compatibility
+        if self.pad_action_chunk:
+            cache_filename = f"robocasa_index_mapping_{self.split}_horizon{self.action_chunking_horizon}_ratio{self.train_ratio}_padded.pkl"
+        else:
+            cache_filename = f"robocasa_index_mapping_{self.split}_horizon{self.action_chunking_horizon}_ratio{self.train_ratio}.pkl"
         return self.data_dir / cache_filename
     
     def _load_index_from_cache(self) -> Optional[List[Dict]]:
@@ -314,7 +320,8 @@ class RoboCasaTrajectoryDataset(Dataset):
             if (cached_data.get('split') == self.split and
                 cached_data.get('action_chunking_horizon') == self.action_chunking_horizon and
                 cached_data.get('joint_names') == self.joint_names and
-                cached_data.get('train_ratio') == self.train_ratio):
+                cached_data.get('train_ratio') == self.train_ratio and
+                cached_data.get('pad_action_chunk', False) == self.pad_action_chunk):
                 full_index = cached_data['index_mapping']
                 print(f"Successfully loaded {len(full_index)} samples from cache")
                 
@@ -335,6 +342,7 @@ class RoboCasaTrajectoryDataset(Dataset):
             'action_chunking_horizon': self.action_chunking_horizon,
             'joint_names': self.joint_names,
             'train_ratio': self.train_ratio,
+            'pad_action_chunk': self.pad_action_chunk,
             'index_mapping': index_mapping,
         }
         
@@ -416,19 +424,34 @@ class RoboCasaTrajectoryDataset(Dataset):
                         
                         num_frames = f['keypoint_positions_flat'].shape[0]
                         
-                        if num_frames < self.action_chunking_horizon:
-                            print(f"Warning: Episode {hdf5_file} has only {num_frames} frames, skipping...")
-                            continue
-                        
-                        # Add each valid frame as a separate index
-                        for frame_idx in range(num_frames - self.action_chunking_horizon):
-                            index_mapping.append({
-                                'video_path': str(video_file),
-                                'hdf5_path': str(hdf5_file),
-                                'frame_idx': frame_idx,
-                                'task_name': task_name,
-                                'num_frames': num_frames,
-                            })
+                        if self.pad_action_chunk:
+                            # When padding is enabled, include all frames
+                            # Frames near the end will have their action chunks padded with repeated last step
+                            if num_frames < self.action_chunking_horizon:
+                                continue
+                            
+                            for frame_idx in range(num_frames):
+                                index_mapping.append({
+                                    'video_path': str(video_file),
+                                    'hdf5_path': str(hdf5_file),
+                                    'frame_idx': frame_idx,
+                                    'task_name': task_name,
+                                    'num_frames': num_frames,
+                                })
+                        else:
+                            # Original behavior: only include frames with enough future steps
+                            if num_frames < self.action_chunking_horizon:
+                                print(f"Warning: Episode {hdf5_file} has only {num_frames} frames, skipping...")
+                                continue
+                            
+                            for frame_idx in range(num_frames - self.action_chunking_horizon):
+                                index_mapping.append({
+                                    'video_path': str(video_file),
+                                    'hdf5_path': str(hdf5_file),
+                                    'frame_idx': frame_idx,
+                                    'task_name': task_name,
+                                    'num_frames': num_frames,
+                                })
                             
                 except Exception as e:
                     print(f"Error processing {hdf5_file}: {e}")
@@ -462,8 +485,9 @@ class RoboCasaTrajectoryDataset(Dataset):
         else:
             image = Image.fromarray(np.zeros((1, 1, 3), dtype=np.uint8))
         
-        # Load trajectory data
-        trajectory = self._load_trajectory(hdf5_path, frame_idx, self.action_chunking_horizon)
+        # Load trajectory data (pass num_frames for padding calculation)
+        num_frames = mapping.get('num_frames', None)
+        trajectory = self._load_trajectory(hdf5_path, frame_idx, self.action_chunking_horizon, num_frames)
         
         # Transform trajectory based on output type
         if self.output_2d_trajectory:
@@ -486,7 +510,7 @@ class RoboCasaTrajectoryDataset(Dataset):
         instruction = self._load_instruction(hdf5_path)
         
         # Load robot actions and states (in a single file open)
-        robot_actions, robot_states = self._load_robot_actions_and_states(hdf5_path, frame_idx, self.action_chunking_horizon)
+        robot_actions, robot_states = self._load_robot_actions_and_states(hdf5_path, frame_idx, self.action_chunking_horizon, num_frames)
         
         # Normalize based on action_output_mode
         if self.normalize_coordinates and not self.output_2d_trajectory:
@@ -548,8 +572,8 @@ class RoboCasaTrajectoryDataset(Dataset):
         
         # Always return both initial states
         result['fingertip_initial_state'] = fingertip_initial_state
-        if robot_initial_state is not None:
-            result['robot_initial_state'] = robot_initial_state
+        # if robot_initial_state is not None:
+        #     result['robot_initial_state'] = robot_initial_state
         
         # Always return robot actions if available (for training to choose which to use)
         if robot_actions is not None:
@@ -620,7 +644,7 @@ class RoboCasaTrajectoryDataset(Dataset):
         
         raise ValueError(f"Could not load frame {frame_idx} from {video_path}")
     
-    def _load_trajectory(self, hdf5_path: str, start_frame: int, num_steps: int, max_retries: int = 3) -> torch.Tensor:
+    def _load_trajectory(self, hdf5_path: str, start_frame: int, num_steps: int, num_frames: int = None, max_retries: int = 3) -> torch.Tensor:
         """
         Load trajectory data from HDF5 file.
         
@@ -630,16 +654,23 @@ class RoboCasaTrajectoryDataset(Dataset):
             hdf5_path: Path to the HDF5 file
             start_frame: Starting frame index
             num_steps: Number of steps to load
+            num_frames: Total number of frames in the trajectory (for padding calculation)
             
         Returns:
             torch.Tensor of shape [num_steps, num_joints, 3]
         """
         with hdf5_file_with_retry(hdf5_path, max_retries) as f:
-            # Load keypoint positions: shape (num_frames, 36) = (num_frames, 12 keypoints * 3)
-            keypoint_positions = f['keypoint_positions_flat'][start_frame:start_frame + num_steps]
+            # Calculate how many steps we can actually load
+            if num_frames is not None:
+                available_steps = min(num_steps, num_frames - start_frame)
+            else:
+                available_steps = num_steps
             
-            # Reshape to (num_steps, 12, 3)
-            keypoint_positions = keypoint_positions.reshape(num_steps, 12, 3)
+            # Load keypoint positions: shape (available_steps, 36) = (available_steps, 12 keypoints * 3)
+            keypoint_positions = f['keypoint_positions_flat'][start_frame:start_frame + available_steps]
+            
+            # Reshape to (available_steps, 12, 3)
+            keypoint_positions = keypoint_positions.reshape(available_steps, 12, 3)
             
             # Extract only the requested joints
             trajectory_list = []
@@ -648,10 +679,18 @@ class RoboCasaTrajectoryDataset(Dataset):
                 if keypoint_idx is not None:
                     trajectory_list.append(keypoint_positions[:, keypoint_idx, :])
                 else:
+                    raise ValueError(f"Unknown joint name: {joint_name}")
                     # Fill with zeros for unknown joints
-                    trajectory_list.append(np.zeros((num_steps, 3)))
             
-            trajectory = np.stack(trajectory_list, axis=1)  # Shape: (num_steps, num_joints, 3)
+            trajectory = np.stack(trajectory_list, axis=1)  # Shape: (available_steps, num_joints, 3)
+            
+            # Pad with repeated last step if we don't have enough steps
+            if self.pad_action_chunk and available_steps < num_steps:
+                padding_needed = num_steps - available_steps
+                last_step = trajectory[-1:]  # Shape: (1, num_joints, 3)
+                padding = np.repeat(last_step, padding_needed, axis=0)
+                trajectory = np.concatenate([trajectory, padding], axis=0)
+            
             return torch.from_numpy(trajectory).float()
     
     def _load_instruction(self, hdf5_path: str, max_retries: int = 3) -> str:
@@ -662,7 +701,7 @@ class RoboCasaTrajectoryDataset(Dataset):
                 instruction = instruction.decode('utf-8')
             return instruction
     
-    def _load_robot_actions_and_states(self, hdf5_path: str, start_frame: int, num_steps: int, max_retries: int = 3) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    def _load_robot_actions_and_states(self, hdf5_path: str, start_frame: int, num_steps: int, num_frames: int = None, max_retries: int = 3) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """
         Load robot actions and states from HDF5 file in a single file open.
         
@@ -674,6 +713,7 @@ class RoboCasaTrajectoryDataset(Dataset):
             hdf5_path: Path to the HDF5 file
             start_frame: Starting frame index
             num_steps: Number of steps to load
+            num_frames: Total number of frames in the trajectory (for padding calculation)
             
         Returns:
             Tuple of (actions, states) where:
@@ -681,15 +721,33 @@ class RoboCasaTrajectoryDataset(Dataset):
             - states: np.ndarray of shape [num_steps, state_dim] or None if not available
         """
         with hdf5_file_with_retry(hdf5_path, max_retries) as f:
+            # Calculate how many steps we can actually load
+            if num_frames is not None:
+                available_steps = min(num_steps, num_frames - start_frame)
+            else:
+                available_steps = num_steps
+            
             # Load actions if available
             actions = None
             if 'actions' in f:
-                actions = f['actions'][start_frame:start_frame + num_steps].astype(np.float32)
+                actions = f['actions'][start_frame:start_frame + available_steps].astype(np.float32)
+                # Pad with repeated last step if we don't have enough steps
+                if self.pad_action_chunk and available_steps < num_steps:
+                    padding_needed = num_steps - available_steps
+                    last_step = actions[-1:]  # Shape: (1, action_dim)
+                    padding = np.repeat(last_step, padding_needed, axis=0)
+                    actions = np.concatenate([actions, padding], axis=0)
             
             # Load states if available
             states = None
             if 'states' in f:
-                states = f['states'][start_frame:start_frame + num_steps].astype(np.float32)
+                states = f['states'][start_frame:start_frame + available_steps].astype(np.float32)
+                # Pad with repeated last step if we don't have enough steps
+                if self.pad_action_chunk and available_steps < num_steps:
+                    padding_needed = num_steps - available_steps
+                    last_step = states[-1:]  # Shape: (1, state_dim)
+                    padding = np.repeat(last_step, padding_needed, axis=0)
+                    states = np.concatenate([states, padding], axis=0)
             
             return actions, states
     

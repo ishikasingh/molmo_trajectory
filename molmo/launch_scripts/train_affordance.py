@@ -151,20 +151,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--robot_proprio_dim",
         type=int,
-        default=24,
+        default=30,
         help="Proprioception dimension for robot expert (RoboCasa: robot state dim)",
-    )
+    ) # Note: at this stage, we are using the fingertip positions as the proprioception, not the actual proprioception. 
     parser.add_argument(
         "--robot_trajectory_dim",
         type=int,
         default=30,
         help="Fingertip trajectory dimension for robot expert (RoboCasa: 10 keypoints * 3 coords = 30)",
-    )
-    parser.add_argument(
-        "--robot_use_joint_action",
-        action="store_true",
-        default=False,
-        help="If set, robot expert predicts joint actions instead of fingertip trajectories (default: False, uses trajectories)",
     )
     parser.add_argument(
         "--max_crops",
@@ -193,6 +187,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--slow_warmup", action="store_true", default=False,
                         help="Whether to use slow warmup for the model")
+    parser.add_argument("--pad_action_chunk", action="store_true", default=False,
+                        help="If True, pad action chunks with repeated last step when near end of trajectory")
     args, other_args = parser.parse_known_args()
 
     # Default training split
@@ -322,35 +318,51 @@ if __name__ == "__main__":
     elif args.mixture == "trajectory_3d_fm":
         # Flow matching based 3D trajectory prediction
         eval_tasks = []
-        tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
+        tasks = [["egodex", ["trajectory_3d"], 1.0]]
     elif args.mixture == "trajectory_3d_direct":
         # Direct 3D trajectory prediction (regression) using action expert architecture
         eval_tasks = []
-        tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
+        tasks = [["egodex", ["trajectory_3d"], 1.0]]
     elif args.mixture == "trajectory_3d_human_robot_fm":
         # Human (EgoDex) + Robot (RoboCasa) trajectory prediction with fingertip trajectories
         eval_tasks = []
-        tasks = [["egodex", ["trajectory_3d_fm"], 0.5],
-                 ["robo_casa", ["robocasa_3d_fm"], 0.5]]
+        tasks = [["egodex", ["trajectory_3d"], 0.5],
+                 ["robo_casa", ["robocasa_3d"], 0.5]]
     elif args.mixture == "trajectory_3d_human_robot_action_fm":
         # Human (EgoDex) + Robot (RoboCasa) with robot using joint actions instead of fingertip trajectory
         eval_tasks = []
-        tasks = [["egodex", ["trajectory_3d_fm"], 0.5],
-                 ["robo_casa", ["robocasa_action_fm"], 0.5]]
+        tasks = [["egodex", ["trajectory_3d"], 0.5],
+                 ["robo_casa", ["robocasa_action"], 0.5]]
+    elif args.mixture == "trajectory_3d_human_robot_direct":
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_3d"], 0.5],
+                ["robo_casa", ["robocasa_3d"], 0.5]]
+    elif args.mixture == "trajectory_3d_human_robot_action_direct":
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_3d"], 0.5],
+                ["robo_casa", ["robocasa_action"], 0.5]]
     elif args.mixture == "trajectory_3d_fm_overfit":
         # Flow matching based 3D trajectory prediction with delta representation
         eval_tasks = []
-        tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
+        tasks = [["egodex", ["trajectory_3d"], 1.0]]
+        data_split = "overfit"
+    elif args.mixture == "trajectory_3d_robot_fm_overfit":
+        eval_tasks = []
+        tasks = [["robo_casa", ["robocasa_3d"], 1.0]]
+        data_split = "overfit"
+    elif args.mixture == "trajecotry_3d_robot_direct_overfit":
+        eval_tasks = []
+        tasks = [["robo_casa", ["robocasa_3d"], 1.0]]
         data_split = "overfit"
     elif args.mixture == "trajectory_3d_fm_pick_and_place":
         # Flow matching based 3D trajectory prediction with delta representation
         eval_tasks = []
-        tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
+        tasks = [["egodex", ["trajectory_3d"], 1.0]]
         data_split = "train_pick_and_place"
     elif args.mixture == "trajectory_3d_direct_pick_and_place":
         # Direct 3D trajectory prediction (regression) using action expert architecture
         eval_tasks = []
-        tasks = [["egodex", ["trajectory_3d_fm"], 1.0]]
+        tasks = [["egodex", ["trajectory_3d"], 1.0]]
         data_split = "train_pick_and_place"
     elif args.mixture == "robo_casa_affordance":
         # eval_tasks = ["robo_casa_affordance"]
@@ -419,7 +431,7 @@ if __name__ == "__main__":
     model_cfg.multi_annotation_weighting = "root_subsegments"
 
     # Enable flow matching for trajectory prediction tasks
-    if "_fm" in args.mixture or "trajectory_3d_direct" in args.mixture:
+    if "_fm" in args.mixture or "_direct" in args.mixture:
         # Set action expert mode and derive settings
         model_cfg.action_expert_mode = args.action_expert_mode
         
@@ -464,12 +476,19 @@ if __name__ == "__main__":
         model_cfg.robot_proprio_dim = args.robot_proprio_dim
         model_cfg.robot_trajectory_dim = args.robot_trajectory_dim
         
-        # Determine robot action mode: use trajectory (default) or joint actions
-        model_cfg.robot_use_trajectory_as_action = not args.robot_use_joint_action
+        # Determine robot action mode: check if this mixture uses joint actions
+        # Mixtures that use joint actions:
+        # - trajectory_3d_human_robot_action_fm
+        # - trajectory_3d_human_robot_action_direct
+        robot_use_joint_action = (
+            args.mixture == "trajectory_3d_human_robot_action_fm" or
+            args.mixture == "trajectory_3d_human_robot_action_direct"
+        )
+        model_cfg.robot_use_trajectory_as_action = not robot_use_joint_action
         
         # Determine effective robot action dim based on mode
         effective_robot_action_dim = (
-            args.robot_trajectory_dim if not args.robot_use_joint_action 
+            args.robot_trajectory_dim if not robot_use_joint_action 
             else args.robot_action_dim
         )
         
@@ -496,7 +515,7 @@ if __name__ == "__main__":
             log.info(f"Separate expert mode dimensions:")
             log.info(f"  Human expert (id=0): action_dim={args.human_action_dim}, proprio_dim={args.human_proprio_dim}")
             log.info(f"  Robot expert (id=1): action_dim={effective_robot_action_dim}, proprio_dim={args.robot_proprio_dim}")
-            log.info(f"  Robot uses {'joint actions' if args.robot_use_joint_action else 'trajectory'}")
+            log.info(f"  Robot uses {'joint actions' if robot_use_joint_action else 'trajectory'}")
         
         # Configure action expert to be smaller than VLM (OpenPI-style)
         # This reduces memory while maintaining head_dim compatibility
@@ -564,6 +583,7 @@ if __name__ == "__main__":
             shuffle=True,
             split=data_split,
             action_chunking_horizon=model_cfg.action_horizon,
+            pad_action_chunk=args.pad_action_chunk,
             drop_last=True,
             sequence_length=args.seq_len,
             num_workers=24,  # Increased from 2 to 32 to enable parallel loading
@@ -574,10 +594,10 @@ if __name__ == "__main__":
         ),
         ft_connector=not args.freeze_vlm,
         ft_llm=not args.freeze_vlm,
-        # ft_vit=True,
+        ft_vit=not args.freeze_vlm,
         # ft_connector=False,
         # ft_llm=False,
-        ft_vit=False,
+        # ft_vit=False,
         optimizer=OptimizerConfig(
             name=OptimizerType.adamw,
             connector_learning_rate=5e-6,

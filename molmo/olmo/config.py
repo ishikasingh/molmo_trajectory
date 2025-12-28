@@ -1354,6 +1354,9 @@ class DataConfig(BaseConfig):
     action_chunking_horizon: Optional[int] = None
     """Trajectory dataset horizon (defaults to dataset's intrinsic setting)"""
 
+    pad_action_chunk: bool = False
+    """If True, pad action chunks with repeated last step when near end of trajectory"""
+
     # DataLoader args
     num_workers: int = 0
     drop_last: bool = False
