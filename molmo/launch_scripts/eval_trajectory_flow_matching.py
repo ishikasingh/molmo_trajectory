@@ -25,6 +25,8 @@ from olmo.model import Molmo
 from olmo.data.model_preprocessor import load_image
 from olmo.data import build_mm_preprocessor
 from olmo.config import ModelConfig
+from olmo.data.trajectory_datasets import TrajectoryDataset
+from olmo.data.robo_casa_affordance_datasets import RoboCasaTrajectoryDataset
 
 
 def get_finger_colors() -> Dict[str, str]:
@@ -244,7 +246,11 @@ def draw_prompt_text(draw: ImageDraw.Draw, prompt: str,
     text_padding = int(image_height * 0.015)
     
     # Try to load a font
-    font_size = max(16, int(image_height/40))
+    # Scale font size based on image size - use smaller divisor for smaller images
+    # For 256x256 images: ~6-8, for 1080p images: ~27
+    min_font_size = 8
+    max_font_size = 24
+    font_size = max(min_font_size, min(max_font_size, int(image_height/50)))
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", font_size)
     except OSError:
@@ -328,7 +334,11 @@ def draw_legend(draw: ImageDraw.Draw, finger_colors: Dict[str, str],
                             legend_y - int(image_height * 0.01)), legend_bg)
     
     # Try to load a font
-    legend_font_size = max(12, int(image_height/50))
+    # Scale font size based on image size - use smaller divisor for smaller images
+    # For 256x256 images: ~5, for 1080p images: ~21
+    min_legend_font_size = 6
+    max_legend_font_size = 18
+    legend_font_size = max(min_legend_font_size, min(max_legend_font_size, int(image_height/60)))
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", legend_font_size)
     except OSError:
@@ -399,7 +409,8 @@ def convert_delta_to_absolute(delta_trajectory: np.ndarray, initial_state: np.nd
 def load_test_examples(num_examples: int = 10, 
                        action_chunking_horizon: int = 10,
                        trajectory_representation: str = "absolute",
-                       split: str = "test") -> List[Dict]:
+                       split: str = "test",
+                       dataset_type: str = "egodex") -> List[Dict]:
     """
     Load examples from the specified split for 3D trajectory prediction.
     
@@ -408,26 +419,42 @@ def load_test_examples(num_examples: int = 10,
         action_chunking_horizon: Number of timesteps in trajectory
         trajectory_representation: Either 'absolute' or 'delta' for trajectory representation
         split: Dataset split to load (e.g., train, test)
+        dataset_type: Either 'egodex' or 'robocasa' to specify which dataset to load
     
     Returns:
         List of example dictionaries
     """
-    from olmo.data.trajectory_datasets import TrajectoryDataset
-    
     # Check if stats file is available for normalization
-    stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
-    normalize_coords = bool(stats_file)
-    
-    # Load dataset (always 3D)
-    dataset = TrajectoryDataset(
-        split=split,
-        action_chunking_horizon=action_chunking_horizon,
-        output_2d_trajectory=False,
-        normalize_coordinates=False, # Set to be False as in inference time, the trajectory itself is only for visualization, but this only works for delta representation.
-        output_format="flow_matching",  # Use flow matching format
-        trajectory_representation=trajectory_representation,
-        frame_downsampling_ratio=10,
-    )
+    if dataset_type == "egodex":
+        stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
+        normalize_coords = bool(stats_file)
+        
+        # Load EgoDex dataset (always 3D)
+        dataset = TrajectoryDataset(
+            split=split,
+            action_chunking_horizon=action_chunking_horizon,
+            output_2d_trajectory=False,
+            normalize_coordinates=False, # Set to be False as in inference time, the trajectory itself is only for visualization, but this only works for delta representation.
+            output_format="flow_matching",  # Use flow matching format
+            trajectory_representation=trajectory_representation,
+            frame_downsampling_ratio=10,
+        )
+    elif dataset_type == "robocasa":
+        stats_file = os.environ.get("ROBOCASA_STATS_FILE")
+        normalize_coords = bool(stats_file)
+        
+        # Load RoboCasa dataset (always 3D)
+        dataset = RoboCasaTrajectoryDataset(
+            split=split,
+            action_chunking_horizon=action_chunking_horizon,
+            output_2d_trajectory=False,
+            normalize_coordinates=False, # Set to be False as in inference time, the trajectory itself is only for visualization, but this only works for delta representation.
+            trajectory_representation=trajectory_representation,
+            frame_downsampling_ratio=10,
+            action_output_mode="trajectory",  # Use fingertip trajectory as action target
+        )
+    else:
+        raise ValueError(f"Unknown dataset_type: {dataset_type}. Must be 'egodex' or 'robocasa'")
     
     print(f"Loaded '{split}' dataset with {len(dataset)} examples")
     
@@ -494,7 +521,8 @@ def load_video_examples(num_videos: int = 5,
                         action_chunking_horizon: int = 10,
                         trajectory_representation: str = "absolute",
                         split: str = "test",
-                        frame_downsampling_ratio: int = 10) -> List[Dict]:
+                        frame_downsampling_ratio: int = 10,
+                        dataset_type: str = "egodex") -> List[Dict]:
     """
     Load all frames from multiple videos for video evaluation.
     
@@ -504,22 +532,34 @@ def load_video_examples(num_videos: int = 5,
         trajectory_representation: Either 'absolute' or 'delta' for trajectory representation
         split: Dataset split to load (e.g., train, test)
         frame_downsampling_ratio: Frame downsampling ratio (e.g., 10 = every 10th frame)
+        dataset_type: Either 'egodex' or 'robocasa' to specify which dataset to load
     
     Returns:
         List of video dictionaries, each containing frames and metadata
     """
-    from olmo.data.trajectory_datasets import TrajectoryDataset
-    
     # Load dataset with specified downsampling ratio
-    dataset = TrajectoryDataset(
-        split=split,
-        action_chunking_horizon=action_chunking_horizon,
-        output_2d_trajectory=False,
-        normalize_coordinates=False,
-        output_format="flow_matching",
-        trajectory_representation=trajectory_representation,
-        frame_downsampling_ratio=frame_downsampling_ratio,
-    )
+    if dataset_type == "egodex":
+        dataset = TrajectoryDataset(
+            split=split,
+            action_chunking_horizon=action_chunking_horizon,
+            output_2d_trajectory=False,
+            normalize_coordinates=False,
+            output_format="flow_matching",
+            trajectory_representation=trajectory_representation,
+            frame_downsampling_ratio=frame_downsampling_ratio,
+        )
+    elif dataset_type == "robocasa":
+        dataset = RoboCasaTrajectoryDataset(
+            split=split,
+            action_chunking_horizon=action_chunking_horizon,
+            output_2d_trajectory=False,
+            normalize_coordinates=False,
+            trajectory_representation=trajectory_representation,
+            frame_downsampling_ratio=frame_downsampling_ratio,
+            action_output_mode="trajectory",  # Use fingertip trajectory as action target
+        )
+    else:
+        raise ValueError(f"Unknown dataset_type: {dataset_type}. Must be 'egodex' or 'robocasa'")
     
     print(f"Loaded '{split}' dataset with {len(dataset)} examples (downsampling ratio: {frame_downsampling_ratio})")
     
@@ -685,6 +725,7 @@ def evaluate_video(model, preprocessor, tokenizer, video_data: Dict,
         if "expert_type" in batch:
             expert_type = torch.tensor([batch["expert_type"]], dtype=torch.long).to(device)
         elif hasattr(model.config, "num_action_experts") and model.config.num_action_experts > 1:
+            print("WARNING: Multi-expert mode but no expert_type in batch. Defaulting to expert 0 (human).")
             expert_type = torch.tensor([0], dtype=torch.long).to(device)
         
         # Generate trajectory
@@ -855,6 +896,9 @@ def main():
                        help="Frame downsampling ratio for video mode (e.g., 10 = every 10th frame)")
     parser.add_argument("--video_fps", type=int, default=3,
                        help="Frames per second for output videos (video mode only)")
+    parser.add_argument("--dataset", type=str, default="egodex",
+                       choices=["egodex", "robocasa"],
+                       help="Dataset to load: 'egodex' for EgoDex (human) dataset or 'robocasa' for RoboCasa dataset")
     
     args = parser.parse_args()
     
@@ -864,6 +908,7 @@ def main():
     
     print(f"\n{'='*80}")
     print(f"Evaluation mode: {args.eval_mode.upper()}")
+    print(f"Dataset: {args.dataset}")
     print(f"Trajectory representation: {args.trajectory_representation}")
     print(f"Split: {args.split}")
     print(f"{'='*80}\n")
@@ -873,7 +918,7 @@ def main():
     if args.eval_mode == "image":
         print(f"Loading {args.num_examples} examples from split '{args.split}' for 3D trajectory task...")
         examples = load_test_examples(args.num_examples, args.action_chunking_horizon, 
-                                      args.trajectory_representation, args.split)
+                                      args.trajectory_representation, args.split, args.dataset)
         
         if not examples:
             print("No examples loaded. Exiting.")
@@ -900,7 +945,13 @@ def main():
     
     # Load stats if normalization was used
     if args.normalize_coordinates:
-        stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
+        if args.dataset == "egodex":
+            stats_file = os.environ.get("TRAJECTORY_STATS_FILE")
+        elif args.dataset == "robocasa":
+            stats_file = os.environ.get("ROBOCASA_STATS_FILE")
+        else:
+            stats_file = None
+        
         if stats_file and os.path.exists(stats_file):
             print(f"Loading trajectory stats from {stats_file}")
             stats = torch.load(stats_file, map_location="cpu")
@@ -908,17 +959,23 @@ def main():
             stats_std = stats["std"].numpy()
             print("Loaded mean/std for denormalization")
         else:
-            print("WARNING: normalize_coordinates is True but TRAJECTORY_STATS_FILE not set or not found!")
+            env_var_name = "TRAJECTORY_STATS_FILE" if args.dataset == "egodex" else "ROBOCASA_STATS_FILE"
+            print(f"WARNING: normalize_coordinates is True but {env_var_name} not set or not found!")
             print("Model predictions will NOT be denormalized (results may be incorrect)")
     
     if args.camera_intrinsic and os.path.exists(args.camera_intrinsic):
         intrinsic = np.load(args.camera_intrinsic)
         print(f"Loaded camera intrinsic from {args.camera_intrinsic}")
     else:
-        # Use default intrinsic from EgoDex
-        intrinsic = np.array([[736.6339, 0., 960.], 
-                             [0., 736.6339, 540.], 
-                             [0., 0., 1.]])
+        if args.dataset == "egodex":
+            # Use default intrinsic from EgoDex
+            intrinsic = np.array([[736.6339, 0., 960.], 
+                                [0., 736.6339, 540.], 
+                                [0., 0., 1.]])
+        elif args.dataset == "robocasa":
+            intrinsic = np.array([[160.91805426, 0., 128.],
+                                 [  0., 160.91805426, 128.],
+                                 [  0., 0., 1.]])
         print("Using default EgoDex camera intrinsic")
     
     # Branch based on evaluation mode
@@ -938,6 +995,7 @@ def main():
             trajectory_representation=args.trajectory_representation,
             split=args.split,
             frame_downsampling_ratio=args.frame_downsampling_ratio,
+            dataset_type=args.dataset,
         )
         
         if not video_examples:
