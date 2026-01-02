@@ -776,20 +776,86 @@ class Trainer:
         # Check if this batch has trajectory targets
         has_trajectory = 'trajectory_target' in batch
         
+        # Determine action expert mode (used for loss computation)
+        action_expert_mode = getattr(self.cfg.model, 'action_expert_mode', 'shared')
+        is_multi_expert_mode = action_expert_mode == "separate_human_robot"
+        is_sequential_mode = action_expert_mode == "sequential"
+        
+        # Determine if robot should use trajectory or joint actions as target
+        # robot_use_trajectory_as_action=True: robot uses fingertip trajectory (same as human)
+        # robot_use_trajectory_as_action=False: robot uses joint actions
+        robot_use_trajectory_as_action = getattr(self.cfg.model, 'robot_use_trajectory_as_action', True)
+        
         # Prepare flow matching inputs if needed
         noisy_actions = None
         action_timestep = None
         if has_trajectory:
+            # trajectory_target is always fingertip trajectory from dataloader
             trajectory_target = batch['trajectory_target']  # (batch_size, action_horizon, action_dim)
             batch_size = trajectory_target.shape[0]
             device = trajectory_target.device
             
+            # For shared mode with robot_use_trajectory_as_action=False:
+            # Build unified target where human uses trajectory_target, robot uses robot_actions (padded)
+            # This allows training a single shared expert on mixed data with different action dims
+            action_dim_per_sample = None  # Track valid action_dim per sample for masked loss
+            if not is_sequential_mode and not robot_use_trajectory_as_action:
+                robot_actions = batch.get('robot_actions')
+                expert_type = batch.get('expert_type')
+                robot_actions_dims = batch.get('robot_actions_dims')
+                trajectory_target_dims = batch.get('trajectory_target_dims')
+                
+                if robot_actions is not None and expert_type is not None:
+                    robot_mask = (expert_type == 1)
+                    human_mask = (expert_type == 0)
+                    
+                    # Determine max action_dim and create unified target
+                    traj_dim = trajectory_target.shape[-1]
+                    robot_dim = robot_actions.shape[-1]
+                    max_dim = max(traj_dim, robot_dim)
+                    
+                    # Pad both to max_dim if needed
+                    if traj_dim < max_dim:
+                        pad = torch.zeros(batch_size, trajectory_target.shape[1], max_dim - traj_dim, 
+                                         device=device, dtype=trajectory_target.dtype)
+                        trajectory_target = torch.cat([trajectory_target, pad], dim=-1)
+                    if robot_dim < max_dim:
+                        pad = torch.zeros(batch_size, robot_actions.shape[1], max_dim - robot_dim,
+                                         device=device, dtype=robot_actions.dtype)
+                        robot_actions = torch.cat([robot_actions, pad], dim=-1)
+                    
+                    # Build unified target: human uses trajectory, robot uses robot_actions
+                    unified_target = trajectory_target.clone()
+                    if robot_mask.any():
+                        unified_target[robot_mask] = robot_actions[robot_mask]
+                    trajectory_target = unified_target
+                    
+                    # Track valid action_dim per sample for masked loss
+                    action_dim_per_sample = torch.zeros(batch_size, dtype=torch.long, device=device)
+                    if trajectory_target_dims is not None:
+                        action_dim_per_sample[human_mask] = trajectory_target_dims[human_mask]
+                    else:
+                        action_dim_per_sample[human_mask] = traj_dim
+                    if robot_actions_dims is not None:
+                        # robot_actions_dims is 0 for human samples (no robot_actions)
+                        robot_valid_dims = robot_actions_dims[robot_mask]
+                        # Use actual robot action dim, not padded
+                        action_dim_per_sample[robot_mask] = torch.where(
+                            robot_valid_dims > 0, robot_valid_dims, torch.tensor(robot_dim, device=device)
+                        )
+                    else:
+                        action_dim_per_sample[robot_mask] = robot_dim
+                    
+                    # Store for loss computation
+                    batch['trajectory_target'] = trajectory_target
+                    batch['action_dim_per_sample'] = action_dim_per_sample
+            
             # Validate trajectory shape matches config
             # After collator fix, should be 3D: (batch_size, action_horizon, action_dim)
-            # In multi-expert mode, each expert may have different action_dim, so we only validate action_horizon
-            # BACKWARD COMPATIBILITY: Use getattr for action_expert_mode (may not exist in old configs)
-            is_multi_expert_mode = getattr(self.cfg.model, 'action_expert_mode', 'shared') == "separate_human_robot"
-            
+            # Skip strict action_dim validation when:
+            # - In multi-expert mode (each expert has different action_dim)
+            # - Using mixed action dims (action_dim_per_sample is set)
+            has_mixed_action_dims = action_dim_per_sample is not None
             if trajectory_target.dim() == 3:
                 # Proper 3D tensor from fixed collator - validate dimensions
                 if trajectory_target.shape[1] != self.cfg.model.action_horizon:
@@ -797,9 +863,8 @@ class Trainer:
                         f"trajectory_target action_horizon {trajectory_target.shape[1]} "
                         f"does not match config action_horizon {self.cfg.model.action_horizon}"
                     )
-                # In multi-expert mode, action_dim can vary per expert, so skip strict validation
-                # The model will handle dimension mismatch at the expert level
-                if not is_multi_expert_mode:
+                # Skip action_dim validation for multi-expert or mixed dims
+                if not is_multi_expert_mode and not has_mixed_action_dims:
                     if trajectory_target.shape[2] != self.cfg.model.action_dim:
                         raise ValueError(
                             f"trajectory_target action_dim {trajectory_target.shape[2]} "
@@ -861,6 +926,16 @@ class Trainer:
                 # Store for loss computation
                 batch['flow_matching_time'] = t
                 batch['flow_matching_noise'] = noise
+                
+                # For sequential mode: also generate noisy_robot_actions for Expert B
+                # Use the same timestep t for both Expert A and Expert B
+                if is_sequential_mode and 'robot_actions' in batch and batch['robot_actions'] is not None:
+                    robot_actions = batch['robot_actions']
+                    robot_actions_noise = torch.randn_like(robot_actions)
+                    batch['robot_actions_noise'] = robot_actions_noise
+                    # Interpolate: noisy_robot_actions = t * noise + (1 - t) * robot_actions
+                    noisy_robot_actions = t_expanded * robot_actions_noise + (1 - t_expanded) * robot_actions
+                    batch['noisy_robot_actions'] = noisy_robot_actions
         
         # shape: (batch_size, seq_len, vocab_size)
         # Note: Like OpenPI, we compute BOTH text logits (from prefix tokens) and velocity output (from action tokens)
@@ -880,6 +955,7 @@ class Trainer:
                 action_timestep=action_timestep,
                 proprio_state=batch.get("proprio_state"),
                 expert_type=batch.get("expert_type"),  # For multi-expert routing
+                noisy_robot_actions=batch.get("noisy_robot_actions"),  # For sequential expert mode (Expert B)
             )
             logits = output.logits
         
@@ -951,7 +1027,13 @@ class Trainer:
         
         # Compute trajectory flow matching loss if applicable
         trajectory_loss = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
-        if has_trajectory and self.trajectory_loss_fn is not None and output.velocity_output is not None:
+        trajectory_loss_a = torch.tensor(0.0, device=logits.device, dtype=torch.float32)  # Expert A loss (sequential mode)
+        trajectory_loss_b = torch.tensor(0.0, device=logits.device, dtype=torch.float32)  # Expert B loss (sequential mode)
+        
+        # Skip computing trajectory_loss from velocity_output in sequential mode
+        # In sequential mode, velocity_output is just a clone of velocity_output_a for backward compatibility
+        # We'll compute trajectory_loss_a and trajectory_loss_b separately instead
+        if has_trajectory and self.trajectory_loss_fn is not None and output.velocity_output is not None and not is_sequential_mode:
             # For flow matching, the forward pass computed the predicted VELOCITY from noisy actions
             # Note: output.velocity_output contains the predicted VELOCITY, NOT the trajectory itself!
             # The actual trajectory is only computed during inference via ODE integration (sample_actions_flow_matching)
@@ -964,10 +1046,12 @@ class Trainer:
             if self.cfg.model.use_direct_trajectory_prediction:
                 # Direct trajectory prediction loss (MSE against GT)
                 trajectory_target = batch['trajectory_target'].to(torch.float32)
-                action_dim_mask = batch.get('trajectory_target_dims')
+                # Use action_dim_per_sample if available (mixed human/robot with different dims)
+                # Otherwise fall back to trajectory_target_dims
+                action_dim_mask = batch.get('action_dim_per_sample', batch.get('trajectory_target_dims'))
                 
                 if action_dim_mask is not None:
-                    # Multi-expert mode with different action dimensions
+                    # Mixed mode with different action dimensions per sample
                     batch_size, action_horizon, max_action_dim = velocity_pred.shape
                     loss = F.mse_loss(velocity_pred, trajectory_target, reduction="none")
                     mask = torch.zeros_like(loss)
@@ -988,8 +1072,9 @@ class Trainer:
                 # Check for NaN/Inf before loss computation
                 if torch.isnan(velocity_pred).any() or torch.isinf(velocity_pred).any():
                     log.error(f"[FLOW MATCHING ERROR] velocity_pred contains NaN or Inf! NaN: {torch.isnan(velocity_pred).sum().item()}, Inf: {torch.isinf(velocity_pred).sum().item()}")
-                # Get action_dim_mask for multi-expert mode (if available)
-                action_dim_mask = batch.get('trajectory_target_dims')  # From collator padding
+                # Use action_dim_per_sample if available (mixed human/robot with different dims)
+                # Otherwise fall back to trajectory_target_dims
+                action_dim_mask = batch.get('action_dim_per_sample', batch.get('trajectory_target_dims'))
                 
                 trajectory_loss = self.trajectory_loss_fn(
                     model_output=velocity_pred,
@@ -998,6 +1083,95 @@ class Trainer:
                     noise=noise,
                     action_dim_mask=action_dim_mask,
                 )
+        
+        # Sequential mode: compute losses for Expert A and Expert B (separate block!)
+        if has_trajectory and is_sequential_mode and output.velocity_output_a is not None:
+            # Get t and noise for flow matching (needed for loss computation)
+            t = batch['flow_matching_time'].to(torch.float32) if 'flow_matching_time' in batch else None
+            noise = batch['flow_matching_noise'].to(torch.float32) if 'flow_matching_noise' in batch else None
+            
+            # Expert A loss: fingertip trajectory for ALL samples
+            # trajectory_target is always fingertip trajectory (from dataloader)
+            velocity_pred_a = output.velocity_output_a.to(torch.float32)
+            trajectory_target_a = batch['trajectory_target'].to(torch.float32)
+            
+            if self.cfg.model.use_direct_trajectory_prediction:
+                trajectory_loss_a = F.mse_loss(velocity_pred_a, trajectory_target_a)
+            else:
+                # Get noise for Expert A (fingertip trajectory dimensions)
+                # Note: noise was generated for trajectory_target, need to handle dimension mismatch
+                fingertip_dim = trajectory_target_a.shape[-1]
+                if noise.shape[-1] >= fingertip_dim:
+                    noise_a = noise[:, :, :fingertip_dim]
+                else:
+                    # If noise is smaller (unlikely), pad with zeros
+                    noise_a = torch.zeros_like(trajectory_target_a)
+                    noise_a[:, :, :noise.shape[-1]] = noise
+                
+                trajectory_loss_a = self.trajectory_loss_fn(
+                    model_output=velocity_pred_a,
+                    trajectory_target=trajectory_target_a,
+                    t=t,
+                    noise=noise_a,
+                    action_dim_mask=None,  # Expert A has fixed dimensions
+                )
+            
+            # Expert B loss: robot actions for ROBOT samples only
+            if output.velocity_output_b is not None:
+                # Robot samples are identified by expert_type == 1
+                expert_type = batch.get('expert_type')
+                robot_actions_target = batch.get('robot_actions')
+                
+                if expert_type is not None and robot_actions_target is not None:
+                    robot_mask = (expert_type == 1)
+                    num_robot = robot_mask.sum().item()
+                    
+                    if num_robot > 0:
+                        velocity_pred_b = output.velocity_output_b.to(torch.float32)
+                        robot_actions_target = robot_actions_target.to(torch.float32)
+                        
+                        # Get only robot samples
+                        velocity_pred_b_robot = velocity_pred_b[robot_mask]
+                        robot_actions_target_robot = robot_actions_target[robot_mask]
+                        
+                        # Get robot action dimension from valid samples
+                        # Use robot_actions_dims if available (from collator), otherwise use tensor shape
+                        robot_actions_dims = batch.get('robot_actions_dims')
+                        if robot_actions_dims is not None:
+                            # Get dimension for first valid robot sample
+                            robot_action_dim = robot_actions_dims[robot_mask][0].item()
+                        else:
+                            robot_action_dim = getattr(self.cfg.model, 'robot_action_dim', robot_actions_target.shape[-1])
+                        
+                        velocity_pred_b_robot = velocity_pred_b_robot[:, :, :robot_action_dim]
+                        robot_actions_target_robot = robot_actions_target_robot[:, :, :robot_action_dim]
+                        
+                        if self.cfg.model.use_direct_trajectory_prediction:
+                            trajectory_loss_b = F.mse_loss(velocity_pred_b_robot, robot_actions_target_robot)
+                        else:
+                            # Get t and noise for robot samples
+                            t_robot = t[robot_mask]
+                            
+                            # Use robot_actions_noise if available, otherwise fallback
+                            if 'robot_actions_noise' in batch:
+                                noise_robot = batch['robot_actions_noise'][robot_mask, :, :robot_action_dim].to(torch.float32)
+                            else:
+                                # Fallback: use trajectory noise (may have dimension mismatch)
+                                noise_robot = batch['flow_matching_noise'][robot_mask, :, :robot_action_dim].to(torch.float32)
+                            
+                            trajectory_loss_b = self.trajectory_loss_fn(
+                                model_output=velocity_pred_b_robot,
+                                trajectory_target=robot_actions_target_robot,
+                                t=t_robot,
+                                noise=noise_robot,
+                                action_dim_mask=None,
+                            )
+            
+            # Set trajectory_loss for logging/metrics (sum of Expert A and Expert B losses)
+            if output.velocity_output_b is not None:
+                trajectory_loss = trajectory_loss_a + trajectory_loss_b
+            else:
+                trajectory_loss = trajectory_loss_a
 
             # log.info(f"[FLOW MATCHING DEBUG] Flow matching loss computed: {trajectory_loss.item():.6f}")
         
@@ -1008,7 +1182,21 @@ class Trainer:
             if output.velocity_output is not None:
                 # Flow matching mode: supervise on velocity_output (from action tokens)
                 # Logits are still computed (from text tokens) but not supervised
-                total_loss = self.cfg.model.flow_matching_loss_weight * trajectory_loss
+                if is_sequential_mode:
+                    # Sequential mode: use Expert A and Expert B losses only
+                    # velocity_output is only for backward compatibility (eval time), not used for training
+                    # Expert B loss (robot actions for robot samples only)
+                    # Note: If velocity_output_b exists, velocity_output_a is guaranteed to exist
+                    if output.velocity_output_b is not None:
+                        # Robot samples: add both Expert A and Expert B losses
+                        total_loss = self.cfg.model.flow_matching_loss_weight * trajectory_loss_a
+                        total_loss = total_loss + self.cfg.model.flow_matching_loss_weight * trajectory_loss_b
+                    elif output.velocity_output_a is not None:
+                        # Human-only batch: add only Expert A loss
+                        total_loss = self.cfg.model.flow_matching_loss_weight * trajectory_loss_a
+                else:
+                    # Non-sequential mode: use velocity_output loss
+                    total_loss = self.cfg.model.flow_matching_loss_weight * trajectory_loss
             else:
                 # Text-based trajectory output: supervise on text tokens (CE loss)
                 total_loss = ce_loss

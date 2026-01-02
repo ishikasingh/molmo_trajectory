@@ -170,11 +170,12 @@ if __name__ == "__main__":
         "--action_expert_mode",
         type=str,
         default="shared",
-        choices=["disabled", "shared", "separate_human_robot"],
+        choices=["disabled", "shared", "separate_human_robot", "sequential"],
         help="Action expert architecture mode: "
              "'disabled' (no action expert), "
              "'shared' (single expert for all trajectories), "
-             "'separate_human_robot' (separate experts with per-sample routing)",
+             "'separate_human_robot' (separate experts with per-sample routing), "
+             "'sequential' (VLM + Expert A for human, VLM + Expert A + Expert B for robot)",
     )
     parser.add_argument(
         "--flow_matching_prediction_type",
@@ -323,6 +324,18 @@ if __name__ == "__main__":
         # Direct 3D trajectory prediction (regression) using action expert architecture
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d"], 1.0]]
+    elif args.mixture == "robot_3d_fm":
+        eval_tasks = []
+        tasks = [["robo_casa", ["robocasa_3d"], 1.0]]
+    elif args.mixture == "robot_3d_direct":
+        eval_tasks = []
+        tasks = [["robo_casa", ["robocasa_3d"], 1.0]]
+    elif args.mixture == "robot_action_fm":
+        eval_tasks = []
+        tasks = [["robo_casa", ["robocasa_action"], 1.0]]
+    elif args.mixture == "robot_action_direct":
+        eval_tasks = []
+        tasks = [["robo_casa", ["robocasa_action"], 1.0]]
     elif args.mixture == "trajectory_3d_human_robot_fm":
         # Human (EgoDex) + Robot (RoboCasa) trajectory prediction with fingertip trajectories
         eval_tasks = []
@@ -447,6 +460,12 @@ if __name__ == "__main__":
             model_cfg.use_action_expert = True
             model_cfg.num_action_experts = 2
             log.info("Using separate action experts for human (expert 0) and robot (expert 1) trajectories")
+        elif args.action_expert_mode == "sequential":
+            model_cfg.use_action_expert = True
+            model_cfg.num_action_experts = 2
+            log.info("Using sequential action experts: Expert A (fingertip trajectory) + Expert B (robot actions)")
+            log.info("  Human data: VLM + Expert A only")
+            log.info("  Robot data: VLM + Expert A + Expert B (sequential)")
         else:
             raise ValueError(f"Unknown action_expert_mode: {args.action_expert_mode}")
         
@@ -462,7 +481,17 @@ if __name__ == "__main__":
         model_cfg.flow_matching_prediction_type = args.flow_matching_prediction_type
         log.info(f"Flow matching prediction type: {args.flow_matching_prediction_type}")
         
-        if "trajectory_3d_direct" in args.mixture:
+        # Determine if this mixture uses direct trajectory prediction (regression)
+        use_direct_trajectory_prediction = (
+            args.mixture == "trajectory_3d_direct" or
+            args.mixture == "robot_3d_direct" or
+            args.mixture == "robot_action_direct" or
+            args.mixture == "trajectory_3d_human_robot_direct" or
+            args.mixture == "trajectory_3d_human_robot_action_direct" or
+            args.mixture == "trajecotry_3d_robot_direct_overfit" or
+            args.mixture == "trajectory_3d_direct_pick_and_place"
+        )
+        if use_direct_trajectory_prediction:
             model_cfg.use_direct_trajectory_prediction = True
             log.info("Enabled direct trajectory prediction mode (regression)")
         
@@ -482,7 +511,9 @@ if __name__ == "__main__":
         # - trajectory_3d_human_robot_action_direct
         robot_use_joint_action = (
             args.mixture == "trajectory_3d_human_robot_action_fm" or
-            args.mixture == "trajectory_3d_human_robot_action_direct"
+            args.mixture == "trajectory_3d_human_robot_action_direct" or
+            args.mixture == "robot_action_fm" or
+            args.mixture == "robot_action_direct"
         )
         model_cfg.robot_use_trajectory_as_action = not robot_use_joint_action
         
@@ -506,6 +537,18 @@ if __name__ == "__main__":
             log.info(f"Shared expert mode (padded to max dims):")
             log.info(f"  action_dim={max_action_dim} (human={args.human_action_dim}, robot={effective_robot_action_dim})")
             log.info(f"  proprio_dim={max_proprio_dim} (human={args.human_proprio_dim}, robot={args.robot_proprio_dim})")
+        elif args.action_expert_mode == "sequential":
+            # Sequential mode: Expert A predicts fingertip trajectory (shared), Expert B predicts robot actions
+            # Expert A (expert_id=0): uses human_action_dim for fingertip trajectory prediction
+            # Expert B (expert_id=1): uses robot_action_dim for robot action prediction
+            # Default action_dim/proprio_dim are for Expert A (backward compatible)
+            model_cfg.action_dim = args.human_action_dim  # Expert A output dim (fingertip trajectory)
+            model_cfg.proprio_dim = args.human_proprio_dim  # Expert A proprio dim
+            
+            log.info(f"Sequential expert mode dimensions:")
+            log.info(f"  Expert A (id=0, fingertip trajectory): action_dim={args.human_action_dim}, proprio_dim={args.human_proprio_dim}")
+            log.info(f"  Expert B (id=1, robot actions): action_dim={args.robot_action_dim}, proprio_dim={args.robot_proprio_dim}")
+            log.info(f"  Robot data uses both experts sequentially")
         else:
             # separate_human_robot mode: each expert has its own dimensions
             # Set defaults for backward compatibility (used as fallback)

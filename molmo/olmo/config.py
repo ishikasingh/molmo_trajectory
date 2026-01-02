@@ -281,6 +281,14 @@ class ActionExpertMode(StrEnum):
     
     separate_human_robot = "separate_human_robot"
     """Separate experts for human and robot trajectories with per-sample routing."""
+    
+    sequential = "sequential"
+    """VLM + Expert A for human, VLM + Expert A + Expert B for robot (sequential).
+    
+    Expert A predicts fingertip trajectories (shared with human data).
+    Expert B predicts robot actions sequentially after Expert A.
+    Attention is blockwise causal: Expert A output is isolated from Expert B.
+    """
 
 
 class FlowMatchingPredictionType(StrEnum):

@@ -398,7 +398,7 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None, pad_a
             trajectory_representation="delta", # default to be delta, as it works
             pad_action_chunk=pad_action_chunk
         )
-    elif dataset_name == "robocasa_3d":
+    elif dataset_name == "robocasa_3d" or dataset_name == "robocasa_action":
         # RoboCasa dataset with fingertip trajectory as action target
         data_dir = os.environ.get("ROBOCASA_DATA_DIR")
         stats_file = os.environ.get("ROBOCASA_STATS_FILE")
@@ -411,26 +411,8 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None, pad_a
             stats_file=stats_file,
             trajectory_representation="delta", # default to be delta, as it works better for flow matching
             frame_downsampling_ratio=10, # robocasa dataset is recorded at 20 fps, while egodex is recorded at 30 fps
-            action_output_mode="trajectory",  # Use fingertip trajectory as action target
             pad_action_chunk=pad_action_chunk
-        )
-    elif dataset_name == "robocasa_action":
-        # RoboCasa dataset with robot joint action command as action target
-        data_dir = os.environ.get("ROBOCASA_DATA_DIR")
-        stats_file = os.environ.get("ROBOCASA_STATS_FILE")
-        return RoboCasaTrajectoryDataset(
-            data_dir=data_dir,
-            split=split,
-            action_chunking_horizon=horizon,
-            output_2d_trajectory=False,
-            normalize_coordinates=bool(stats_file),
-            stats_file=stats_file,
-            trajectory_representation="delta",
-            frame_downsampling_ratio=10,
-            action_output_mode="robot_action",  # Use robot joint action as action target
-            pad_action_chunk=pad_action_chunk
-        )
-    
+        )    
     # Delta (velocity) representation variants
     elif dataset_name == "trajectory_2d_delta_text":
         data_dir = os.environ.get("EGODEX_DATA_DIR")

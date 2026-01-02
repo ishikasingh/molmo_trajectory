@@ -77,6 +77,7 @@ class EvalConfig:
     seed: int = 42
     action_horizon: int = 30
     num_ode_steps: int = 10
+    steps_per_chunk: int = 1  # Number of steps to execute from each predicted action chunk before predicting next chunk
     video_fps: int = 20
     normalize_actions: bool = True
     trajectory_representation: str = "delta"
@@ -703,6 +704,7 @@ class ClosedLoopEvaluator:
             )
         
         language_command = episode_data['language_command']
+        print(f"Language command: {language_command}")
         
         # Reset to exact initial state from dataset (same as process_episode)
         try:
@@ -739,6 +741,10 @@ class ClosedLoopEvaluator:
         done = False
         step = 0
         success = False
+        
+        # Track current action chunk and position within it
+        current_action_chunk = None
+        chunk_step_idx = 0
 
         # Progress bar for this episode
         pbar = tqdm(
@@ -749,34 +755,39 @@ class ClosedLoopEvaluator:
         
         try:
             while not done and step < self.config.max_steps:
-                # Render current observation
-                frame = env.sim.render(
-                    height=self.config.render_height,
-                    width=self.config.render_width,
-                    camera_name=self.config.camera_name,
-                )[::-1]  # Flip vertically
+                # Check if we need to predict a new action chunk
+                if current_action_chunk is None or chunk_step_idx >= self.config.steps_per_chunk:
+                    # Render current observation
+                    frame = env.sim.render(
+                        height=self.config.render_height,
+                        width=self.config.render_width,
+                        camera_name=self.config.camera_name,
+                    )[::-1]  # Flip vertically
+                    
+                    video_writer.append_frame(frame)
+                    
+                    # Get proprioceptive state (fingertip positions)
+                    proprio_state = get_keypoint_positions_flat(env.sim)
+                    
+                    # Preprocess observation (skip in debug mode)
+                    if self.config.debug:
+                        # Create dummy obs_dict for debug mode
+                        obs_dict = {}
+                    else:
+                        obs_dict = self.preprocess_observation(
+                            image=frame,
+                            instruction=language_command,
+                            proprio_state=proprio_state,
+                        )
+                    
+                    # Predict new action chunk
+                    current_action_chunk = self.predict_actions(obs_dict)
+                    chunk_step_idx = 0
                 
-                video_writer.append_frame(frame)
-                
-                # Get proprioceptive state (fingertip positions)
-                proprio_state = get_keypoint_positions_flat(env.sim)
-                
-                # Preprocess observation (skip in debug mode)
-                if self.config.debug:
-                    # Create dummy obs_dict for debug mode
-                    obs_dict = {}
-                else:
-                    obs_dict = self.preprocess_observation(
-                        image=frame,
-                        instruction=language_command,
-                        proprio_state=proprio_state,
-                    )
-                
-                # Predict action chunk
-                action_chunk = self.predict_actions(obs_dict)
-                
-                # Execute first action in chunk
-                action = action_chunk[0]
+                # Execute action from current chunk
+                # Use min to ensure we don't go beyond the chunk size
+                action_idx = min(chunk_step_idx, len(current_action_chunk) - 1)
+                action = current_action_chunk[action_idx]
                 
                 # Step environment
                 try:
@@ -797,6 +808,19 @@ class ClosedLoopEvaluator:
                     break
                 
                 step += 1
+                chunk_step_idx += 1
+                
+                # Render frame after step for video (if not done)
+                if not done:
+                    try:
+                        frame = env.sim.render(
+                            height=self.config.render_height,
+                            width=self.config.render_width,
+                            camera_name=self.config.camera_name,
+                        )[::-1]  # Flip vertically
+                        video_writer.append_frame(frame)
+                    except:
+                        pass
                 
                 # Update sites if needed
                 if hasattr(env, "update_sites"):
@@ -849,6 +873,7 @@ class ClosedLoopEvaluator:
         print(f"Number of tasks: {self.config.num_tasks}")
         print(f"Max steps per episode: {self.config.max_steps}")
         print(f"Action horizon: {self.config.action_horizon}")
+        print(f"Steps per chunk: {self.config.steps_per_chunk}")
         print("="*80 + "\n")
         
         # Find all episodes from dataset(s)
@@ -963,6 +988,7 @@ class ClosedLoopEvaluator:
                 'max_steps': self.config.max_steps,
                 'action_horizon': self.config.action_horizon,
                 'num_ode_steps': self.config.num_ode_steps,
+                'steps_per_chunk': self.config.steps_per_chunk,
                 'seed': self.config.seed,
             },
             'results': [
@@ -1081,6 +1107,12 @@ def main():
         help="Number of ODE integration steps for flow matching"
     )
     parser.add_argument(
+        "--steps_per_chunk", 
+        type=int, 
+        default=1,
+        help="Number of steps to execute from each predicted action chunk before predicting next chunk"
+    )
+    parser.add_argument(
         "--video_fps", 
         type=int, 
         default=20,
@@ -1162,6 +1194,7 @@ def main():
         seed=args.seed,
         action_horizon=args.action_horizon,
         num_ode_steps=args.num_ode_steps,
+        steps_per_chunk=args.steps_per_chunk,
         video_fps=args.video_fps,
         normalize_actions=not args.no_normalize_actions,
         max_episodes=args.max_episodes,

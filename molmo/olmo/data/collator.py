@@ -45,7 +45,10 @@ class MMCollator:
 
     TEXT_KEYS = ["input_tokens", "target_tokens", "loss_masks", "subsegment_ids", "position_ids"]
     IMAGE_KEYS = ["images", "image_masks", "image_input_idx",]
-    TRAJECTORY_KEYS = ["trajectory_target", "proprio_state", "expert_type"]
+    # Keys always present for trajectory training
+    TRAJECTORY_KEYS_REQUIRED = ["trajectory_target", "proprio_state", "expert_type"]
+    # Keys only present for robot data (human samples won't have these)
+    TRAJECTORY_KEYS_OPTIONAL = ["robot_actions"]
 
     def __init__(self, max_sequence_length=None, include_metadata=True, pad=None,
                  max_crops=None):
@@ -64,94 +67,110 @@ class MMCollator:
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         assert len(batch) > 0, "Given an empty batch"
-        keys = batch[0].keys()
         out = {}
+        
+        # Text keys
         for key in self.TEXT_KEYS:
-            # If one examples has subsegment_ids, all examples need it so with ones
-            # matching the input tokens
             if any(key in ex for ex in batch):
                 if key == "subsegment_ids":
                     for ex in batch:
                         if "subsegment_ids" not in ex:
                             ex["subsegment_ids"] = np.ones_like(ex["input_tokens"])
-
                 dtype = np.float32 if key == "loss_masks" else np.int64
                 out[key] = _collate(
                     [ex.get(key) for ex in batch], self.max_sequence_length, dtype, pad=self.pad)
 
+        # Image keys
         for key in self.IMAGE_KEYS:
             if any(key in ex for ex in batch):
                 out[key] = _collate([ex.get(key) for ex in batch], self.max_crops, pad=self.pad)
         
-        # Handle trajectory targets and proprioception states
-        # In multi-expert mode (shared mode with human+robot), dimensions may vary per sample
-        # - trajectory_target: 2D tensor (action_horizon x action_dim)
-        # - proprio_state: 1D tensor (proprio_dim)
-        # - expert_type: scalar (0=human, 1=robot)
-        for key in self.TRAJECTORY_KEYS:
-            if any(key in ex for ex in batch):
-                trajectory_tensors = []
-                for ex in batch:
-                    if key in ex:
-                        traj = ex[key]
-                        if isinstance(traj, np.ndarray):
-                            traj = torch.from_numpy(traj)
-                        elif isinstance(traj, (int, float)):
-                            # Handle scalar values like expert_type
-                            traj = torch.tensor(traj)
-                        trajectory_tensors.append(traj)
-                if trajectory_tensors:
-                    # Check if all tensors have the same shape (for stacking)
-                    # Case 1: Scalar tensors (like expert_type) - dim() == 0
-                    if trajectory_tensors[0].dim() == 0:
-                        out[key] = torch.stack(trajectory_tensors, dim=0)
-                    
-                    # Case 2: All tensors have the same shape - simple stack
-                    elif all(t.shape == trajectory_tensors[0].shape for t in trajectory_tensors):
-                        out[key] = torch.stack(trajectory_tensors, dim=0)
-                    
-                    # Case 3: 1D tensors with different sizes (proprio_state in shared mode)
-                    elif trajectory_tensors[0].dim() == 1:
-                        # Find max dimension
-                        max_dim = max(t.shape[0] for t in trajectory_tensors)
-                        
-                        # Pad each tensor to max dimension
-                        padded_tensors = []
-                        dim_mask = []  # Track valid dimensions per sample
-                        for t in trajectory_tensors:
-                            padded = torch.zeros(max_dim, dtype=t.dtype)
-                            padded[:t.shape[0]] = t
-                            padded_tensors.append(padded)
-                            dim_mask.append(t.shape[0])
-                        
-                        out[key] = torch.stack(padded_tensors, dim=0)
-                        # Store actual dimension per sample for masking
-                        out[f"{key}_dims"] = torch.tensor(dim_mask)
-                    
-                    # Case 4: 2D+ tensors with different shapes (trajectory_target in shared mode)
-                    else:
-                        # Find max dimensions across all axes
-                        max_dims = list(trajectory_tensors[0].shape)
-                        for t in trajectory_tensors[1:]:
-                            for i in range(len(max_dims)):
-                                max_dims[i] = max(max_dims[i], t.shape[i])
-                        
-                        # Pad each tensor to max dimensions
-                        padded_tensors = []
-                        action_dim_mask = []  # Track valid action_dim (last dim) per sample
-                        for t in trajectory_tensors:
-                            # Create padded tensor filled with zeros
-                            padded = torch.zeros(max_dims, dtype=t.dtype)
-                            # Copy original tensor into padded tensor
-                            slices = [slice(0, s) for s in t.shape]
-                            padded[slices] = t
-                            padded_tensors.append(padded)
-                            # Store actual action_dim for this sample (last dimension)
-                            action_dim_mask.append(t.shape[-1])
-                        
-                        out[key] = torch.stack(padded_tensors, dim=0)
-                        # Store action_dim per sample for loss masking
-                        out[f"{key}_dims"] = torch.tensor(action_dim_mask)
+        # Required trajectory keys (always present in all samples)
+        for key in self.TRAJECTORY_KEYS_REQUIRED:
+            if not any(key in ex for ex in batch):
+                continue
+            
+            tensors = []
+            for ex in batch:
+                t = ex[key]
+                if isinstance(t, np.ndarray):
+                    t = torch.from_numpy(t)
+                elif isinstance(t, (int, float)):
+                    t = torch.tensor(t)
+                tensors.append(t)
+            
+            # Scalar (expert_type)
+            if tensors[0].dim() == 0:
+                out[key] = torch.stack(tensors, dim=0)
+            # All same shape - simple stack
+            elif all(t.shape == tensors[0].shape for t in tensors):
+                out[key] = torch.stack(tensors, dim=0)
+            # Different shapes - pad to max
+            else:
+                max_dims = list(tensors[0].shape)
+                for t in tensors[1:]:
+                    for i in range(len(max_dims)):
+                        max_dims[i] = max(max_dims[i], t.shape[i])
+                
+                padded = []
+                dims = []
+                for t in tensors:
+                    p = torch.zeros(max_dims, dtype=t.dtype)
+                    slices = [slice(0, s) for s in t.shape]
+                    p[slices] = t
+                    padded.append(p)
+                    dims.append(t.shape[-1])
+                out[key] = torch.stack(padded, dim=0)
+                out[f"{key}_dims"] = torch.tensor(dims)
+        
+        # Optional trajectory keys (only present for robot samples)
+        for key in self.TRAJECTORY_KEYS_OPTIONAL:
+            if not any(key in ex for ex in batch):
+                continue
+            
+            # Get first valid tensor to determine shape/dtype
+            first = None
+            for ex in batch:
+                if key in ex:
+                    t = ex[key]
+                    if isinstance(t, np.ndarray):
+                        t = torch.from_numpy(t)
+                    first = t
+                    break
+            
+            # Collect tensors (None for missing samples)
+            tensors = []
+            for ex in batch:
+                if key in ex:
+                    t = ex[key]
+                    if isinstance(t, np.ndarray):
+                        t = torch.from_numpy(t)
+                    tensors.append(t)
+                else:
+                    tensors.append(None)
+            
+            # Find max dims across valid tensors
+            max_dims = list(first.shape)
+            for t in tensors:
+                if t is not None:
+                    for i in range(len(max_dims)):
+                        max_dims[i] = max(max_dims[i], t.shape[i])
+            
+            # Pad all tensors (zeros for missing samples)
+            padded = []
+            dims = []
+            for t in tensors:
+                if t is None:
+                    padded.append(torch.zeros(max_dims, dtype=first.dtype))
+                    dims.append(0)  # 0 indicates missing
+                else:
+                    p = torch.zeros(max_dims, dtype=t.dtype)
+                    slices = [slice(0, s) for s in t.shape]
+                    p[slices] = t
+                    padded.append(p)
+                    dims.append(t.shape[-1])
+            out[key] = torch.stack(padded, dim=0)
+            out[f"{key}_dims"] = torch.tensor(dims)
         
         out["input_ids"] = out.pop("input_tokens")
         if "target_tokens" in out:

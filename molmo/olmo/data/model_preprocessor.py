@@ -872,6 +872,14 @@ class Preprocessor:
         if "state" in example:
             batch["proprio_state"] = example["state"]
         
+        # Preserve expert_type for multi-expert routing
+        if "expert_type" in example:
+            batch["expert_type"] = example["expert_type"]
+        
+        # Preserve robot_actions for sequential mode (Expert B supervision) or non-sequential robot action mode
+        if "robot_actions" in example:
+            batch["robot_actions"] = example["robot_actions"]
+        
         return batch
 
     @property

@@ -1792,6 +1792,29 @@ class ActionExpertTransformer(nn.Module):
                 self.action_dim = config.action_dim
                 self.proprio_dim = config.proprio_dim
                 log.warning(f"Unknown expert_id={expert_id}, using default dims: action_dim={self.action_dim}, proprio_dim={self.proprio_dim}")
+        elif action_expert_mode == "sequential":
+            # Sequential mode: Expert A predicts fingertip trajectory (shared), Expert B predicts robot actions
+            if expert_id == 0:
+                # Expert A: fingertip trajectory prediction (same for human and robot)
+                human_action_dim = getattr(config, 'human_action_dim', None)
+                human_proprio_dim = getattr(config, 'human_proprio_dim', None)
+                self.action_dim = human_action_dim
+                self.proprio_dim = human_proprio_dim
+                log.info(f"Sequential Expert A (id={expert_id}, fingertip trajectory): "
+                         f"action_dim={self.action_dim}, proprio_dim={self.proprio_dim}")
+            elif expert_id == 1:
+                # Expert B: robot action prediction (only used for robot data, sequentially after Expert A)
+                robot_action_dim = getattr(config, 'robot_action_dim', None)
+                robot_proprio_dim = getattr(config, 'robot_proprio_dim', None)
+                self.action_dim = robot_action_dim
+                self.proprio_dim = robot_proprio_dim
+                log.info(f"Sequential Expert B (id={expert_id}, robot actions): "
+                         f"action_dim={self.action_dim}, proprio_dim={self.proprio_dim}")
+            else:
+                # Fallback for additional experts
+                self.action_dim = config.action_dim
+                self.proprio_dim = config.proprio_dim
+                log.warning(f"Unknown expert_id={expert_id}, using default dims: action_dim={self.action_dim}, proprio_dim={self.proprio_dim}")
         else:
             # Shared mode or single expert - use default dimensions (backward compatible)
             self.action_dim = config.action_dim
@@ -2060,6 +2083,31 @@ class OLMoOutput(NamedTuple):
     See sample_actions_flow_matching() for ODE integration.
     
     Only populated if `use_action_expert` is enabled.
+    """
+    
+    velocity_output_a: Optional[torch.FloatTensor] = None
+    """
+    Expert A velocity output for sequential mode (fingertip trajectory).
+    
+    Shape: (batch_size, action_horizon, human_action_dim)
+    
+    In sequential mode, Expert A predicts fingertip trajectories for ALL samples.
+    This output can be used to supervise fingertip trajectory prediction for both
+    human and robot data.
+    
+    Only populated in sequential mode (`action_expert_mode == "sequential"`).
+    """
+    
+    velocity_output_b: Optional[torch.FloatTensor] = None
+    """
+    Expert B velocity output for sequential mode (robot actions).
+    
+    Shape: (batch_size, action_horizon, robot_action_dim) - padded to max_action_dim
+    
+    In sequential mode, Expert B predicts robot actions for ROBOT samples only.
+    Human samples will have zeros in this tensor (use robot_mask to identify valid entries).
+    
+    Only populated in sequential mode (`action_expert_mode == "sequential"`).
     """
 
 
@@ -2763,15 +2811,24 @@ class Molmo(nn.Module):
         batch_size = action_hidden.shape[0]
         seq_len = action_hidden.shape[1]
         device = action_hidden.device
-        dtype = action_hidden.dtype
         
-        # Initialize output tensor with d_model dimension
+        # Determine the correct dtype for the output tensor
+        # Check if autocast is enabled (which would affect the output dtype)
+        expert_param_dtype = next(self.action_experts[0].parameters()).dtype
+        if device.type == "cuda" and torch.is_autocast_enabled():
+            target_dtype = torch.get_autocast_gpu_dtype()
+        elif device.type == "cpu" and torch.is_autocast_cpu_enabled():
+            target_dtype = torch.get_autocast_cpu_dtype()
+        else:
+            target_dtype = expert_param_dtype
+        
+        # Initialize output tensor with d_model dimension and target dtype (accounts for autocast)
         action_hidden_projected = torch.zeros(
             batch_size, 
             seq_len,
             self.config.d_model,
             device=device, 
-            dtype=dtype
+            dtype=target_dtype
         )
         
         for expert_id in range(self.num_action_experts):
@@ -2805,15 +2862,24 @@ class Molmo(nn.Module):
         """
         batch_size = noisy_actions.shape[0]
         device = noisy_actions.device
-        dtype = noisy_actions.dtype
         
-        # Initialize output tensor
+        # Determine the correct dtype for the output tensor
+        # Check if autocast is enabled (which would affect the output dtype)
+        expert_param_dtype = next(self.action_experts[0].parameters()).dtype
+        if device.type == "cuda" and torch.is_autocast_enabled():
+            target_dtype = torch.get_autocast_gpu_dtype()
+        elif device.type == "cpu" and torch.is_autocast_cpu_enabled():
+            target_dtype = torch.get_autocast_cpu_dtype()
+        else:
+            target_dtype = expert_param_dtype
+        
+        # Initialize output tensor with the target dtype (accounts for autocast)
         action_hidden = torch.zeros(
             batch_size,
             self.config.action_horizon,
             self.config.action_expert_d_model,
             device=device,
-            dtype=dtype
+            dtype=target_dtype
         )
         
         for expert_id in range(self.num_action_experts):
@@ -2846,13 +2912,23 @@ class Molmo(nn.Module):
         """
         device = expert_type.device
         
-        # Initialize output tensor
+        # Determine the correct dtype for the output tensor
+        # Check if autocast is enabled (which would affect the output dtype)
+        expert_param_dtype = next(self.action_experts[0].parameters()).dtype
+        if device.type == "cuda" and torch.is_autocast_enabled():
+            target_dtype = torch.get_autocast_gpu_dtype()
+        elif device.type == "cpu" and torch.is_autocast_cpu_enabled():
+            target_dtype = torch.get_autocast_cpu_dtype()
+        else:
+            target_dtype = expert_param_dtype
+        
+        # Initialize output tensor with the target dtype (accounts for autocast)
         action_hidden = torch.zeros(
             batch_size,
             self.config.action_horizon,
             self.config.action_expert_d_model,
             device=device,
-            dtype=torch.float32
+            dtype=target_dtype
         )
         
         for expert_id in range(self.num_action_experts):
@@ -2885,15 +2961,24 @@ class Molmo(nn.Module):
         """
         batch_size = proprio_state.shape[0]
         device = proprio_state.device
-        dtype = proprio_state.dtype
         
-        # Initialize output tensor
+        # Determine the correct dtype for the output tensor
+        # Check if autocast is enabled (which would affect the output dtype)
+        expert_param_dtype = next(self.action_experts[0].parameters()).dtype
+        if device.type == "cuda" and torch.is_autocast_enabled():
+            target_dtype = torch.get_autocast_gpu_dtype()
+        elif device.type == "cpu" and torch.is_autocast_cpu_enabled():
+            target_dtype = torch.get_autocast_cpu_dtype()
+        else:
+            target_dtype = expert_param_dtype
+        
+        # Initialize output tensor with the target dtype (accounts for autocast)
         proprio_hidden = torch.zeros(
             batch_size,
             1,
             self.config.action_expert_d_model,
             device=device,
-            dtype=dtype
+            dtype=target_dtype
         )
         
         for expert_id in range(self.num_action_experts):
@@ -3028,6 +3113,160 @@ class Molmo(nn.Module):
         
         return action_hidden_out
 
+    def _process_sequential_expert_layer(
+        self,
+        block_idx: int,
+        expert_a_hidden: torch.Tensor,
+        expert_b_hidden: torch.Tensor,
+        prefix_q: torch.Tensor,
+        prefix_k: torch.Tensor,
+        prefix_v: torch.Tensor,
+        prefix_len: int,
+        robot_mask: torch.Tensor,
+        merged_attention_bias_a: Optional[torch.Tensor],
+        merged_attention_bias_b: Optional[torch.Tensor],
+        merged_position_ids_a: Optional[torch.Tensor],
+        merged_position_ids_b: Optional[torch.Tensor],
+        response_mask: Optional[torch.Tensor],
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        use_cache: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Process one layer of sequential experts: Expert A for all samples, Expert B for robot samples.
+        
+        In sequential mode:
+        - Expert A processes all samples (VLM prefix + Expert A tokens)
+        - Expert B processes only robot samples (VLM prefix + Expert A + Expert B tokens)
+        - Attention is blockwise causal: Expert A is isolated from Expert B
+        
+        Args:
+            block_idx: Current layer index
+            expert_a_hidden: (batch_size, action_horizon, action_expert_d_model) Expert A hidden states
+            expert_b_hidden: (num_robot, action_horizon, action_expert_d_model) Expert B hidden states
+            prefix_q, prefix_k, prefix_v: VLM prefix Q, K, V tensors (batch_size, nh, prefix_len, head_dim)
+            prefix_len: Length of prefix sequence
+            robot_mask: (batch_size,) Boolean mask for robot samples
+            merged_attention_bias_a: Attention bias for Expert A sequence (VLM + Expert A)
+            merged_attention_bias_b: Attention bias for Expert B sequence (VLM + Expert A + Expert B)
+            merged_position_ids_a: Position IDs for Expert A sequence
+            merged_position_ids_b: Position IDs for Expert B sequence
+            response_mask: Response mask
+            layer_past: Past key-value cache
+            use_cache: Whether to use caching
+            
+        Returns:
+            Tuple of:
+                - expert_a_hidden: (batch_size, action_horizon, action_expert_d_model) Updated Expert A states
+                - expert_b_hidden: (num_robot, action_horizon, action_expert_d_model) Updated Expert B states
+        """
+        batch_size = expert_a_hidden.shape[0]
+        action_len = expert_a_hidden.shape[1]
+        device = expert_a_hidden.device
+        dtype = expert_a_hidden.dtype
+        
+        # Get Expert A and B
+        expert_a = self.action_experts[0]
+        expert_b = self.action_experts[1]
+        action_block_a = expert_a.blocks[block_idx]
+        action_block_b = expert_b.blocks[block_idx]
+        
+        # ============ Step 1: Process Expert A for ALL samples ============
+        # This is identical to single-expert processing
+        
+        # Get Expert A's Q, K, V
+        action_q_a, action_k_a, action_v_a = action_block_a.get_qkv(expert_a_hidden)
+        
+        # Shared attention: VLM prefix + Expert A
+        att_multi_head_a, _ = action_block_a.shared_attention_multi_expert(
+            [(prefix_q, prefix_k, prefix_v), (action_q_a, action_k_a, action_v_a)],
+            attention_bias=merged_attention_bias_a,
+            position_ids=merged_position_ids_a,
+            drop_mask=response_mask,
+            layer_past=layer_past,
+            use_cache=use_cache
+        )
+        
+        # Split and apply Expert A's output projection
+        action_att_mh_a = att_multi_head_a[:, :, prefix_len:prefix_len+action_len, :]
+        B, nh, _, head_dim = action_att_mh_a.size()
+        action_att_a = action_att_mh_a.transpose(1, 2).contiguous().view(B, action_len, nh * head_dim)
+        action_att_out_a = action_block_a.attn_out(action_att_a)
+        
+        if action_block_a.config.norm_after:
+            if action_block_a._activation_checkpoint_fn is not None:
+                action_att_out_a = action_block_a._activation_checkpoint_fn(action_block_a.attn_norm, action_att_out_a)
+            else:
+                action_att_out_a = action_block_a.attn_norm(action_att_out_a)
+        
+        expert_a_hidden = expert_a_hidden + action_block_a.dropout(action_att_out_a, drop_mask=None)
+        expert_a_hidden = action_block_a.apply_ffn(expert_a_hidden, expert_a_hidden)
+        
+        # ============ Step 2: Process Expert B for ROBOT samples only ============
+        if robot_mask.any() and expert_b_hidden is not None:
+            num_robot = robot_mask.sum().item()
+            action_len_b = expert_b_hidden.shape[1]
+            
+            # Get Q, K, V for Expert A (robot subset) to be used as context for Expert B
+            expert_a_hidden_robot = expert_a_hidden[robot_mask]  # (num_robot, action_len, d)
+            action_q_a_robot, action_k_a_robot, action_v_a_robot = action_block_a.get_qkv(expert_a_hidden_robot)
+            
+            # Get Q, K, V for Expert B
+            action_q_b, action_k_b, action_v_b = action_block_b.get_qkv(expert_b_hidden)
+            
+            # Subset prefix for robot samples
+            prefix_q_robot = prefix_q[robot_mask]
+            prefix_k_robot = prefix_k[robot_mask]
+            prefix_v_robot = prefix_v[robot_mask]
+            
+            # Subset attention bias for robot samples
+            merged_attention_bias_b_subset = None
+            if merged_attention_bias_b is not None:
+                if merged_attention_bias_b.shape[0] == batch_size:
+                    merged_attention_bias_b_subset = merged_attention_bias_b[robot_mask]
+                else:
+                    merged_attention_bias_b_subset = merged_attention_bias_b
+            
+            merged_position_ids_b_subset = None
+            if merged_position_ids_b is not None:
+                if merged_position_ids_b.shape[0] == batch_size:
+                    merged_position_ids_b_subset = merged_position_ids_b[robot_mask]
+                else:
+                    merged_position_ids_b_subset = merged_position_ids_b.clone()
+            
+            # Shared attention: VLM prefix + Expert A + Expert B
+            # Expert B can attend to all three components
+            att_multi_head_b, _ = action_block_b.shared_attention_multi_expert(
+                [
+                    (prefix_q_robot, prefix_k_robot, prefix_v_robot),
+                    (action_q_a_robot, action_k_a_robot, action_v_a_robot),
+                    (action_q_b, action_k_b, action_v_b)
+                ],
+                attention_bias=merged_attention_bias_b_subset,
+                position_ids=merged_position_ids_b_subset,
+                drop_mask=response_mask,
+                layer_past=layer_past,
+                use_cache=use_cache
+            )
+            
+            # Split and apply Expert B's output projection
+            # Expert B tokens are at positions [prefix_len + action_len : prefix_len + action_len + action_len_b]
+            expert_b_start = prefix_len + action_len
+            action_att_mh_b = att_multi_head_b[:, :, expert_b_start:expert_b_start+action_len_b, :]
+            N, nh_b, _, head_dim_b = action_att_mh_b.size()
+            action_att_b = action_att_mh_b.transpose(1, 2).contiguous().view(N, action_len_b, nh_b * head_dim_b)
+            action_att_out_b = action_block_b.attn_out(action_att_b)
+            
+            if action_block_b.config.norm_after:
+                if action_block_b._activation_checkpoint_fn is not None:
+                    action_att_out_b = action_block_b._activation_checkpoint_fn(action_block_b.attn_norm, action_att_out_b)
+                else:
+                    action_att_out_b = action_block_b.attn_norm(action_att_out_b)
+            
+            expert_b_hidden = expert_b_hidden + action_block_b.dropout(action_att_out_b, drop_mask=None)
+            expert_b_hidden = action_block_b.apply_ffn(expert_b_hidden, expert_b_hidden)
+        
+        return expert_a_hidden, expert_b_hidden
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -3053,6 +3292,8 @@ class Molmo(nn.Module):
         expert_type: Optional[torch.Tensor] = None,
         # Prefix KV cache for efficient ODE integration (flow matching inference)
         prefix_kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        # Sequential expert mode: noisy robot actions for Expert B (flow matching only)
+        noisy_robot_actions: Optional[torch.Tensor] = None,
     ) -> OLMoOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -3187,6 +3428,8 @@ class Molmo(nn.Module):
         action_hidden = None
         action_position_ids = None
         velocity_output = None  # Will be set during action expert processing if has_action_tokens
+        velocity_output_a = None  # Expert A velocity (sequential mode only)
+        velocity_output_b = None  # Expert B velocity (sequential mode only)
         
         if has_action_tokens:
             # Check if we need multi-expert routing for embeddings
@@ -3349,12 +3592,93 @@ class Molmo(nn.Module):
             # Check if we have cached prefix KV (for efficient ODE integration)
             use_prefix_cache = prefix_kv_cache is not None and len(prefix_kv_cache) == len(self.transformer.blocks)
             
-            # Determine if we need multi-expert routing at the block level
+            # Determine expert routing mode at the block level
+            action_expert_mode = getattr(self.config, 'action_expert_mode', 'shared')
             use_multi_expert_blocks = (
                 self.num_action_experts > 1 and 
                 expert_type is not None and 
-                self.action_experts is not None
+                self.action_experts is not None and
+                action_expert_mode == "separate_human_robot"
             )
+            use_sequential_experts = (
+                self.num_action_experts > 1 and 
+                expert_type is not None and 
+                self.action_experts is not None and
+                action_expert_mode == "sequential"
+            )
+            
+            # For sequential mode: initialize Expert B hidden states for robot samples
+            expert_b_hidden = None
+            robot_mask = None
+            merged_attention_bias_b = None
+            merged_position_ids_b = None
+            action_len = action_hidden.shape[1]
+            
+            if use_sequential_experts:
+                robot_mask = (expert_type == 1)  # Robot samples need Expert B
+                num_robot = robot_mask.sum().item()
+                
+                if num_robot > 0:
+                    # Initialize Expert B hidden states based on prediction mode
+                    expert_b = self.action_experts[1]
+                    
+                    if self.config.use_direct_trajectory_prediction:
+                        # Direct trajectory prediction: use learnable queries
+                        expert_b_hidden = expert_b.embed_trajectory_queries(num_robot)
+                    else:
+                        # Flow matching mode: use noisy robot actions for Expert B
+                        if noisy_robot_actions is not None and action_timestep is not None:
+                            # Extract robot samples' noisy actions and timestep
+                            robot_noisy_actions = noisy_robot_actions[robot_mask]  # (num_robot, action_horizon, robot_action_dim)
+                            robot_timestep = action_timestep[robot_mask]  # (num_robot,)
+                            expert_b_hidden = expert_b.embed_actions_with_time(
+                                robot_noisy_actions, robot_timestep
+                            )
+                        else:
+                            raise ValueError(
+                                "Sequential expert mode with flow matching requires noisy_robot_actions and action_timestep "
+                                "for Expert B initialization, but they are None. "
+                                "Make sure to pass noisy_robot_actions when training in sequential mode."
+                            )
+                    
+                    action_len_b = expert_b_hidden.shape[1]
+                    
+                    # Create merged attention bias for Expert B (VLM + Expert A + Expert B)
+                    # Expert B can attend to everything (VLM + Expert A + Expert B bidirectionally)
+                    if attention_bias is not None:
+                        total_len_b = prefix_len + action_len + action_len_b
+                        
+                        merged_attention_bias_b = get_causal_attention_bias(
+                            self.__cache, total_len_b, x.device
+                        ).to(dtype=torch.float)
+                        
+                        if attention_bias.shape[0] > 1:
+                            # Need to expand and subset for robot samples
+                            merged_attention_bias_b = merged_attention_bias_b.repeat(num_robot, 1, 1, 1)
+                        
+                        # Copy prefix attention bias for robot samples
+                        prefix_attn_bias_robot = attention_bias[robot_mask, :, :prefix_len, :prefix_len] if attention_bias.shape[0] > 1 else attention_bias[:, :, :prefix_len, :prefix_len]
+                        merged_attention_bias_b[:, :, :prefix_len, :prefix_len] = prefix_attn_bias_robot
+                        
+                        # Expert A rows can attend to VLM + Expert A (bidirectional within A)
+                        merged_attention_bias_b[:, :, prefix_len + proprio_len:prefix_len + action_len, :prefix_len + action_len] = 0.0
+                        
+                        # Expert B rows can attend to everything (VLM + Expert A + Expert B)
+                        merged_attention_bias_b[:, :, prefix_len + action_len:, :] = 0.0
+                    
+                    # Create position IDs for Expert B
+                    if merged_position_ids is not None:
+                        max_pos_a = merged_position_ids.max()
+                        expert_b_position_ids = torch.arange(
+                            max_pos_a + 1,
+                            max_pos_a + 1 + action_len_b,
+                            dtype=torch.long,
+                            device=x.device
+                        ).unsqueeze(0).expand(num_robot, -1)
+                        merged_position_ids_b = torch.cat([
+                            merged_position_ids[robot_mask],
+                            expert_b_position_ids
+                        ], dim=1)
             
             for block_idx, vlm_block in enumerate(self.transformer.blocks):
                 if output_hidden_states:
@@ -3399,7 +3723,26 @@ class Molmo(nn.Module):
                     prefix_hidden, prefix_cache, (prefix_q, prefix_k, prefix_v) = prefix_result
                 
                 # Step 2-6: Process action through expert blocks
-                if use_multi_expert_blocks:
+                if use_sequential_experts:
+                    # Sequential mode: Expert A for all, then Expert B for robot samples
+                    action_hidden, expert_b_hidden = self._process_sequential_expert_layer(
+                        block_idx=block_idx,
+                        expert_a_hidden=action_hidden,
+                        expert_b_hidden=expert_b_hidden,
+                        prefix_q=prefix_q,
+                        prefix_k=prefix_k,
+                        prefix_v=prefix_v,
+                        prefix_len=prefix_len,
+                        robot_mask=robot_mask,
+                        merged_attention_bias_a=merged_attention_bias,
+                        merged_attention_bias_b=merged_attention_bias_b,
+                        merged_position_ids_a=merged_position_ids,
+                        merged_position_ids_b=merged_position_ids_b,
+                        response_mask=response_mask,
+                        layer_past=layer_past,
+                        use_cache=use_cache,
+                    )
+                elif use_multi_expert_blocks:
                     # Multi-expert mode: route samples to different expert blocks
                     action_hidden = self._process_action_layer_multi_expert(
                         block_idx=block_idx,
@@ -3477,7 +3820,43 @@ class Molmo(nn.Module):
                 velocity_hidden = action_hidden
             
             # Route velocity prediction and output projection to appropriate expert(s)
-            if self.num_action_experts > 1 and expert_type is not None:
+            velocity_output_b = None  # Expert B velocity (only for sequential mode)
+            velocity_output_a = None  # Expert A velocity (for sequential mode with robot data)
+            
+            if use_sequential_experts:
+                # Sequential mode: 
+                # - Expert A predicts fingertip trajectory for ALL samples
+                # - Expert B predicts robot actions for ROBOT samples only
+                expert_a = self.action_experts[0]
+                expert_b = self.action_experts[1]
+                
+                # Expert A velocity prediction for all samples (fingertip trajectory)
+                velocity_output_a = expert_a.predict_velocity(velocity_hidden)
+                
+                # For output: human samples use Expert A velocity, robot samples use Expert B velocity
+                # Initialize output with Expert A's dimensions (fingertip trajectory)
+                velocity_output = velocity_output_a.clone()
+                
+                # Expert B velocity prediction for robot samples (robot actions)
+                if robot_mask is not None and robot_mask.any() and expert_b_hidden is not None:
+                    expert_b_velocity_hidden = expert_b_hidden  # Already processed through all layers
+                    velocity_output_b_raw = expert_b.predict_velocity(expert_b_velocity_hidden)
+                    
+                    # Store Expert B velocity in a padded tensor with max action dim
+                    max_action_dim = max(expert_a.action_dim, expert_b.action_dim)
+                    velocity_output_b = torch.zeros(
+                        batch_size, 
+                        self.config.action_horizon,
+                        max_action_dim,
+                        device=velocity_output.device,
+                        dtype=velocity_output.dtype
+                    )
+                    velocity_output_b[robot_mask, :, :expert_b.action_dim] = velocity_output_b_raw
+                
+                # Output projection uses Expert A for all samples (main action hidden)
+                action_hidden_projected = expert_a.output_proj(action_hidden)
+                
+            elif self.num_action_experts > 1 and expert_type is not None:
                 # Multi-expert mode with per-sample routing
                 velocity_output = self._route_velocity_prediction(velocity_hidden, expert_type)
                 action_hidden_projected = self._route_output_projection(action_hidden, expert_type)
@@ -3574,12 +3953,15 @@ class Molmo(nn.Module):
         # Flow matching: velocity_output is already computed in action_expert processing above
         # It's computed directly from action_hidden (in action_expert_d_model) before projection
         # velocity_output is set during action expert processing when has_action_tokens is True
+        # velocity_output_a and velocity_output_b are set in sequential mode only
 
         return OLMoOutput(
             logits=logits,
             attn_key_values=attn_key_values,
             hidden_states=tuple(all_hidden_states) if output_hidden_states else None,
-            velocity_output=velocity_output
+            velocity_output=velocity_output,
+            velocity_output_a=velocity_output_a,
+            velocity_output_b=velocity_output_b
         )  # type: ignore[arg-type]
     
     @torch.no_grad()
@@ -3596,7 +3978,8 @@ class Molmo(nn.Module):
         proprio_state: Optional[torch.Tensor] = None,
         expert_type: Optional[torch.Tensor] = None,
         use_kv_cache: bool = True,
-    ) -> torch.Tensor:
+        initial_robot_noise: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Sample actions using flow matching with ODE integration OR direct prediction.
         
@@ -3609,6 +3992,11 @@ class Molmo(nn.Module):
         If use_direct_trajectory_prediction is True, it performs a single forward pass
         to predict the trajectory directly.
         
+        For sequential expert mode:
+        - Expert A predicts fingertip trajectories for all samples
+        - Expert B predicts robot actions only for robot samples (expert_type == 1)
+        - Both experts use ODE integration with their own noise
+        
         Args:
             input_ids: Text input token IDs (batch_size, seq_len)
             attention_mask: Attention mask for text
@@ -3616,15 +4004,28 @@ class Molmo(nn.Module):
             image_masks: Image attention masks
             image_input_idx: Image input indices
             num_steps: Number of ODE integration steps (default: config.flow_matching_num_steps)
-            initial_noise: Optional initial noise (default: sample from N(0,1))
+            initial_noise: Optional initial noise for Expert A (default: sample from N(0,1))
             position_ids: Position IDs for tokens (batch_size, seq_len)
             proprio_state: Optional proprioceptive state (batch_size, proprio_dim)
             expert_type: Expert type for multi-expert routing (batch_size,) - 0=human, 1=robot
             use_kv_cache: Whether to use KV caching for prefix (default: True for efficiency)
+            initial_robot_noise: Optional initial noise for Expert B robot actions (sequential mode only)
             
         Returns:
-            actions: Predicted actions (batch_size, action_horizon, action_dim)
+            For non-sequential mode: actions (batch_size, action_horizon, action_dim)
+            For sequential mode with robot samples: tuple of (actions, robot_actions)
+                - actions: Expert A output (batch_size, action_horizon, human_action_dim)
+                - robot_actions: Expert B output (batch_size, action_horizon, robot_action_dim)
+                  (only populated for robot samples, zeros for human samples)
         """
+        # Check if using sequential expert mode
+        action_expert_mode = getattr(self.config, 'action_expert_mode', 'shared')
+        is_sequential_mode = (
+            action_expert_mode == 'sequential' and
+            self.num_action_experts > 1 and
+            expert_type is not None
+        )
+        
         # Direct trajectory prediction case
         if self.config.use_direct_trajectory_prediction:
             with torch.autocast("cuda", enabled=False):
@@ -3641,13 +4042,15 @@ class Molmo(nn.Module):
                     proprio_state=proprio_state,
                     expert_type=expert_type,
                 )
+            if is_sequential_mode and output.velocity_output_b is not None:
+                return output.velocity_output, output.velocity_output_b
             return output.velocity_output
 
         batch_size = input_ids.shape[0]
         device = input_ids.device
         num_steps = num_steps or self.config.flow_matching_num_steps
         
-        # Initialize from noise at t=1
+        # Initialize from noise at t=1 for Expert A
         if initial_noise is None:
             x_t = torch.randn(
                 batch_size, 
@@ -3657,6 +4060,20 @@ class Molmo(nn.Module):
             )
         else:
             x_t = initial_noise
+        
+        # Initialize noise for Expert B (robot actions) in sequential mode
+        x_t_robot = None
+        if is_sequential_mode:
+            robot_action_dim = getattr(self.config, 'robot_action_dim', self.config.action_dim)
+            if initial_robot_noise is None:
+                x_t_robot = torch.randn(
+                    batch_size,
+                    self.config.action_horizon,
+                    robot_action_dim,
+                    device=device
+                )
+            else:
+                x_t_robot = initial_robot_noise
         
         # Time step: integrate from t=1 to t=0
         # Using the diffusion convention: t=1 is noise, t=0 is data
@@ -3688,6 +4105,7 @@ class Molmo(nn.Module):
                             action_timestep=t,
                             proprio_state=proprio_state,
                             expert_type=expert_type,
+                            noisy_robot_actions=x_t_robot,  # For sequential mode Expert B
                         )
                         # Save the prefix KV cache for subsequent steps
                         prefix_kv_cache = output.attn_key_values
@@ -3706,6 +4124,7 @@ class Molmo(nn.Module):
                             proprio_state=proprio_state,
                             expert_type=expert_type,
                             prefix_kv_cache=prefix_kv_cache,  # Use cached prefix KV
+                            noisy_robot_actions=x_t_robot,  # For sequential mode Expert B
                         )
                 
                 if use_x0_prediction:
@@ -3723,6 +4142,18 @@ class Molmo(nn.Module):
                     v_t = output.velocity_output
                     
                 x_t = x_t + dt * v_t
+                
+                # Update Expert B (robot actions) in sequential mode
+                if is_sequential_mode and x_t_robot is not None and output.velocity_output_b is not None:
+                    if use_x0_prediction:
+                        x0_pred_b = output.velocity_output_b
+                        robot_action_dim = x_t_robot.shape[-1]
+                        v_t_robot = (x_t_robot - x0_pred_b[:, :, :robot_action_dim]) / t_clamped
+                    else:
+                        robot_action_dim = x_t_robot.shape[-1]
+                        v_t_robot = output.velocity_output_b[:, :, :robot_action_dim]
+                    x_t_robot = x_t_robot + dt * v_t_robot
+                
                 time = time + dt
         else:
             # Fallback: re-process prefix each step (less efficient but more general)
@@ -3742,6 +4173,7 @@ class Molmo(nn.Module):
                         action_timestep=t,
                         proprio_state=proprio_state,
                         expert_type=expert_type,
+                        noisy_robot_actions=x_t_robot,  # For sequential mode Expert B
                     )
                 
                 if use_x0_prediction:
@@ -3759,8 +4191,23 @@ class Molmo(nn.Module):
                     v_t = output.velocity_output
                     
                 x_t = x_t + dt * v_t
+                
+                # Update Expert B (robot actions) in sequential mode
+                if is_sequential_mode and x_t_robot is not None and output.velocity_output_b is not None:
+                    if use_x0_prediction:
+                        x0_pred_b = output.velocity_output_b
+                        robot_action_dim = x_t_robot.shape[-1]
+                        v_t_robot = (x_t_robot - x0_pred_b[:, :, :robot_action_dim]) / t_clamped
+                    else:
+                        robot_action_dim = x_t_robot.shape[-1]
+                        v_t_robot = output.velocity_output_b[:, :, :robot_action_dim]
+                    x_t_robot = x_t_robot + dt * v_t_robot
+                
                 time = time + dt
         
+        # Return both Expert A and Expert B outputs in sequential mode
+        if is_sequential_mode and x_t_robot is not None:
+            return x_t, x_t_robot
         return x_t
 
     def get_fsdp_wrap_policy(self, wrap_strategy: Optional[FSDPWrapStrategy] = None):

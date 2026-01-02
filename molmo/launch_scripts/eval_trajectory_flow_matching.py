@@ -451,7 +451,6 @@ def load_test_examples(num_examples: int = 10,
             normalize_coordinates=False, # Set to be False as in inference time, the trajectory itself is only for visualization, but this only works for delta representation.
             trajectory_representation=trajectory_representation,
             frame_downsampling_ratio=10,
-            action_output_mode="trajectory",  # Use fingertip trajectory as action target
         )
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}. Must be 'egodex' or 'robocasa'")
@@ -556,7 +555,6 @@ def load_video_examples(num_videos: int = 5,
             normalize_coordinates=False,
             trajectory_representation=trajectory_representation,
             frame_downsampling_ratio=frame_downsampling_ratio,
-            action_output_mode="trajectory",  # Use fingertip trajectory as action target
         )
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}. Must be 'egodex' or 'robocasa'")

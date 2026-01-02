@@ -147,11 +147,6 @@ class RoboCasaTrajectoryDataset(Dataset):
         frame_downsampling_ratio: int = 1,  # Sample every n frames
         # Train/test split ratio (for random split within each task)
         train_ratio: float = 0.9,
-        # Action output mode: 'trajectory' or 'robot_action'
-        # Note: Both fingertip trajectories and robot actions are always returned.
-        # The training code will choose which to use based on the model configuration.
-        # action_output_mode controls which stats are used for normalization.
-        action_output_mode: str = "trajectory",
         pad_action_chunk: bool = False,  # If True, pad action chunks with repeated last step when near end of trajectory
     ):
         """
@@ -169,9 +164,6 @@ class RoboCasaTrajectoryDataset(Dataset):
             output_2d_trajectory: Whether to output 2D or 3D trajectory
             frame_downsampling_ratio: Downsample frames by this ratio
             train_ratio: Ratio of episodes to use for training (rest for testing)
-            action_output_mode: Which outputs/stats the model will be trained on:
-                - 'trajectory': fingertip trajectories (uses trajectory stats)
-                - 'robot_action': low-level robot actions (uses robot_action stats)
         """
         if data_dir is None:
             data_dir = os.environ.get("ROBOCASA_DATA_DIR")
@@ -189,7 +181,6 @@ class RoboCasaTrajectoryDataset(Dataset):
         self.output_2d_trajectory = output_2d_trajectory
         self.frame_downsampling_ratio = frame_downsampling_ratio
         self.train_ratio = train_ratio
-        self.action_output_mode = action_output_mode
         self.pad_action_chunk = pad_action_chunk
         
         # Validate parameters
@@ -197,8 +188,6 @@ class RoboCasaTrajectoryDataset(Dataset):
             f"trajectory_representation must be 'absolute' or 'delta', got {trajectory_representation}"
         assert frame_downsampling_ratio >= 1, \
             f"frame_downsampling_ratio must be >= 1, got {frame_downsampling_ratio}"
-        assert action_output_mode in ["trajectory", "robot_action"], \
-            f"action_output_mode must be 'trajectory' or 'robot_action', got {action_output_mode}"
         
         # Load normalization stats if needed
         # Store both trajectory and robot_action stats separately if available
@@ -225,27 +214,10 @@ class RoboCasaTrajectoryDataset(Dataset):
                     self.robot_action_stats_std = stats_dict["std"].float() if isinstance(stats_dict["std"], torch.Tensor) else torch.tensor(stats_dict["std"]).float()
                     print(f"Loaded robot_action stats (n_samples={stats_dict.get('n_samples', 'unknown')}, action_dim={stats_dict.get('action_dim', 'unknown')})")
                 
-                # Choose which stats to use for normalization based on action_output_mode
-                if self.action_output_mode == "trajectory":
-                    if self.trajectory_stats_mean is not None:
-                        self.stats_mean = self.trajectory_stats_mean
-                        self.stats_std = self.trajectory_stats_std
-                        print(f"Using trajectory stats for normalization (action_output_mode='trajectory')")
-                    else:
-                        raise ValueError(f"Trajectory stats not found in {self.stats_file}")
-                elif self.action_output_mode == "robot_action":
-                    if self.robot_action_stats_mean is not None:
-                        self.stats_mean = self.robot_action_stats_mean
-                        self.stats_std = self.robot_action_stats_std
-                        print(f"Using robot_action stats for normalization (action_output_mode='robot_action')")
-                    else:
-                        raise ValueError(f"Robot action stats not found in {self.stats_file}")
-            else:
-                self.stats_mean = None
-                self.stats_std = None
-        else:
-            self.stats_mean = None
-            self.stats_std = None
+                if self.trajectory_stats_mean is None:
+                    raise ValueError(f"Trajectory stats not found in {self.stats_file}")
+                if self.robot_action_stats_mean is None:
+                    raise ValueError(f"Robot action stats not found in {self.stats_file}")
         
         # Joint names - use EgoDex-style names for compatibility
         if joint_names is None:
@@ -512,17 +484,17 @@ class RoboCasaTrajectoryDataset(Dataset):
         # Load robot actions and states (in a single file open)
         robot_actions, robot_states = self._load_robot_actions_and_states(hdf5_path, frame_idx, self.action_chunking_horizon, num_frames)
         
-        # Normalize based on action_output_mode
+        # Normalize trajectory and robot actions if stats are available
         if self.normalize_coordinates and not self.output_2d_trajectory:
-            if self.action_output_mode == "trajectory" and self.trajectory_stats_mean is not None:
-                # Normalize 3D trajectory using trajectory stats
+            # Normalize 3D trajectory if trajectory stats are available
+            if self.trajectory_stats_mean is not None:
                 num_steps, num_joints, coords = final_trajectory.shape
                 mean = self.trajectory_stats_mean.view(1, num_joints, coords)
                 std = self.trajectory_stats_std.view(1, num_joints, coords)
                 final_trajectory = (final_trajectory - mean) / std
-            elif self.action_output_mode == "robot_action" and robot_actions is not None and self.robot_action_stats_mean is not None:
-                # Normalize robot actions using robot_action stats
-                # Note: trajectory is not normalized in this case
+            
+            # Normalize robot actions if robot_action stats are available
+            if robot_actions is not None and self.robot_action_stats_mean is not None:
                 robot_actions_tensor = torch.from_numpy(robot_actions) if isinstance(robot_actions, np.ndarray) else robot_actions
                 mean = self.robot_action_stats_mean.view(1, -1)  # Shape: [1, action_dim]
                 std = self.robot_action_stats_std.view(1, -1)    # Shape: [1, action_dim]
@@ -535,9 +507,6 @@ class RoboCasaTrajectoryDataset(Dataset):
         # Flatten trajectory for flow matching: [num_steps, num_joints*coords]
         num_steps = final_trajectory.shape[0]
         trajectory_flattened = final_trajectory.reshape(num_steps, -1).astype(np.float32)
-        
-        # Always use fingertip trajectory as trajectory_target (default)
-        trajectory_target = trajectory_flattened
         
         # Determine style based on output format
         if self.output_2d_trajectory:
@@ -552,13 +521,19 @@ class RoboCasaTrajectoryDataset(Dataset):
         # Initial robot state (if available)
         robot_initial_state = None
         if robot_states is not None:
-            robot_initial_state = robot_states[0].astype(np.float32)        
+            robot_initial_state = robot_states[0].astype(np.float32)
+        
         # Build base result dict
+        # NOTE: trajectory_target is always fingertip trajectory for consistency
+        # Training code will choose which target to use based on action_expert_mode:
+        # - shared/separate_human_robot with trajectory: use trajectory_target (fingertip)
+        # - shared/separate_human_robot with robot_action: use robot_actions
+        # - sequential: use trajectory_target for Expert A, robot_actions for Expert B
         result = {
             'image': image,
             'state': fingertip_initial_state,  # Default proprioception (fingertip position)
-            'trajectory_target': trajectory_target,  # Fingertip trajectory (always returned)
-            'trajectory_shape': trajectory_target.shape,
+            'trajectory_target': trajectory_flattened,  # Fingertip trajectory (default target)
+            'trajectory_shape': trajectory_flattened.shape,
             'expert_type': 1,  # Robot trajectory expert (for multi-expert routing)
             'metadata': {
                 'image': image,
@@ -566,30 +541,23 @@ class RoboCasaTrajectoryDataset(Dataset):
                 'frame_idx': frame_idx,
                 'output_2d_trajectory': self.output_2d_trajectory,
                 'trajectory_representation': self.trajectory_representation,
-                'action_output_mode': self.action_output_mode,
             }
         }
         
-        # Always return both initial states
-        result['fingertip_initial_state'] = fingertip_initial_state
-        # if robot_initial_state is not None:
-        #     result['robot_initial_state'] = robot_initial_state
-        
-        # Always return robot actions if available (for training to choose which to use)
+        # Return robot actions if available (only for robot data that has actions)
         if robot_actions is not None:
             result['robot_actions'] = robot_actions.astype(np.float32)  # Shape: [num_steps, action_dim]
             result['metadata']['robot_action_dim'] = robot_actions.shape[-1]
-        else:
-            # If robot_actions not available, set to None explicitly
-            result['robot_actions'] = None
         
         # Store robot states for reference
         if robot_states is not None:
             result['robot_states'] = robot_states  # Shape: [num_steps, state_dim]
             result['metadata']['robot_state_dim'] = robot_states.shape[-1]
         
-        # Store trajectory dimensions in metadata
+        # Store dimensions in metadata
         result['metadata']['trajectory_dim'] = trajectory_flattened.shape[-1]
+        if robot_actions is not None:
+            result['metadata']['robot_action_dim'] = robot_actions.shape[-1]
         
         # For text-based modes, use message_list (needed for text output formatting)
         # For flow matching, use top-level fields (no text output needed)
