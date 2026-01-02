@@ -629,6 +629,14 @@ class ClosedLoopEvaluator:
                 proprio_state=obs_dict.get("proprio_state"),
                 expert_type=obs_dict.get("expert_type"),
             )
+            
+            # Check if sequential expert mode returns a tuple (Expert A output, Expert B robot actions)
+            # In sequential mode, we want Expert B's robot actions (the second element)
+            action_expert_mode = getattr(self.model.config, 'action_expert_mode', 'shared')
+            if action_expert_mode == 'sequential' and isinstance(actions, tuple):
+                # Sequential mode: (fingertip_trajectory, robot_actions)
+                # We want the robot actions from Expert B (second element)
+                actions = actions[1]
         
         # Convert to numpy
         actions_np = actions.cpu().numpy()[0]  # (action_horizon, action_dim)

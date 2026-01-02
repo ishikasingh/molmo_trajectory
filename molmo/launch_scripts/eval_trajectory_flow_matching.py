@@ -758,6 +758,14 @@ def evaluate_video(model, preprocessor, tokenizer, video_data: Dict,
                     proprio_state=proprio_state,
                     expert_type=expert_type,
                 )
+                
+                # Check if sequential expert mode returns a tuple (Expert A fingertip trajectory, Expert B robot actions)
+                # For trajectory evaluation, we want Expert A's fingertip trajectory (the first element)
+                action_expert_mode = getattr(model.config, 'action_expert_mode', 'shared')
+                if action_expert_mode == 'sequential' and isinstance(pred_trajectory, tuple):
+                    # Sequential mode: (fingertip_trajectory, robot_actions)
+                    # We want the fingertip trajectory from Expert A (first element)
+                    pred_trajectory = pred_trajectory[0]
         
         # Convert to numpy and process
         if isinstance(pred_trajectory, torch.Tensor):
@@ -1217,6 +1225,14 @@ def main():
                     proprio_state=proprio_state,
                     expert_type=expert_type,
                 )
+                
+                # Check if sequential expert mode returns a tuple (Expert A fingertip trajectory, Expert B robot actions)
+                # For trajectory evaluation, we want Expert A's fingertip trajectory (the first element)
+                action_expert_mode = getattr(model.config, 'action_expert_mode', 'shared')
+                if action_expert_mode == 'sequential' and isinstance(pred_traj_sample, tuple):
+                    # Sequential mode: (fingertip_trajectory, robot_actions)
+                    # We want the fingertip trajectory from Expert A (first element)
+                    pred_traj_sample = pred_traj_sample[0]
             all_pred_trajectories.append(pred_traj_sample)
         
         end_time = time.time()
