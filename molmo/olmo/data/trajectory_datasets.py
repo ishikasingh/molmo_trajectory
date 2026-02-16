@@ -8,6 +8,7 @@ import h5py
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 import pickle
 import time
 import random
@@ -105,6 +106,7 @@ class TrajectoryDataset(Dataset):
         trajectory_representation: str = "absolute",  # "absolute" or "delta" (velocity: v_t = x_{t+1} - x_t)
         load_images: bool = True,
         pad_action_chunk: bool = False,  # If True, pad action chunks with repeated last step when near end of trajectory
+        interpolation_times: int = 1,  # If > 1, load horizon//interpolation_times steps and interpolate to horizon steps
     ):
         # Get data directory from environment variable if not provided
         if data_dir is None:
@@ -115,6 +117,8 @@ class TrajectoryDataset(Dataset):
         self.data_dir = Path(data_dir)
         self.split = split
         self.action_chunking_horizon = action_chunking_horizon
+        self.interpolation_times = max(1, int(interpolation_times))
+        self.steps_to_load = max(1, action_chunking_horizon // self.interpolation_times)
         self.use_confidence_filter = use_confidence_filter
         self.confidence_threshold = confidence_threshold
         self.output_2d_trajectory = output_2d_trajectory
@@ -166,14 +170,12 @@ class TrajectoryDataset(Dataset):
         print(f"Loaded {len(self.index_mapping)} samples from {split} split")
         
     def _get_cache_filepath(self) -> Path:
-        """Get the path to the cached index mapping file."""
-        # Include pad_action_chunk in cache filename if enabled for backward compatibility
+        """Cache path keyed by steps_to_load (actual loading horizon), not action_chunking_horizon."""
+        parts = [f"index_mapping_{self.split}_horizon{self.steps_to_load}"]
         if self.pad_action_chunk:
-            cache_filename = f"index_mapping_{self.split}_horizon{self.action_chunking_horizon}_padded.pkl"
-        else:
-            cache_filename = f"index_mapping_{self.split}_horizon{self.action_chunking_horizon}.pkl"
-        return self.data_dir / cache_filename
-    
+            parts.append("padded")
+        return self.data_dir / ("_".join(parts) + ".pkl")
+
     def _load_index_from_cache(self) -> Optional[List[Dict]]:
         """Load index mapping from cache file if it exists."""
         cache_file = self._get_cache_filepath()
@@ -181,33 +183,45 @@ class TrajectoryDataset(Dataset):
             print(f"Loading cached index mapping from {cache_file}...")
             with open(cache_file, 'rb') as f:
                 cached_data = pickle.load(f)
-            
-            # Validate that cache matches current configuration
-            if (cached_data.get('split') == self.split and
-                cached_data.get('action_chunking_horizon') == self.action_chunking_horizon and
-                cached_data.get('joint_names') == self.joint_names and
-                cached_data.get('pad_action_chunk', False) == self.pad_action_chunk):
+            # Effective steps to load: horizon // interpolation_times (same index for same value)
+            cached_steps_to_load = cached_data.get('steps_to_load')
+            if cached_steps_to_load is None:
+                h = cached_data.get('action_chunking_horizon')
+                cached_steps_to_load = (h // max(1, cached_data.get('interpolation_times', 1))) if h is not None else None
+            horizon_match = cached_steps_to_load == self.steps_to_load
+            split_ok = cached_data.get('split') == self.split
+            joint_names_ok = cached_data.get('joint_names') == self.joint_names
+            pad_ok = cached_data.get('pad_action_chunk', False) == self.pad_action_chunk
+            if split_ok and horizon_match and joint_names_ok and pad_ok:
                 full_index = cached_data['index_mapping']
                 print(f"Successfully loaded {len(full_index)} samples from cache")
-                
-                # Apply downsampling filter if needed
                 if self.frame_downsampling_ratio > 1:
                     filtered_index = self._apply_downsampling_filter(full_index)
                     print(f"Applied downsampling ratio {self.frame_downsampling_ratio}: {len(full_index)} -> {len(filtered_index)} samples")
                     return filtered_index
                 return full_index
-            else:
-                print("Cache configuration mismatch, rebuilding index...")
+            mismatches = []
+            if not split_ok:
+                mismatches.append(f"split (cached={cached_data.get('split')!r}, current={self.split!r})")
+            if not horizon_match:
+                mismatches.append(f"steps_to_load (cached={cached_steps_to_load}, current={self.steps_to_load})")
+            if not joint_names_ok:
+                mismatches.append("joint_names")
+            if not pad_ok:
+                mismatches.append(f"pad_action_chunk (cached={cached_data.get('pad_action_chunk', False)}, current={self.pad_action_chunk})")
+            print(f"Cache configuration mismatch, rebuilding index. Mismatch: {', '.join(mismatches)}")
         return None
     
     def _save_index_to_cache(self, index_mapping: List[Dict]) -> None:
-        """Save index mapping to cache file."""
+        """Save index mapping to cache file. Path uses steps_to_load; dict includes action_chunking_horizon for backward compat."""
         cache_file = self._get_cache_filepath()
         cache_data = {
             'split': self.split,
-            'action_chunking_horizon': self.action_chunking_horizon,
+            'steps_to_load': self.steps_to_load,
             'joint_names': self.joint_names,
             'pad_action_chunk': self.pad_action_chunk,
+            'action_chunking_horizon': self.action_chunking_horizon,
+            'interpolation_times': self.interpolation_times,
             'index_mapping': index_mapping,
         }
         
@@ -312,8 +326,8 @@ class TrajectoryDataset(Dataset):
                 if self.pad_action_chunk:
                     # When padding is enabled, include all frames
                     # Frames near the end will have their action chunks padded with repeated last step
-                    # requires at least action_chunking_horizon frames
-                    if trajectory_length < self.action_chunking_horizon:
+                    # requires at least steps_to_load frames
+                    if trajectory_length < self.steps_to_load:
                         continue
                     
                     for frame_idx in range(trajectory_length):
@@ -325,11 +339,11 @@ class TrajectoryDataset(Dataset):
                             'trajectory_length': trajectory_length,  # Store for padding calculation
                         })
                 else:
-                    # Original behavior: only include frames with enough future steps
-                    if trajectory_length < self.action_chunking_horizon:
+                    # Original behavior: only include frames with enough future steps (steps_to_load when using interpolation)
+                    if trajectory_length < self.steps_to_load:
                         continue
                     
-                    for frame_idx in range(trajectory_length - self.action_chunking_horizon):
+                    for frame_idx in range(trajectory_length - self.steps_to_load):
                         index_mapping.append({
                             'video_path': str(video_file),
                             'hdf5_path': str(hdf5_file),
@@ -373,7 +387,9 @@ class TrajectoryDataset(Dataset):
         
         # Get trajectory_length for padding calculation (only available when pad_action_chunk is enabled)
         trajectory_length = mapping.get('trajectory_length', None)
-        trajectory = self._load_trajectory(hdf5_path, mapping['frame_idx'], self.action_chunking_horizon, trajectory_length)
+        trajectory = self._load_trajectory(hdf5_path, mapping['frame_idx'], self.steps_to_load, trajectory_length)
+        if self.interpolation_times > 1:
+            trajectory = self._interpolate_trajectory(trajectory)
         
         if self.output_2d_trajectory:
             final_trajectory = self._project_trajectory_to_2d(hdf5_path, mapping['frame_idx'], trajectory)
@@ -570,6 +586,29 @@ class TrajectoryDataset(Dataset):
                 trajectory = np.concatenate([trajectory, padding], axis=0)
             
             return torch.from_numpy(trajectory).float()
+    
+    def _interpolate_trajectory(self, trajectory: torch.Tensor) -> torch.Tensor:
+        """
+        Linearly interpolate trajectory from steps_to_load steps to action_chunking_horizon steps.
+        trajectory: [steps_to_load, num_joints, 3]
+        Returns: [action_chunking_horizon, num_joints, 3]
+        """
+        if self.interpolation_times <= 1 or trajectory.shape[0] >= self.action_chunking_horizon:
+            return trajectory
+        steps_in = trajectory.shape[0]
+        steps_out = self.action_chunking_horizon
+        device = trajectory.device
+        dtype = trajectory.dtype
+        if steps_out == 1:
+            return trajectory[0:1].expand(1, *trajectory.shape[1:]).clone()
+        idx_float = torch.linspace(0, steps_in - 1, steps_out, device=device, dtype=dtype)
+        idx_low = idx_float.long().clamp(0, steps_in - 2)
+        idx_high = (idx_low + 1).clamp(max=steps_in - 1)
+        weight_high = (idx_float - idx_low.float()).unsqueeze(-1).unsqueeze(-1)
+        low = trajectory[idx_low]
+        high = trajectory[idx_high]
+        interp = low + weight_high * (high - low)
+        return interp
     
     def _load_instruction(self, hdf5_path: str, max_retries: int = 3) -> str:
         """

@@ -16,6 +16,7 @@ import h5py
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
@@ -45,6 +46,7 @@ class EgoDexVLADataset(Dataset):
         transform: Optional transforms to apply to the image
         output_2d_trajectory: Whether to output 2D or 3D trajectory
         normalize_2d_coordinates: Whether to normalize 2D coordinates to 0-100 scale
+        interpolation_times: If > 1, load horizon//interpolation_times steps and interpolate to horizon steps (e.g. horizon=30, interpolation_times=2 -> load 15, interpolate to 30).
     """
     
     def __init__(
@@ -60,10 +62,13 @@ class EgoDexVLADataset(Dataset):
         transform: Optional[transforms.Compose] = None,
         output_2d_trajectory: bool = False,
         normalize_2d_coordinates: bool = True,  # New parameter
+        interpolation_times: int = 1,
     ):
         self.data_dir = Path(data_dir)
         self.split = split
         self.action_chunking_horizon = action_chunking_horizon
+        self.interpolation_times = max(1, int(interpolation_times))
+        self.steps_to_load = max(1, action_chunking_horizon // self.interpolation_times)
         self.image_size = image_size
         self.use_confidence_filter = use_confidence_filter
         self.confidence_threshold = confidence_threshold
@@ -145,7 +150,7 @@ class EgoDexVLADataset(Dataset):
                     fps = 30
                     cap.release()
                     
-                    if frame_count < self.action_chunking_horizon:
+                    if frame_count < self.steps_to_load:
                         print(f"    Warning: Video {video_file} has only {frame_count} frames, skipping...")
                         continue
                     
@@ -165,8 +170,8 @@ class EgoDexVLADataset(Dataset):
                             # Get trajectory length
                             trajectory_length = f[f'transforms/{self.joint_names[0]}'].shape[0]
                             
-                            # Add each valid frame as a separate index
-                            for frame_idx in range(trajectory_length - self.action_chunking_horizon):
+                            # Add each valid frame as a separate index (need at least steps_to_load future steps)
+                            for frame_idx in range(trajectory_length - self.steps_to_load):
                                 index_mapping.append({
                                     'video_path': str(video_file),
                                     'hdf5_path': str(hdf5_file),
@@ -195,12 +200,14 @@ class EgoDexVLADataset(Dataset):
         # Load image frame
         image = self._load_frame(mapping['video_path'], mapping['frame_idx'])
         
-        # Load trajectory data (current + future steps)
+        # Load trajectory data (current + future steps; may load fewer steps and interpolate)
         trajectory = self._load_trajectory(
             mapping['hdf5_path'], 
             mapping['frame_idx'], 
-            self.action_chunking_horizon
+            self.steps_to_load
         )
+        if self.interpolation_times > 1:
+            trajectory = self._interpolate_trajectory(trajectory)
         
         # Transform trajectory based on output type
         if self.output_2d_trajectory:
@@ -313,6 +320,25 @@ class EgoDexVLADataset(Dataset):
             trajectory = np.stack(trajectory_list, axis=1)
             return torch.from_numpy(trajectory).float()
     
+    def _interpolate_trajectory(self, trajectory: torch.Tensor) -> torch.Tensor:
+        """
+        Linearly interpolate trajectory from steps_to_load steps to action_chunking_horizon steps.
+        Uses torch.nn.functional.interpolate (1D linear mode).
+        trajectory: [steps_to_load, num_joints, 3]
+        Returns: [action_chunking_horizon, num_joints, 3]
+        """
+        if self.interpolation_times <= 1 or trajectory.shape[0] >= self.action_chunking_horizon:
+            return trajectory
+        steps_in = trajectory.shape[0]
+        steps_out = self.action_chunking_horizon
+        if steps_out == 1:
+            return trajectory[0:1]
+        # F.interpolate expects (N, C, L) for 1D; we interpolate along the time dimension L
+        # trajectory [T_in, J, 3] -> (1, J*3, T_in)
+        t = trajectory.permute(1, 2, 0).reshape(1, -1, steps_in)
+        t = F.interpolate(t, size=steps_out, mode="linear", align_corners=True)
+        return t.reshape(trajectory.shape[1], trajectory.shape[2], steps_out).permute(2, 0, 1)
+    
     def _load_instruction(self, hdf5_path: str) -> str:
         """Load language instruction from HDF5 file attributes."""
         with h5py.File(hdf5_path, 'r') as f:
@@ -348,7 +374,7 @@ class EgoDexVLADataset(Dataset):
                 confidences = {}
                 for joint in self.joint_names:
                     if f'confidences/{joint}' in f:
-                        conf = f[f'confidences/{joint}'][mapping['frame_idx']:mapping['frame_idx'] + self.action_chunking_horizon]
+                        conf = f[f'confidences/{joint}'][mapping['frame_idx']:mapping['frame_idx'] + self.steps_to_load]
                         confidences[joint] = {
                             'mean': float(np.mean(conf)),
                             'min': float(np.min(conf)),
@@ -501,12 +527,14 @@ class EgoDexVLADataset(Dataset):
         image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         original_height, original_width = image.shape[:2]
         
-        # Load trajectory data
+        # Load trajectory data (use steps_to_load, then interpolate if needed)
         trajectory = self._load_trajectory(
             mapping['hdf5_path'], 
             mapping['frame_idx'], 
-            self.action_chunking_horizon
+            self.steps_to_load
         )
+        if self.interpolation_times > 1:
+            trajectory = self._interpolate_trajectory(trajectory)
         
         # Get trajectory in the desired format
         if self.output_2d_trajectory:
@@ -646,12 +674,14 @@ class EgoDexVLADataset(Dataset):
             print(f"  Task: {mapping['task_name']}")
             print(f"  Frame: {mapping['frame_idx']}")
             
-            # Load trajectory data
+            # Load trajectory data (use steps_to_load, then interpolate if needed)
             trajectory = self._load_trajectory(
                 mapping['hdf5_path'], 
                 mapping['frame_idx'], 
-                self.action_chunking_horizon
+                self.steps_to_load
             )
+            if self.interpolation_times > 1:
+                trajectory = self._interpolate_trajectory(trajectory)
             
             # Get 3D camera frame trajectory
             trajectory_3d = self._transform_trajectory_to_camera_frame(
@@ -812,6 +842,7 @@ def create_dataloader(
     augment: bool = True,
     output_2d_trajectory: bool = False,
     normalize_2d_coordinates: bool = True,  # New parameter
+    interpolation_times: int = 1,
     **kwargs
 ) -> DataLoader:
     """Create a DataLoader for EgoDex VLA training."""
@@ -828,6 +859,7 @@ def create_dataloader(
         transform=transform,
         output_2d_trajectory=output_2d_trajectory,
         normalize_2d_coordinates=normalize_2d_coordinates,  # Pass the new parameter
+        interpolation_times=interpolation_times,
         **kwargs
     )
     

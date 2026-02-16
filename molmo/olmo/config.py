@@ -1362,6 +1362,9 @@ class DataConfig(BaseConfig):
     action_chunking_horizon: Optional[int] = None
     """Trajectory dataset horizon (defaults to dataset's intrinsic setting)"""
 
+    interpolation_times: Optional[int] = None
+    """If > 1, load horizon//interpolation_times steps and interpolate to horizon (e.g. horizon=30, interpolation_times=2 -> load 15, interpolate to 30). Default 1 = no interpolation."""
+
     pad_action_chunk: bool = False
     """If True, pad action chunks with repeated last step when near end of trajectory"""
 

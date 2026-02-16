@@ -124,6 +124,12 @@ if __name__ == "__main__":
         help="Number of timesteps to predict for trajectory actions",
     )
     parser.add_argument(
+        "--interpolation_times",
+        type=int,
+        default=1,
+        help="If > 1, load horizon//interpolation_times steps from dataset and interpolate to horizon (e.g. horizon=30, interpolation_times=2 -> load 15, interpolate to 30). Default 1 = no interpolation.",
+    )
+    parser.add_argument(
         "--exclude_proprio",
         action="store_true",
         default=False,
@@ -626,6 +632,7 @@ if __name__ == "__main__":
             shuffle=True,
             split=data_split,
             action_chunking_horizon=model_cfg.action_horizon,
+            interpolation_times=args.interpolation_times,
             pad_action_chunk=args.pad_action_chunk,
             drop_last=True,
             sequence_length=args.seq_len,
@@ -646,7 +653,8 @@ if __name__ == "__main__":
             connector_learning_rate=5e-6,
             vit_learning_rate=5e-6,
             llm_learning_rate=1e-5 if not args.slow_warmup else 5e-6,
-            flow_matching_learning_rate=5e-4,
+            # flow_matching_learning_rate=5e-4,
+            flow_matching_learning_rate=1e-5,
             connector_weight_decay=0.0,
             vit_weight_decay=0.0,
             llm_weight_decay=0.0,
