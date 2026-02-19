@@ -12,7 +12,7 @@ rsync -avz --progress \
 --exclude='assets' \
   --exclude='lib' \
   --exclude='vendor' \
-  FAR-affordance/ fanyangr-dev-eks-test:/root/sky_workdir/FAR-affordance/
+  ./ rfmpi-ishikasi-dev-lambda-1-high-priority:/root/sky_workdir/FAR-affordance/
   # FAR-affordance/ fanyangr-affordance-eks:/root/sky_workdir/FAR-affordance/
 
 # Alternative destination (commented out):

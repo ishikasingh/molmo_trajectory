@@ -388,11 +388,14 @@ def sample_episodes(
         num_tasks = len(task_names)
     
     sampled_tasks = random.sample(task_names, num_tasks)
+    sampled_tasks = [name for name in sampled_tasks if "Milk" in name]
     
     samples = []
-    for task_name in sampled_tasks:
+    # for task_name in sampled_tasks:
+    for _ in range(num_tasks):
         # Randomly pick one episode from this task
-        episode = random.choice(task_episodes[task_name])
+        # episode = random.choice(task_episodes[task_name])
+        episode = random.choice(task_episodes[sampled_tasks[0]])
         samples.append(episode)
     
     return samples
@@ -663,10 +666,12 @@ class ClosedLoopEvaluator:
                 std = self.action_stats_std.reshape(1, -1)
                 actions_np = actions_np * std + mean
             else:
+                actions_np = actions_np[..., :self.action_stats_mean.size] * self.action_stats_std + self.action_stats_mean
                 print(
                     f"Warning: Action dim mismatch. Model output: {actions_np.shape[-1]}, "
                     f"stats: {self.action_stats_mean.size}"
                 )
+                
         
         return actions_np
     
