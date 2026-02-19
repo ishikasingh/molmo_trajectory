@@ -275,6 +275,7 @@ if __name__ == "__main__":
             if args.use_transitions:
                 tasks = [["egodex", ["affordance_with_transitions"], 0.35],
                          ["robo_casa", ["robo_casa_affordance"], 0.15],
+                         ["trossen", ["trossen_3d"], 0.15],
                     ["demo", [
                         "pixmo_ask_model_anything",
                         ("pixmo_cap", 50000),
@@ -293,6 +294,7 @@ if __name__ == "__main__":
             else:
                 tasks = [["egodex", ["affordance_new"], 0.35],
                          ["robo_casa", ["robo_casa_affordance"], 0.15],
+                         ["trossen", ["trossen_3d"], 0.15],
                     ["demo", [
                         "pixmo_ask_model_anything",
                         ("pixmo_cap", 50000),
@@ -312,10 +314,12 @@ if __name__ == "__main__":
             eval_tasks = [] 
             if args.use_transitions:
                 tasks = [["egodex", ["affordance_with_transitions"], 0.5],
-                         ["robo_casa", ["robo_casa_affordance"], 0.5]]
+                         ["robo_casa", ["robo_casa_affordance"], 0.5],
+                         ["trossen", ["trossen_3d"], 0.5]]
             else:
                 tasks = [["egodex", ["affordance_new"], 0.5],
-                         ["robo_casa", ["robo_casa_affordance"], 0.5]]
+                         ["robo_casa", ["robo_casa_affordance"], 0.5],
+                         ["trossen", ["trossen_3d"], 0.5]]
     elif args.mixture == "trajectory_2d_text":
         eval_tasks = []
         tasks = [["egodex", ["trajectory_2d_text"], 1.0]]
@@ -360,6 +364,16 @@ if __name__ == "__main__":
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d"], 0.5],
                 ["robo_casa", ["robocasa_action"], 0.5]]
+    elif args.mixture == "trajectory_3d_egodex_trossen_fm":
+        # EgoDex (human) + Trossen (robot) trajectory prediction with fingertip trajectories
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_3d"], 0.8],
+                 ["trossen", ["trossen_3d"], 0.2]]
+    elif args.mixture == "trajectory_3d_egodex_trossen_direct":
+        # EgoDex (human) + Trossen (robot) trajectory prediction with direct regression
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_3d"], 0.8],
+                 ["trossen", ["trossen_3d"], 0.2]]
     elif args.mixture == "trajectory_3d_fm_overfit":
         # Flow matching based 3D trajectory prediction with delta representation
         eval_tasks = []
@@ -387,6 +401,7 @@ if __name__ == "__main__":
         # eval_tasks = ["robo_casa_affordance"]
         eval_tasks = []
         tasks = [["train", ["robo_casa_affordance"], 1.0]]
+    
     else:
         raise NotImplementedError(args.mixture)
 
@@ -494,6 +509,7 @@ if __name__ == "__main__":
             args.mixture == "robot_action_direct" or
             args.mixture == "trajectory_3d_human_robot_direct" or
             args.mixture == "trajectory_3d_human_robot_action_direct" or
+            args.mixture == "trajectory_3d_egodex_trossen_direct" or
             args.mixture == "trajecotry_3d_robot_direct_overfit" or
             args.mixture == "trajectory_3d_direct_pick_and_place"
         )

@@ -21,6 +21,9 @@ PYTHONPATH=. torchrun --nproc-per-node 4 --nnodes=${SKYPILOT_NUM_NODES} --node_r
 # sequential
 PYTHONPATH=. torchrun --nproc-per-node 8 --nnodes=${SKYPILOT_NUM_NODES} --node_rank=${SKYPILOT_NODE_RANK} --rdzv_id=311 --rdzv_endpoint=${SKYPILOT_MASTER_ADDR}:29500 launch_scripts/train_affordance.py trajectory_3d_human_robot_fm checkpoints/Molmo-7B-D-0924 --save_folder=finetuned_checkpoints_action --save_overwrite --wandb.name=human_robot_3d_fm_0065 --wandb.entity=ishikasi --wandb.project=affordance --global_batch_size $((SKYPILOT_NUM_NODES*8*48)) --device_train_batch_size 48 --device_eval_batch_size 1 --seq_len 500 --action_horizon 100 --max_crops 2 --flow_matching_prediction_type=x0 --freeze_vlm --action_expert_mode sequential
 
+# aloha trosson
+PYTHONPATH=. torchrun --nproc-per-node 6 --nnodes=${SKYPILOT_NUM_NODES} --node_rank=${SKYPILOT_NODE_RANK} --rdzv_id=311 --rdzv_endpoint=${SKYPILOT_MASTER_ADDR}:29500 launch_scripts/train_affordance.py trajectory_3d_egodex_trossen_direct checkpoints/Molmo-7B-D-0924 --save_folder=finetuned_checkpoints_action --save_overwrite --wandb.name=human_trosson_3d_direct_0065 --wandb.entity=ishikasi --wandb.project=affordance --global_batch_size $((SKYPILOT_NUM_NODES*6*12)) --device_train_batch_size 12 --device_eval_batch_size 1 --seq_len 500 --action_horizon 100 --max_crops 2 --flow_matching_prediction_type=x0 --freeze_vlm
+
 
 ```
 note that the global batch size `--global_batch_size $((SKYPILOT_NUM_NODES*8*16))` should match `--device_train_batch_size 16`.

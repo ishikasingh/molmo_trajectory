@@ -28,10 +28,10 @@ from tqdm import tqdm
 
 from olmo.data.dataset import Dataset
 
-try:
-    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-except ImportError:
-    LeRobotDataset = None
+# try:
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+# except ImportError:
+#     LeRobotDataset = None
 
 # Default camera key for Trossen (head camera)
 DEFAULT_CAMERA_KEY = "observation.images.cam_high"
@@ -203,6 +203,7 @@ class TrossenAffordanceDataset(Dataset):
     def _build_index_mapping(self) -> List[Dict]:
         """Build list of (global_frame_idx, episode_idx, num_frames) with enough future steps."""
         mapping = []
+        # import ipdb; ipdb.set_trace()
         ep_from = self.lerobot_dataset.episode_data_index["from"].numpy()
         ep_to = self.lerobot_dataset.episode_data_index["to"].numpy()
         num_episodes = len(ep_from)

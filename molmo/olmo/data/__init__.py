@@ -424,7 +424,7 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None, pad_a
     elif dataset_name == "trossen_affordance" or dataset_name == "trossen_3d":
         # Trossen/LeRobot dataset with EE positions (run data/add_trossen_ee_to_dataset.py first)
         data_root = os.environ.get("TROSSEN_DATA_DIR")
-        repo_id = os.environ.get("TROSSEN_REPO_ID", None)
+        repo_id = 'ykorkmaz/aloha_play_dataset_part_3' if os.environ.get("TROSSEN_REPO_ID", None) is None else os.environ.get("TROSSEN_REPO_ID", None)
         ee_hdf5 = os.environ.get("TROSSEN_EE_HDF5", None)
         stats_file = os.environ.get("TROSSEN_STATS_FILE", None)
         return TrossenAffordanceDataset(
@@ -433,10 +433,10 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None, pad_a
             ee_hdf5_path=ee_hdf5,
             split=split,
             action_chunking_horizon=horizon,
-            normalize_coordinates=bool(stats_file),
+            normalize_coordinates=True,
             stats_file=stats_file,
             trajectory_representation="delta",
-            frame_downsampling_ratio=1,
+            frame_downsampling_ratio=3,
             pad_action_chunk=pad_action_chunk,
         )
     # Delta (velocity) representation variants

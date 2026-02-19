@@ -452,8 +452,19 @@ def load_test_examples(num_examples: int = 10,
             trajectory_representation=trajectory_representation,
             frame_downsampling_ratio=10,
         )
+    elif dataset_type == "trossen":
+        dataset = TrossenAffordanceDataset(
+            repo_id='ykorkmaz/aloha_play_dataset_part_3',
+            data_root=os.environ.get("TROSSEN_DATA_DIR"),
+            ee_hdf5_path=os.environ.get("TROSSEN_DATA_DIR") / "trossen_ee_world.hdf5",
+            split=split,
+            action_chunking_horizon=action_chunking_horizon,
+            normalize_coordinates=True,
+            stats_file=os.environ.get("TROSSEN_STATS_FILE"),
+            frame_downsampling_ratio=3,
+        )
     else:
-        raise ValueError(f"Unknown dataset_type: {dataset_type}. Must be 'egodex' or 'robocasa'")
+        raise ValueError(f"Unknown dataset_type: {dataset_type}. Must be 'egodex' or 'robocasa' or 'trossen'")
     
     print(f"Loaded '{split}' dataset with {len(dataset)} examples")
     
@@ -531,7 +542,7 @@ def load_video_examples(num_videos: int = 5,
         trajectory_representation: Either 'absolute' or 'delta' for trajectory representation
         split: Dataset split to load (e.g., train, test)
         frame_downsampling_ratio: Frame downsampling ratio (e.g., 10 = every 10th frame)
-        dataset_type: Either 'egodex' or 'robocasa' to specify which dataset to load
+        dataset_type: Either 'egodex' or 'robocasa' or 'trossen' to specify which dataset to load
     
     Returns:
         List of video dictionaries, each containing frames and metadata
@@ -557,7 +568,7 @@ def load_video_examples(num_videos: int = 5,
             frame_downsampling_ratio=frame_downsampling_ratio,
         )
     else:
-        raise ValueError(f"Unknown dataset_type: {dataset_type}. Must be 'egodex' or 'robocasa'")
+        raise ValueError(f"Unknown dataset_type: {dataset_type}. Must be 'egodex' or 'robocasa' or 'trossen'")
     
     print(f"Loaded '{split}' dataset with {len(dataset)} examples (downsampling ratio: {frame_downsampling_ratio})")
     
@@ -903,7 +914,7 @@ def main():
     parser.add_argument("--video_fps", type=int, default=3,
                        help="Frames per second for output videos (video mode only)")
     parser.add_argument("--dataset", type=str, default="egodex",
-                       choices=["egodex", "robocasa"],
+                       choices=["egodex", "robocasa", "trossen"],
                        help="Dataset to load: 'egodex' for EgoDex (human) dataset or 'robocasa' for RoboCasa dataset")
     
     args = parser.parse_args()
