@@ -151,7 +151,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--robot_action_dim",
         type=int,
-        default=24,
+        default=14,
         help="Action dimension for robot expert (RoboCasa: 24 for bimanual action command)",
     )
     parser.add_argument(
@@ -160,6 +160,7 @@ if __name__ == "__main__":
         default=6,
         help="Proprioception dimension for robot expert (RoboCasa: robot state dim)",
     ) # Note: at this stage, we are using the fingertip positions as the proprioception, not the actual proprioception. 
+    # thus, it is the same as robot_trajectory_dim
     parser.add_argument(
         "--robot_trajectory_dim",
         type=int,
@@ -245,81 +246,6 @@ if __name__ == "__main__":
                 "pixmo_count_counting",
             ], 0.35]
         ]
-    elif args.mixture == "affordance":
-        if args.cotrain:
-            eval_tasks = ["affordance_eval", "pointing_eval:test"]
-            tasks = [["train", ["affordance"], 0.5],
-                     ["pointing", ["pixmo_points"], 0.5]]
-        else:
-            eval_tasks = []
-            tasks = [["train", ["affordance"], 1.0]]
-    elif args.mixture == "affordance_new":
-        if args.cotrain:
-            eval_tasks = ["affordance_eval", "pointing_eval:test"]
-            if args.use_transitions:
-                tasks = [["train", ["affordance_with_transitions"], 0.5],
-                         ["pointing", ["pixmo_points"], 0.5]]
-            else:   
-                tasks = [["train", ["affordance_new"], 0.5],
-                        ["pointing", ["pixmo_points"], 0.5]]
-        else:
-            eval_tasks = []
-            if args.use_transitions:
-                tasks = [["train", ["affordance_with_transitions"], 1.0]]
-            else:
-                tasks = [["train", ["affordance_new"], 1.0]]
-    elif args.mixture == "affordance_human_robot":
-        # default to use new affordance format
-        if args.cotrain:
-            eval_tasks = ["affordance_eval", "pointing_eval:test"]
-            if args.use_transitions:
-                tasks = [["egodex", ["affordance_with_transitions"], 0.35],
-                         ["robo_casa", ["robo_casa_affordance"], 0.15],
-                         ["trossen", ["trossen_3d"], 0.15],
-                    ["demo", [
-                        "pixmo_ask_model_anything",
-                        ("pixmo_cap", 50000),
-                        "pixmo_cap_qa",
-                        "pixmo_pointing_explanations"
-                    ], 0.15],
-                    ["pointing", [
-                        "pixmo_points",
-                        "pixmo_count",
-                        "pixmo_points_high_freq",
-                        "pixmo_points_counting",
-                        "pixmo_points_high_freq_counting",
-                        "pixmo_count_counting",
-                    ], 0.35]
-                ]
-            else:
-                tasks = [["egodex", ["affordance_new"], 0.35],
-                         ["robo_casa", ["robo_casa_affordance"], 0.15],
-                         ["trossen", ["trossen_3d"], 0.15],
-                    ["demo", [
-                        "pixmo_ask_model_anything",
-                        ("pixmo_cap", 50000),
-                        "pixmo_cap_qa",
-                        "pixmo_pointing_explanations"
-                    ], 0.15],
-                    ["pointing", [
-                        "pixmo_points",
-                        "pixmo_count",
-                        "pixmo_points_high_freq",
-                        "pixmo_points_counting",
-                        "pixmo_points_high_freq_counting",
-                        "pixmo_count_counting",
-                    ], 0.35]
-                ]
-        else:
-            eval_tasks = [] 
-            if args.use_transitions:
-                tasks = [["egodex", ["affordance_with_transitions"], 0.5],
-                         ["robo_casa", ["robo_casa_affordance"], 0.5],
-                         ["trossen", ["trossen_3d"], 0.5]]
-            else:
-                tasks = [["egodex", ["affordance_new"], 0.5],
-                         ["robo_casa", ["robo_casa_affordance"], 0.5],
-                         ["trossen", ["trossen_3d"], 0.5]]
     elif args.mixture == "trajectory_2d_text":
         eval_tasks = []
         tasks = [["egodex", ["trajectory_2d_text"], 1.0]]
@@ -346,38 +272,47 @@ if __name__ == "__main__":
     elif args.mixture == "robot_action_direct":
         eval_tasks = []
         tasks = [["robo_casa", ["robocasa_action"], 1.0]]
-    elif args.mixture == "trajectory_3d_human_robot_fm":
+    elif args.mixture == "trajectory_3d_robot_fm":
         # Human (EgoDex) + Robot (RoboCasa) trajectory prediction with fingertip trajectories
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d"], 0.5],
                  ["robo_casa", ["robocasa_3d"], 0.5]]
-    elif args.mixture == "trajectory_3d_human_robot_action_fm":
+    elif args.mixture == "trajectory_3d_robot_action_fm":
         # Human (EgoDex) + Robot (RoboCasa) with robot using joint actions instead of fingertip trajectory
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d"], 0.5],
                  ["robo_casa", ["robocasa_action"], 0.5]]
-    elif args.mixture == "trajectory_3d_human_robot_direct":
+    elif args.mixture == "trajectory_3d_robot_direct":
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d"], 0.5],
                 ["robo_casa", ["robocasa_3d"], 0.5]]
-    elif args.mixture == "trajectory_3d_human_robot_action_direct":
+    elif args.mixture == "trajectory_3d_robot_action_direct":
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d"], 0.5],
                 ["robo_casa", ["robocasa_action"], 0.5]]
-    elif args.mixture == "trajectory_3d_egodex_trossen_fm":
+    elif args.mixture == "trajectory_3d_trossen_fm":
         # EgoDex (human) + Trossen (robot) trajectory prediction with fingertip trajectories
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d"], 0.8],
                  ["trossen", ["trossen_3d"], 0.2]]
-    elif args.mixture == "trajectory_3d_egodex_trossen_direct":
+    elif args.mixture == "trajectory_3d_trossen_direct":
         # EgoDex (human) + Trossen (robot) trajectory prediction with direct regression
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d"], 0.8],
                  ["trossen", ["trossen_3d"], 0.2]]
+    elif args.mixture == "trajectory_3d_trossen_action_direct":
+        # EgoDex (human) + Trossen (robot) trajectory prediction with direct regression
+        eval_tasks = []
+        tasks = [["egodex", ["trajectory_3d"], 0.8],
+                 ["trossen", ["trossen_action"], 0.2]]
     elif args.mixture == "trossen_3d_direct":
         # Trossen (robot) trajectory prediction with direct regression
         eval_tasks = []
         tasks = [["trossen", ["trossen_3d"], 1.0]]
+    elif args.mixture == "trossen_action_direct":
+        # Trossen (robot) trajectory prediction with direct regression
+        eval_tasks = []
+        tasks = [["trossen", ["trossen_action"], 1.0]]
     elif args.mixture == "trajectory_3d_fm_overfit":
         # Flow matching based 3D trajectory prediction with delta representation
         eval_tasks = []
@@ -511,9 +446,10 @@ if __name__ == "__main__":
             args.mixture == "trajectory_3d_direct" or
             args.mixture == "robot_3d_direct" or
             args.mixture == "robot_action_direct" or
-            args.mixture == "trajectory_3d_human_robot_direct" or
-            args.mixture == "trajectory_3d_human_robot_action_direct" or
-            args.mixture == "trajectory_3d_egodex_trossen_direct" or
+            args.mixture == "trajectory_3d_robot_direct" or
+            args.mixture == "trajectory_3d_robot_action_direct" or
+            args.mixture == "trajectory_3d_trossen_direct" or
+            args.mixture == "trajectory_3d_trossen_action_direct" or
             args.mixture == "trossen_3d_direct" or
             args.mixture == "trajecotry_3d_robot_direct_overfit" or
             args.mixture == "trajectory_3d_direct_pick_and_place"
@@ -537,10 +473,12 @@ if __name__ == "__main__":
         # - trajectory_3d_human_robot_action_fm
         # - trajectory_3d_human_robot_action_direct
         robot_use_joint_action = (
-            args.mixture == "trajectory_3d_human_robot_action_fm" or
-            args.mixture == "trajectory_3d_human_robot_action_direct" or
+            args.mixture == "trajectory_3d_robot_action_fm" or
+            args.mixture == "trajectory_3d_robot_action_direct" or
             args.mixture == "robot_action_fm" or
-            args.mixture == "robot_action_direct"
+            args.mixture == "robot_action_direct" or
+            args.mixture == "trajectory_3d_trossen_action_direct" or
+            args.mixture == "trajectory_3d_trossen_action_fm"
         )
         model_cfg.robot_use_trajectory_as_action = not robot_use_joint_action
         

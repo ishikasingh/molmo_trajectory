@@ -422,7 +422,7 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None, pad_a
             frame_downsampling_ratio=10, # robocasa dataset is recorded at 20 fps, while egodex is recorded at 30 fps
             pad_action_chunk=pad_action_chunk
         )
-    elif dataset_name == "trossen_affordance" or dataset_name == "trossen_3d":
+    elif dataset_name == "trossen_3d" or dataset_name == "trossen_action":
         # Trossen/LeRobot dataset with EE positions (run data/add_trossen_ee_to_dataset.py first)
         data_root = os.environ.get("TROSSEN_DATA_DIR", "/root/sky_workdir/FAR-affordance/trossen_data")
         repo_id = 'ykorkmaz/aloha_play_dataset_part_3' if os.environ.get("TROSSEN_REPO_ID", None) is None else os.environ.get("TROSSEN_REPO_ID", None)

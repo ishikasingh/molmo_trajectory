@@ -86,6 +86,8 @@ class TrossenAffordanceDataset(Dataset):
     """
     Dataset for Trossen (LeRobot) data with EE positions in camera frame.
     One end-effector point per arm (left and right gripper center).
+    not "state" means the keypoint positions, not the robot state
+    "robot_states" means joint angles
     """
 
     def __init__(
