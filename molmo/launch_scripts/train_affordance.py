@@ -139,13 +139,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--human_action_dim",
         type=int,
-        default=30,
+        default=6,
         help="Action/trajectory dimension for human expert (EgoDex: 10 joints * 3 coords = 30)",
     )
     parser.add_argument(
         "--human_proprio_dim",
         type=int,
-        default=30,
+        default=6,
         help="Proprioception dimension for human expert (EgoDex: 10 joints * 3 coords = 30)",
     )
     parser.add_argument(
@@ -157,13 +157,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--robot_proprio_dim",
         type=int,
-        default=30,
+        default=6,
         help="Proprioception dimension for robot expert (RoboCasa: robot state dim)",
     ) # Note: at this stage, we are using the fingertip positions as the proprioception, not the actual proprioception. 
     parser.add_argument(
         "--robot_trajectory_dim",
         type=int,
-        default=30,
+        default=6,
         help="Fingertip trajectory dimension for robot expert (RoboCasa: 10 keypoints * 3 coords = 30)",
     )
     parser.add_argument(
@@ -374,6 +374,10 @@ if __name__ == "__main__":
         eval_tasks = []
         tasks = [["egodex", ["trajectory_3d"], 0.8],
                  ["trossen", ["trossen_3d"], 0.2]]
+    elif args.mixture == "trossen_3d_direct":
+        # Trossen (robot) trajectory prediction with direct regression
+        eval_tasks = []
+        tasks = [["trossen", ["trossen_3d"], 1.0]]
     elif args.mixture == "trajectory_3d_fm_overfit":
         # Flow matching based 3D trajectory prediction with delta representation
         eval_tasks = []
@@ -510,6 +514,7 @@ if __name__ == "__main__":
             args.mixture == "trajectory_3d_human_robot_direct" or
             args.mixture == "trajectory_3d_human_robot_action_direct" or
             args.mixture == "trajectory_3d_egodex_trossen_direct" or
+            args.mixture == "trossen_3d_direct" or
             args.mixture == "trajecotry_3d_robot_direct_overfit" or
             args.mixture == "trajectory_3d_direct_pick_and_place"
         )

@@ -402,6 +402,7 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None, pad_a
             stats_file=stats_file,
             output_format="flow_matching",
             frame_downsampling_ratio=10,
+            joint_names=['leftIndexFingerTip', 'rightIndexFingerTip'],
             trajectory_representation="delta", # default to be delta, as it works
             pad_action_chunk=pad_action_chunk,
             interpolation_times=interp
@@ -423,9 +424,9 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None, pad_a
         )
     elif dataset_name == "trossen_affordance" or dataset_name == "trossen_3d":
         # Trossen/LeRobot dataset with EE positions (run data/add_trossen_ee_to_dataset.py first)
-        data_root = os.environ.get("TROSSEN_DATA_DIR")
+        data_root = os.environ.get("TROSSEN_DATA_DIR", "/root/sky_workdir/FAR-affordance/trossen_data")
         repo_id = 'ykorkmaz/aloha_play_dataset_part_3' if os.environ.get("TROSSEN_REPO_ID", None) is None else os.environ.get("TROSSEN_REPO_ID", None)
-        ee_hdf5 = os.environ.get("TROSSEN_EE_HDF5", None)
+        ee_hdf5 = os.environ.get("TROSSEN_EE_HDF5", "/root/sky_workdir/FAR-affordance/trossen_ee_world.hdf5")
         stats_file = os.environ.get("TROSSEN_STATS_FILE", None)
         return TrossenAffordanceDataset(
             repo_id=repo_id,

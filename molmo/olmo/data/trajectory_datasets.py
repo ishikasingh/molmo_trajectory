@@ -142,21 +142,31 @@ class TrajectoryDataset(Dataset):
                 raise ValueError("stats_file must be provided when normalize_coordinates is True and output_2d_trajectory is False")
             print(f"Loading trajectory normalizationstats from {self.stats_file}...")
             stats = torch.load(self.stats_file)
-            self.stats_mean = stats["mean"]
-            self.stats_std = stats["std"]
+
+            # Default joint names matching data_formatter.py TRAJECTORY_KEYPOINTS
+            
+            self.joint_names = [
+                'leftThumbTip', 'leftIndexFingerTip', 'leftMiddleFingerTip', 'leftRingFingerTip', 'leftLittleFingerTip',
+                'rightThumbTip', 'rightIndexFingerTip', 'rightMiddleFingerTip', 'rightRingFingerTip', 'rightLittleFingerTip'
+            ]
+            if joint_names is None:
+                self.finger_indices = list(range(0, len(self.joint_names)))
+            else:
+                self.finger_indices = [self.joint_names.index(j) for j in joint_names if j in self.joint_names]
+
+            # Select only the index fingers from mean and std
+            # stats["mean"] is shape [30], reshape to (10,3), then select [1,6], then flatten to (6,)
+            self.stats_mean = stats["mean"].reshape(len(self.joint_names), 3)[self.finger_indices].reshape(-1)
+            self.stats_std = stats["std"].reshape(len(self.joint_names), 3)[self.finger_indices].reshape(-1)
+
+            
+
             # Ensure stats are on CPU/float
             if isinstance(self.stats_mean, torch.Tensor):
                 self.stats_mean = self.stats_mean.float()
                 self.stats_std = self.stats_std.float()
 
-        # Default joint names matching data_formatter.py TRAJECTORY_KEYPOINTS
-        if joint_names is None:
-            self.joint_names = [
-                'leftThumbTip', 'leftIndexFingerTip', 'leftMiddleFingerTip', 'leftRingFingerTip', 'leftLittleFingerTip',
-                'rightThumbTip', 'rightIndexFingerTip', 'rightMiddleFingerTip', 'rightRingFingerTip', 'rightLittleFingerTip'
-            ]
-        else:
-            self.joint_names = joint_names
+        
         
         print(f"Loading index mapping for {split} split...")
         self.index_mapping = self._build_index_mapping()
@@ -192,7 +202,7 @@ class TrajectoryDataset(Dataset):
             split_ok = cached_data.get('split') == self.split
             joint_names_ok = cached_data.get('joint_names') == self.joint_names
             pad_ok = cached_data.get('pad_action_chunk', False) == self.pad_action_chunk
-            if split_ok and horizon_match and joint_names_ok and pad_ok:
+            if split_ok and horizon_match and pad_ok: # and joint_names_ok:
                 full_index = cached_data['index_mapping']
                 print(f"Successfully loaded {len(full_index)} samples from cache")
                 if self.frame_downsampling_ratio > 1:
@@ -210,6 +220,7 @@ class TrajectoryDataset(Dataset):
             if not pad_ok:
                 mismatches.append(f"pad_action_chunk (cached={cached_data.get('pad_action_chunk', False)}, current={self.pad_action_chunk})")
             print(f"Cache configuration mismatch, rebuilding index. Mismatch: {', '.join(mismatches)}")
+            print(cached_data.get('joint_names'), self.joint_names)
         return None
     
     def _save_index_to_cache(self, index_mapping: List[Dict]) -> None:
@@ -299,7 +310,11 @@ class TrajectoryDataset(Dataset):
         # Process video files with progress bar
         for video_file in tqdm(all_video_files, desc="Building index mapping", unit="video"):
             hdf5_file = video_file.with_suffix('.hdf5')
-            if not hdf5_file.exists():
+            try: 
+                if not hdf5_file.exists():
+                    continue
+            except Exception as e:
+                print(f"    Error processing {video_file}: {e}")
                 continue
             
             # cap = cv2.VideoCapture(str(video_file))
@@ -395,6 +410,10 @@ class TrajectoryDataset(Dataset):
             final_trajectory = self._project_trajectory_to_2d(hdf5_path, mapping['frame_idx'], trajectory)
         else:
             final_trajectory = self._transform_trajectory_to_camera_frame(hdf5_path, mapping['frame_idx'], trajectory)
+
+        
+        final_trajectory = final_trajectory[:, [1, 6], :]
+        # print(f"final_trajectory shape: {final_trajectory.shape}")
         
         # Save initial state before converting to delta (if applicable)
         # The state should always be absolute position, even when predicting deltas
@@ -417,6 +436,8 @@ class TrajectoryDataset(Dataset):
             # stats shape: [num_joints * 3]
             
             num_steps, num_joints, coords = final_trajectory.shape
+
+
             
             # Reshape stats to match trajectory [1, num_joints, 3]
             mean = self.stats_mean.view(1, num_joints, coords)

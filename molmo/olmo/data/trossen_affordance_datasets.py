@@ -154,7 +154,9 @@ class TrossenAffordanceDataset(Dataset):
             self.repo_id,
             root=str(self.data_root) if self.data_root else None,
             episodes=self.episodes,
+            # video_backend="decord",
         )
+
 
         # Resolve EE HDF5 path
         if self.ee_hdf5_path is None:
