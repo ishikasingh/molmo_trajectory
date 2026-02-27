@@ -130,6 +130,10 @@ class TrajectoryDataset(Dataset):
         self.overfit_num_examples = type(self).overfit_num_examples
         self.load_images = load_images
         self.pad_action_chunk = pad_action_chunk
+        self.joint_names = [
+                'leftThumbTip', 'leftIndexFingerTip', 'leftMiddleFingerTip', 'leftRingFingerTip', 'leftLittleFingerTip',
+                'rightThumbTip', 'rightIndexFingerTip', 'rightMiddleFingerTip', 'rightRingFingerTip', 'rightLittleFingerTip'
+            ]
         
         assert output_format in ["text", "flow_matching"], f"output_format must be 'text' or 'flow_matching', got {output_format}"
         assert frame_downsampling_ratio >= 1, f"frame_downsampling_ratio must be >= 1, got {frame_downsampling_ratio}"
@@ -145,10 +149,7 @@ class TrajectoryDataset(Dataset):
 
             # Default joint names matching data_formatter.py TRAJECTORY_KEYPOINTS
             
-            self.joint_names = [
-                'leftThumbTip', 'leftIndexFingerTip', 'leftMiddleFingerTip', 'leftRingFingerTip', 'leftLittleFingerTip',
-                'rightThumbTip', 'rightIndexFingerTip', 'rightMiddleFingerTip', 'rightRingFingerTip', 'rightLittleFingerTip'
-            ]
+            
             if joint_names is None:
                 self.finger_indices = list(range(0, len(self.joint_names)))
             else:
