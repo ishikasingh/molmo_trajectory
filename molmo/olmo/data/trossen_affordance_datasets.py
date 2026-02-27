@@ -368,6 +368,7 @@ class TrossenAffordanceDataset(Dataset):
                 "image": image,
                 "frame_idx": global_idx,
                 "episode_idx": ep_idx,
+                "task_name": entry['task_name'],
                 "output_2d_trajectory": False,
                 "trajectory_representation": self.trajectory_representation,
                 "trajectory_dim": trajectory_flat.shape[-1],
