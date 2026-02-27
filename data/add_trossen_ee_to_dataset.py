@@ -294,6 +294,8 @@ def main():
         root=args.root,
         episodes=args.episodes,
     )
+
+    import ipdb; ipdb.set_trace()
     print(f"Loaded dataset: {len(dataset)} frames, {dataset.num_episodes} episodes.")
 
     urdf_path = args.urdf or _default_urdf_path()

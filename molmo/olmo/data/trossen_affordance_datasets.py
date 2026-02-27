@@ -232,7 +232,7 @@ class TrossenAffordanceDataset(Dataset):
                         "global_frame_idx": start + frame_in_ep,
                         "episode_idx": ep_idx,
                         "num_frames": n_frames,
-                        "task_name": self.lerobot_dataset.meta.episode_data[ep_idx]['task'],
+                        "task_name": self.lerobot_dataset.meta.episodes[ep_idx]['tasks'][0],
                     })
             else:
                 if n_frames < self.action_chunking_horizon:
@@ -242,7 +242,7 @@ class TrossenAffordanceDataset(Dataset):
                         "global_frame_idx": start + frame_in_ep,
                         "episode_idx": ep_idx,
                         "num_frames": n_frames,
-                        "task_name": self.lerobot_dataset.meta.episode_data[ep_idx]['task'],
+                        "task_name": self.lerobot_dataset.meta.episodes[ep_idx]['tasks'][0],
                     })
         return mapping
 
@@ -361,13 +361,12 @@ class TrossenAffordanceDataset(Dataset):
             "expert_type": 1,
             "robot_actions": robot_actions,
             "robot_states": robot_states,
-            "label": "Trossen task",
+            "label": entry['task_name'],
             "style": "trajectory_3d_fm",
             "metadata": {
                 "image": image,
                 "frame_idx": global_idx,
                 "episode_idx": ep_idx,
-                "task_name": entry['task_name'],
                 "output_2d_trajectory": False,
                 "trajectory_representation": self.trajectory_representation,
                 "trajectory_dim": trajectory_flat.shape[-1],
