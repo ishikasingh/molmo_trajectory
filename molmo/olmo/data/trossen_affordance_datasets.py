@@ -271,7 +271,6 @@ class TrossenAffordanceDataset(Dataset):
                         "global_frame_idx": start + frame_in_ep,
                         "episode_idx": ep_idx,
                         "num_frames": n_frames,
-                        "task_name": self.lerobot_dataset.meta.episodes[ep_idx]['tasks'][0],
                     })
         return mapping
 
