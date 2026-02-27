@@ -230,12 +230,13 @@ def run_fk_and_save(
 
 
 # Same defaults as lerobot/script/compute_fk_from_dataset.py
-DEFAULT_REPO_ID = "ykorkmaz/aloha_play_dataset_part_3"
+DEFAULT_REPO_ID = "ishika/aloha_play_dataset_part_3_with_fk_full_split"
+ROOT_DIR = "/root/sky_workdir/FAR-affordance/aloha_play_dataset_part_3_with_fk_full_split"
 
 
 def _default_urdf_path() -> Path:
     """Default URDF path: trossen_arm_description/urdf/generated/stationary_ai.urdf (sibling of this repo)."""
-    return Path(__file__).resolve().parent.parent.parent / "trossen_arm_description" / "urdf" / "generated" / "stationary_ai.urdf"
+    return 'data/stationary_ai.urdf'
 
 
 def _default_package_root() -> Path:
@@ -255,7 +256,7 @@ def main():
     parser.add_argument(
         "--root",
         type=str,
-        default=None,
+        default=ROOT_DIR,
         help="Path to local dataset root (if loading from disk instead of Hub).",
     )
     parser.add_argument(
@@ -304,7 +305,7 @@ def main():
         output_path = Path(args.output)
     else:
         # Default: same directory as dataset (local root or HF cache)
-        root = args.root or getattr(dataset.meta, "root", None)
+        root = args.root or ROOT_DIR
         root = Path(root) if root else Path.cwd()
         output_path = root / "trossen_ee_world.hdf5"
 

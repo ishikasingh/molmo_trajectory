@@ -27,6 +27,8 @@ from olmo.data import build_mm_preprocessor
 from olmo.config import ModelConfig
 from olmo.data.trajectory_datasets import TrajectoryDataset
 from olmo.data.robo_casa_affordance_datasets import RoboCasaTrajectoryDataset
+from olmo.data.trossen_affordance_datasets import TrossenAffordanceDataset
+
 
 
 def get_finger_colors() -> Dict[str, str]:
@@ -453,14 +455,19 @@ def load_test_examples(num_examples: int = 10,
             frame_downsampling_ratio=10,
         )
     elif dataset_type == "trossen":
+        data_root = os.environ.get("TROSSEN_DATA_DIR", "/root/sky_workdir/FAR-affordance/trossen_data")
+        repo_id = 'ykorkmaz/aloha_play_dataset_part_3' if os.environ.get("TROSSEN_REPO_ID", None) is None else os.environ.get("TROSSEN_REPO_ID", None)
+        ee_hdf5 = os.environ.get("TROSSEN_EE_HDF5", "/root/sky_workdir/FAR-affordance/trossen_ee_world.hdf5")
+        stats_file = os.environ.get("TROSSEN_STATS_FILE", None)
         dataset = TrossenAffordanceDataset(
-            repo_id='ykorkmaz/aloha_play_dataset_part_3',
-            data_root=os.environ.get("TROSSEN_DATA_DIR"),
-            ee_hdf5_path=os.environ.get("TROSSEN_DATA_DIR") / "trossen_ee_world.hdf5",
+            repo_id=repo_id,
+            data_root=data_root,
+            ee_hdf5_path=ee_hdf5,
             split=split,
             action_chunking_horizon=action_chunking_horizon,
             normalize_coordinates=True,
-            stats_file=os.environ.get("TROSSEN_STATS_FILE"),
+            stats_file=stats_file,
+            trajectory_representation="delta",
             frame_downsampling_ratio=3,
         )
     else:
@@ -1337,6 +1344,9 @@ def main():
             
         # Denormalize if stats available (before reshaping, as stats are flattened)
         if stats_mean is not None and stats_std is not None:
+            if stats_mean.shape[0] == 30:
+                stats_mean = stats_mean.reshape(10, 3)[[1, 6]].reshape(-1) # index finger
+                stats_std = stats_std.reshape(10, 3)[[1, 6]].reshape(-1) # index finger
             # pred_trajectory is (1, action_horizon, action_dim) or (batch_size, action_horizon, action_dim)
             # stats are (action_dim,)
             # Broadcast: (..., action_dim) * (action_dim,) + (action_dim,)
