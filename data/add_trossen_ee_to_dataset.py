@@ -295,6 +295,16 @@ def main():
         episodes=args.episodes,
     )
 
+    
+    for episode_idx in range(len(dataset.meta.episodes)):
+        # import ipdb; ipdb.set_trace()
+        print(dataset.meta.episodes[episode_idx]['tasks'][0], type(dataset.meta.episodes[episode_idx]['tasks'][0]))
+        if isinstance(dataset.meta.episodes[episode_idx]['tasks'][0], str):
+            print(True)
+        else:
+            print(False)
+            import ipdb; ipdb.set_trace()
+
     import ipdb; ipdb.set_trace()
     print(f"Loaded dataset: {len(dataset)} frames, {dataset.num_episodes} episodes.")
 
