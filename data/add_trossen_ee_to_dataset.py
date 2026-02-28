@@ -309,7 +309,7 @@ def main():
         # Default: same directory as dataset (local root or HF cache)
         root = args.root or ROOT_DIR
         root = Path(root) if root else Path.cwd()
-        output_path = root / "trossen_ee_world.hdf5"
+        output_path = root / "trossen_ee_world_test.hdf5"
 
     run_fk_and_save(
         dataset,
