@@ -37,7 +37,8 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 DEFAULT_CAMERA_KEY = "observation.images.cam_high"
 
 # Same default dataset as data/add_trossen_ee_to_dataset.py (and compute_fk_from_dataset.py)
-DEFAULT_REPO_ID = "ykorkmaz/aloha_play_dataset_part_3"
+# DEFAULT_REPO_ID = "ykorkmaz/aloha_play_dataset_part_3"
+DEFAULT_REPO_ID = "ishika/aloha_play_dataset_part_3_with_fk_full_split"
 STATE_KEY = "observation.state"
 
 # Camera intrinsics for head camera (same as lerobot/script/compute_fk_from_dataset.py)
@@ -325,19 +326,17 @@ class TrossenAffordanceDataset(Dataset):
 
         trajectory_flat = trajectory.reshape(trajectory.shape[0], -1).astype(np.float32)
 
-        # Future actions and robot states (one per future step, action_chunking_horizon total)
-        robot_actions = []
-        robot_states = []
-        for k in range(1, self.action_chunking_horizon + 1):
-            if global_idx + k < len(self.lerobot_dataset):
-                fut = self.lerobot_dataset[global_idx + k]
-                robot_actions.append(np.asarray(fut[ACTION_KEY], dtype=np.float32).ravel())
-                robot_states.append(np.asarray(fut[STATE_KEY], dtype=np.float32).ravel())
-            else:
-                break
-        if robot_actions:
-            robot_actions = np.stack(robot_actions, axis=0)
-            robot_states = np.stack(robot_states, axis=0)
+        # Future actions and robot states: read from parquet in one batch to avoid
+        # decoding the same episode video multiple times (LeRobot __getitem__ decodes
+        # video per call).
+        start_fut = global_idx + 1
+        end_fut = min(global_idx + self.action_chunking_horizon + 1, len(self.lerobot_dataset))
+        if start_fut < end_fut:
+            indices = list(range(start_fut, end_fut))
+            subset = self.lerobot_dataset.hf_dataset.select(indices)
+            _to_float32 = lambda x: np.asarray(x, dtype=np.float32).ravel()
+            robot_actions = np.stack([_to_float32(x) for x in subset[ACTION_KEY]])
+            robot_states = np.stack([_to_float32(x) for x in subset[STATE_KEY]])
             if self.pad_action_chunk and robot_actions.shape[0] < self.action_chunking_horizon:
                 robot_actions = np.concatenate([
                     robot_actions,
