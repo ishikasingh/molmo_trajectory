@@ -362,7 +362,7 @@ class TrossenAffordanceDataset(Dataset):
             "expert_type": 1,
             "robot_actions": robot_actions,
             "robot_states": robot_states,
-            "label": "Trossen task", #entry['task_name'], self.lerobot_dataset.meta.episodes[ep_idx]['tasks'][0]
+            "label": self.lerobot_dataset.meta.episodes[ep_idx]['tasks'][0], #entry['task_name'], 
             "style": "trajectory_3d_fm",
             "metadata": {
                 "image": image,

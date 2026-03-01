@@ -596,7 +596,7 @@ if __name__ == "__main__":
             pad_action_chunk=args.pad_action_chunk,
             drop_last=True,
             sequence_length=args.seq_len,
-            num_workers=24,  # Increased from 2 to 32 to enable parallel loading
+            num_workers=32,  # Increased from 2 to 32 to enable parallel loading
             pad="to_max",
             shuffle_messages=True,
             pin_memory=True,
