@@ -96,6 +96,31 @@ def _build_state_to_q_mapping(model: pin.Model, state_names: list[str]) -> list[
     return mapping
 
 
+def _load_states_bulk(hf_dataset, state_key: str, num_frames: int):
+    """
+    Load observation.state from the HuggingFace dataset in bulk and return
+    (num_frames, state_dim) float64 array. Uses one column read + in-memory conversion
+    instead of N separate __getitem__ calls.
+    """
+    if num_frames <= 0:
+        return np.zeros((0, 0), dtype=np.float64)
+    # Single column read: one I/O instead of N
+    col = hf_dataset[state_key]
+    # Handle list of tensors (e.g. from set_transform(hf_transform_to_torch))
+    if col and hasattr(col[0], "numpy"):
+        out = np.stack([np.asarray(x.numpy(), dtype=np.float64).ravel() for x in col])
+    else:
+        try:
+            out = np.asarray(col, dtype=np.float64)
+            if out.ndim == 1:
+                out = np.stack([np.asarray(x, dtype=np.float64).ravel() for x in col])
+            elif out.ndim > 2:
+                out = out.reshape(num_frames, -1)
+        except (ValueError, TypeError):
+            out = np.stack([np.asarray(x, dtype=np.float64).ravel() for x in col])
+    return out
+
+
 def _pose_from_se3(placement: pin.SE3) -> tuple[np.ndarray, np.ndarray]:
     """Extract position (3,) and quaternion xyzw (4,) from Pinocchio SE3 placement."""
     position = np.array(placement.translation).reshape(3)
@@ -191,15 +216,13 @@ def run_fk_and_save(
     head_pos = np.zeros((num_frames, 3), dtype=np.float64)
     head_quat = np.zeros((num_frames, 4), dtype=np.float64)
 
+    # Bulk-load all states in one column read (avoids N dataset[idx] calls)
+    states = _load_states_bulk(dataset.hf_dataset, state_key, num_frames)
+
     for idx in tqdm(range(num_frames), desc="FK", unit="frame"):
-        frame = dataset[idx]
-        state = frame[state_key]
-        if hasattr(state, "numpy"):
-            state = state.numpy()
-        state = np.asarray(state, dtype=np.float64)
+        state = states[idx]
         if state.ndim > 1:
             state = state.ravel()
-
         pose = compute_fk_for_frame(
             model, data, state, state_names, state_to_q, frame_ids
         )
@@ -231,12 +254,13 @@ def run_fk_and_save(
 
 # Same defaults as lerobot/script/compute_fk_from_dataset.py
 DEFAULT_REPO_ID = "ishika/aloha_play_dataset_part_3_with_fk_full_split"
-ROOT_DIR = "/root/sky_workdir/FAR-affordance/aloha_play_dataset_part_3_with_fk_full_split"
+# ROOT_DIR = "/root/sky_workdir/FAR-affordance/aloha_play_dataset_part_3_with_fk_full_split"
+ROOT_DIR = "/home/ishikasi/.cache/huggingface/lerobot/ishika/aloha_play_dataset_part_3_with_fk_full_split"
 
 
 def _default_urdf_path() -> Path:
     """Default URDF path: trossen_arm_description/urdf/generated/stationary_ai.urdf (sibling of this repo)."""
-    return 'data/stationary_ai.urdf'
+    return '/home/ishikasi/lab42/src/FAR-affordance/data/stationary_ai.urdf'
 
 
 def _default_package_root() -> Path:
@@ -305,7 +329,7 @@ def main():
             print(False)
             import ipdb; ipdb.set_trace()
 
-    import ipdb; ipdb.set_trace()
+    # import ipdb; ipdb.set_trace()
     print(f"Loaded dataset: {len(dataset)} frames, {dataset.num_episodes} episodes.")
 
     urdf_path = args.urdf or _default_urdf_path()

@@ -10,6 +10,13 @@ At each sample frame we provide:
   - Future action sequence
   - Future end-effector position sequence (in current frame's camera frame)
 
+Normalization: Unlike EgoDex or RoboCasa, this is a small dataset; normalization stats (mean, variance/std,
+min, max) are computed online in __init__ when normalize_coordinates=True and no stats_file is provided.
+You can still pass a precomputed stats file (e.g. from compute_trajectory_stats.py) if desired.
+
+Frame alignment: The EE HDF5 must be produced by data/add_trossen_ee_to_dataset.py from the same
+LeRobot dataset (same repo_id, data_root, and episodes). HDF5 row index i = LeRobot global frame index i.
+
 Requires: lerobot, and an HDF5 of EE positions produced by data/add_trossen_ee_to_dataset.py.
 """
 
@@ -117,7 +124,8 @@ class TrossenAffordanceDataset(Dataset):
             action_chunking_horizon: Number of future steps.
             camera_key: Observation key for images (default: observation.images.cam_high).
             normalize_coordinates: Whether to normalize EE coordinates (e.g. with stats).
-            stats_file: Path to stats for normalization.
+            stats_file: Path to stats for normalization (optional). If not provided and
+                normalize_coordinates=True, stats (mean, std, min, max) are computed online in __init__.
             trajectory_representation: 'absolute' or 'delta'.
             load_images: Whether to load images.
             frame_downsampling_ratio: Sample every n frames.
@@ -170,20 +178,16 @@ class TrossenAffordanceDataset(Dataset):
                 "Run data/add_trossen_ee_to_dataset.py first."
             )
 
-        # Normalization stats (optional)
+        # Normalization stats (optional). For small Trossen dataset we compute online in __init__
+        # when normalize_coordinates=True and no stats_file is provided.
         self.trajectory_stats_mean = None
         self.trajectory_stats_std = None
+        self.trajectory_stats_min = None
+        self.trajectory_stats_max = None
         self.robot_action_stats_mean = None
         self.robot_action_stats_std = None
-        if self.normalize_coordinates and self.stats_file and os.path.exists(self.stats_file):
-            stats = torch.load(self.stats_file)
-            if "mean" in stats and "std" in stats:
-                self.trajectory_stats_mean = torch.tensor(stats["mean"]).float()
-                self.trajectory_stats_std = torch.tensor(stats["std"]).float()
-            if "robot_action_stats" in stats:
-                ra = stats["robot_action_stats"]
-                self.robot_action_stats_mean = torch.tensor(ra["mean"]).float()
-                self.robot_action_stats_std = torch.tensor(ra["std"]).float()
+        self.robot_action_stats_min = None
+        self.robot_action_stats_max = None
 
         # Build flat index: list of {global_frame_idx, episode_idx, num_frames}
         self.index_mapping = self._build_index_mapping()
@@ -193,6 +197,28 @@ class TrossenAffordanceDataset(Dataset):
                 e for e in self.index_mapping
                 if (e["global_frame_idx"] - self._episode_start(e["episode_idx"])) % self.frame_downsampling_ratio == 0
             ]
+
+        # Normalization stats (optional). For small Trossen dataset we compute online when
+        # normalize_coordinates=True and no stats_file is provided.
+        if self.normalize_coordinates:
+            if self.stats_file and os.path.exists(self.stats_file):
+                stats = torch.load(self.stats_file)
+                if "mean" in stats and "std" in stats:
+                    self.trajectory_stats_mean = torch.tensor(stats["mean"]).float()
+                    self.trajectory_stats_std = torch.tensor(stats["std"]).float()
+                if "min" in stats and "max" in stats:
+                    self.trajectory_stats_min = torch.tensor(stats["min"]).float()
+                    self.trajectory_stats_max = torch.tensor(stats["max"]).float()
+                if "robot_action_stats" in stats:
+                    ra = stats["robot_action_stats"]
+                    self.robot_action_stats_mean = torch.tensor(ra["mean"]).float()
+                    self.robot_action_stats_std = torch.tensor(ra["std"]).float()
+                    if "min" in ra and "max" in ra:
+                        self.robot_action_stats_min = torch.tensor(ra["min"]).float()
+                        self.robot_action_stats_max = torch.tensor(ra["max"]).float()
+            else:
+                # Small dataset: compute mean, variance (std), min, max online
+                self._compute_normalization_stats_online()
 
         print(
             f"[TrossenAffordanceDataset] {self.split}: {len(self.index_mapping)} samples, "
@@ -249,6 +275,111 @@ class TrossenAffordanceDataset(Dataset):
                     })
         return mapping
 
+    def _compute_normalization_stats_online(self) -> None:
+        """
+        Compute normalization stats (mean, std, min, max) over all samples in index_mapping.
+        Used for the small Trossen dataset so we don't need a precomputed stats file.
+        """
+        all_trajectories: List[np.ndarray] = []
+        all_robot_actions: List[np.ndarray] = []
+        _to_float32 = lambda x: np.asarray(x, dtype=np.float32).ravel()
+
+        with _hdf5_with_retry(str(self.ee_hdf5_path)) as f:
+            for entry in tqdm(self.index_mapping, desc="Computing trajectory/action stats"):
+                global_idx = entry["global_frame_idx"]
+                ep_idx = entry["episode_idx"]
+                num_frames = entry["num_frames"]
+                ep_start = self._episode_start(ep_idx)
+
+                head_pos = np.asarray(f["head_camera_position"][global_idx])
+                head_quat = np.asarray(f["head_camera_quat_xyzw"][global_idx])
+                n_future = min(
+                    self.action_chunking_horizon,
+                    num_frames - (global_idx - ep_start) - 1,
+                )
+                left_ee_fut = f["left_ee_position"][global_idx + 1:global_idx + 1 + n_future]
+                right_ee_fut = f["right_ee_position"][global_idx + 1:global_idx + 1 + n_future]
+
+                trajectory_list = []
+                for i in range(left_ee_fut.shape[0]):
+                    left_cam = _world_to_camera(
+                        np.asarray(left_ee_fut[i]), head_pos, head_quat
+                    )
+                    right_cam = _world_to_camera(
+                        np.asarray(right_ee_fut[i]), head_pos, head_quat
+                    )
+                    trajectory_list.append(np.concatenate([left_cam, right_cam]))
+                trajectory = np.stack(trajectory_list, axis=0).astype(np.float32)
+
+                if self.pad_action_chunk and trajectory.shape[0] < self.action_chunking_horizon:
+                    pad = np.repeat(
+                        trajectory[-1:],
+                        self.action_chunking_horizon - trajectory.shape[0],
+                        axis=0,
+                    )
+                    trajectory = np.concatenate([trajectory, pad], axis=0)
+
+                if self.trajectory_representation == "delta":
+                    deltas = trajectory[1:] - trajectory[:-1]
+                    trajectory = np.concatenate([deltas, deltas[-1:]], axis=0)
+
+                all_trajectories.append(trajectory.reshape(-1, trajectory.shape[-1]))
+
+                start_fut = global_idx + 1
+                end_fut = min(
+                    global_idx + self.action_chunking_horizon + 1,
+                    len(self.lerobot_dataset),
+                )
+                if start_fut < end_fut:
+                    indices = list(range(start_fut, end_fut))
+                    subset = self.lerobot_dataset.hf_dataset.select(indices)
+                    robot_actions = np.stack(
+                        [_to_float32(x) for x in subset[ACTION_KEY]]
+                    )
+                    if self.pad_action_chunk and robot_actions.shape[0] < self.action_chunking_horizon:
+                        robot_actions = np.concatenate([
+                            robot_actions,
+                            np.repeat(
+                                robot_actions[-1:],
+                                self.action_chunking_horizon - robot_actions.shape[0],
+                                axis=0,
+                            ),
+                        ], axis=0)
+                else:
+                    state_dim = len(_to_float32(self.lerobot_dataset[global_idx][STATE_KEY]))
+                    robot_actions = np.zeros(
+                        (self.action_chunking_horizon, state_dim), dtype=np.float32
+                    )
+                all_robot_actions.append(robot_actions)
+
+        if all_trajectories:
+            traj_data = np.concatenate(all_trajectories, axis=0)
+            self.trajectory_stats_mean = torch.from_numpy(
+                np.mean(traj_data, axis=0)
+            ).float()
+            traj_std = np.std(traj_data, axis=0)
+            traj_std[traj_std < 1e-8] = 1.0
+            self.trajectory_stats_std = torch.from_numpy(traj_std).float()
+            self.trajectory_stats_min = torch.from_numpy(np.min(traj_data, axis=0)).float()
+            self.trajectory_stats_max = torch.from_numpy(np.max(traj_data, axis=0)).float()
+            print(
+                f"[TrossenAffordanceDataset] Online trajectory stats: mean/std/min/max from {len(all_trajectories)} samples"
+            )
+
+        if all_robot_actions:
+            ra_data = np.concatenate(all_robot_actions, axis=0)
+            self.robot_action_stats_mean = torch.from_numpy(
+                np.mean(ra_data, axis=0)
+            ).float()
+            ra_std = np.std(ra_data, axis=0)
+            ra_std[ra_std < 1e-8] = 1.0
+            self.robot_action_stats_std = torch.from_numpy(ra_std).float()
+            self.robot_action_stats_min = torch.from_numpy(np.min(ra_data, axis=0)).float()
+            self.robot_action_stats_max = torch.from_numpy(np.max(ra_data, axis=0)).float()
+            print(
+                f"[TrossenAffordanceDataset] Online robot action stats: mean/std/min/max from {len(all_robot_actions)} samples"
+            )
+
     def __len__(self) -> int:
         return len(self.index_mapping)
 
@@ -279,6 +410,7 @@ class TrossenAffordanceDataset(Dataset):
             image = Image.fromarray(np.zeros((1, 1, 3), dtype=np.uint8))
 
         # Load EE and camera pose from HDF5 (current frame's camera pose for all transforms)
+        # HDF5 index = LeRobot global frame index (same as in add_trossen_ee_to_dataset.py).
         with _hdf5_with_retry(str(self.ee_hdf5_path)) as f:
             head_pos = np.asarray(f["head_camera_position"][global_idx])
             head_quat = np.asarray(f["head_camera_quat_xyzw"][global_idx])
@@ -325,10 +457,10 @@ class TrossenAffordanceDataset(Dataset):
             trajectory = trajectory.numpy()
 
         trajectory_flat = trajectory.reshape(trajectory.shape[0], -1).astype(np.float32)
+        trajectory_shape = trajectory_flat.shape
 
         # Future actions and robot states: read from parquet in one batch to avoid
-        # decoding the same episode video multiple times (LeRobot __getitem__ decodes
-        # video per call).
+        # decoding the same episode video multiple times (LeRobot __getitem__ decodes video per call).
         start_fut = global_idx + 1
         end_fut = min(global_idx + self.action_chunking_horizon + 1, len(self.lerobot_dataset))
         if start_fut < end_fut:
@@ -356,9 +488,9 @@ class TrossenAffordanceDataset(Dataset):
 
         result = {
             "image": image,
-            "state": initial_ee.astype(np.float32),
+            "state": initial_ee,
             "trajectory_target": trajectory_flat,
-            "trajectory_shape": trajectory_flat.shape,
+            "trajectory_shape": trajectory_shape,
             "expert_type": 1,
             "robot_actions": robot_actions,
             "robot_states": robot_states,
@@ -434,39 +566,53 @@ def visualize_ee_trajectory_on_frame(
     horizon: int | None = None,
 ) -> Path:
     """
-    Load one sample, project current + future EE positions (in current camera frame) onto the image, and save.
+    Load one sample from the dataset, denormalize if needed, project current + future EE positions
+    (in camera frame) onto the image, and save.
     Left EE: blue, right EE: red. Current position = filled circle, future trajectory = line + points.
     """
     import cv2
 
-    horizon = horizon or dataset.action_chunking_horizon
-    entry = dataset.index_mapping[sample_idx]
-    global_idx = entry["global_frame_idx"]
-    ep_idx = entry["episode_idx"]
-    num_frames = entry["num_frames"]
-    ep_start = dataset._episode_start(ep_idx)
-
-    # Current image
-    item = dataset.lerobot_dataset[global_idx]
-    img = item[dataset.camera_key]
-    img = _image_to_numpy_uint8(img)
+    rng = np.random.default_rng(42)
+    sample = dataset.get(sample_idx, rng)
+    image = sample["image"]
+    img = _image_to_numpy_uint8(image)
     h, w = img.shape[:2]
 
-    # EE and camera pose from HDF5 (current frame's camera for all transforms)
-    with _hdf5_with_retry(str(dataset.ee_hdf5_path)) as f:
-        head_pos = np.asarray(f["head_camera_position"][global_idx])
-        head_quat = np.asarray(f["head_camera_quat_xyzw"][global_idx])
-        n_steps = min(horizon + 1, num_frames - (global_idx - ep_start))
-        left_ee_world = f["left_ee_position"][global_idx:global_idx + n_steps]
-        right_ee_world = f["right_ee_position"][global_idx:global_idx + n_steps]
+    # EE positions in camera frame (6D = left_xyz + right_xyz).
+    # state is always raw (current frame); trajectory may be normalized when dataset uses normalize_coordinates.
+    state = np.asarray(sample["state"], dtype=np.float64).ravel()  # (6,)
+    trajectory = np.asarray(sample["trajectory_target"], dtype=np.float64)  # (T, 6)
+    if trajectory.ndim == 1:
+        trajectory = trajectory.reshape(1, -1)
 
-    # Transform to current frame's camera and project to 2D
-    left_uvs, right_uvs = [], []
-    for i in range(left_ee_world.shape[0]):
-        left_cam = _world_to_camera(np.asarray(left_ee_world[i]), head_pos, head_quat)
-        right_cam = _world_to_camera(np.asarray(right_ee_world[i]), head_pos, head_quat)
-        left_uv = _project_camera_frame_to_image(left_cam, fx, fy, cx, cy)
-        right_uv = _project_camera_frame_to_image(right_cam, fx, fy, cx, cy)
+    # Denormalize only the trajectory for display (state is never normalized)
+    if dataset.trajectory_stats_mean is not None and dataset.trajectory_stats_std is not None:
+        mean = dataset.trajectory_stats_mean.numpy()
+        std = dataset.trajectory_stats_std.numpy()
+        trajectory = trajectory * std + mean
+
+    rep = sample["metadata"].get("trajectory_representation", "absolute")
+    if rep == "delta":
+        # trajectory is (T, 6) deltas: trajectory[t] = pos[t+1] - pos[t]. Integrate from current state.
+        trajectory = state.reshape(1, 6) + np.cumsum(trajectory, axis=0)  # (T, 6) absolute
+
+    # Current: state is (6,) = left_xyz (3) + right_xyz (3)
+    left_cam_current = state[0:3]
+    right_cam_current = state[3:6]
+    # Future: trajectory is now (T, 6) absolute in both modes
+    left_cam_future = trajectory[:, 0:3]  # (T, 3)
+    right_cam_future = trajectory[:, 3:6]  # (T, 3)
+
+    # Build lists of 3D points: current + future for each arm
+    left_points = np.concatenate([left_cam_current.reshape(1, 3), left_cam_future], axis=0)
+    right_points = np.concatenate([right_cam_current.reshape(1, 3), right_cam_future], axis=0)
+
+    # Project to image
+    left_uvs = []
+    right_uvs = []
+    for i in range(left_points.shape[0]):
+        left_uv = _project_camera_frame_to_image(left_points[i], fx, fy, cx, cy)
+        right_uv = _project_camera_frame_to_image(right_points[i], fx, fy, cx, cy)
         if left_uv and 0 <= left_uv[0] < w and 0 <= left_uv[1] < h:
             left_uvs.append(left_uv)
         if right_uv and 0 <= right_uv[0] < w and 0 <= right_uv[1] < h:
@@ -475,7 +621,6 @@ def visualize_ee_trajectory_on_frame(
     # Draw: left = blue, right = red (cv2 uses BGR)
     vis = img.copy()
     if vis.shape[2] == 3:
-        # Ensure BGR for cv2 drawing (dataset image may be RGB)
         vis = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
     left_bgr = (255, 0, 0)   # blue
     right_bgr = (0, 0, 255)  # red
@@ -499,7 +644,7 @@ def visualize_ee_trajectory_on_frame(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(output_path), cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
-    print(f"Saved EE trajectory visualization to {output_path} (sample_idx={sample_idx}, frame={global_idx})")
+    print(f"Saved EE trajectory visualization to {output_path} (sample_idx={sample_idx}, frame={sample['metadata']['frame_idx']})")
     return output_path
 
 
@@ -523,11 +668,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ee_hdf5",
         type=str,
-        default=None,
+        default="/home/ishikasi/.cache/huggingface/lerobot/ishika/aloha_play_dataset_part_3_with_fk_full_split/trossen_ee_world_test.hdf5",
         help="Path to trossen_ee_world.hdf5; default: <data_root>/trossen_ee_world.hdf5",
     )
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--horizon", type=int, default=30)
+    parser.add_argument(
+        "--trajectory_representation",
+        type=str,
+        choices=("absolute", "delta"),
+        default="delta",
+        help="Trajectory representation (default: absolute); delta integrates to absolute for viz",
+    )
     parser.add_argument("--sample_idx", type=int, default=30, help="Dataset sample index to visualize")
     parser.add_argument("--output", type=str, default="trossen_ee_vis.png", help="Output image path")
     parser.add_argument("--fx", type=float, default=DEFAULT_FX, help="Camera focal length x")
@@ -544,7 +696,8 @@ if __name__ == "__main__":
         ee_hdf5_path=args.ee_hdf5,
         split=args.split,
         action_chunking_horizon=args.horizon,
-        trajectory_representation="absolute",  # viz uses raw camera-frame positions from HDF5
+        trajectory_representation=args.trajectory_representation,
+        normalize_coordinates=True,
     )
     print(f"Dataset length: {len(ds)}")
     if len(ds) == 0:
