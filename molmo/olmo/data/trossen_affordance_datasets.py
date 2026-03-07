@@ -202,13 +202,15 @@ class TrossenAffordanceDataset(Dataset):
         # normalize_coordinates=True and no stats_file is provided.
         if self.normalize_coordinates:
             if self.stats_file and os.path.exists(self.stats_file):
-                stats = torch.load(self.stats_file)
-                if "mean" in stats and "std" in stats:
-                    self.trajectory_stats_mean = torch.tensor(stats["mean"]).float()
-                    self.trajectory_stats_std = torch.tensor(stats["std"]).float()
-                if "min" in stats and "max" in stats:
-                    self.trajectory_stats_min = torch.tensor(stats["min"]).float()
-                    self.trajectory_stats_max = torch.tensor(stats["max"]).float()
+                import json
+                with open(self.stats_file, "r") as f:
+                    stats = json.load(f)
+                if "trajectory_stats_mean" in stats and "trajectory_stats_std" in stats:
+                    self.trajectory_stats_mean = torch.tensor(stats["trajectory_stats_mean"]).float()
+                    self.trajectory_stats_std = torch.tensor(stats["trajectory_stats_std"]).float()
+                if "trajectory_stats_min" in stats and "trajectory_stats_max" in stats:
+                    self.trajectory_stats_min = torch.tensor(stats["trajectory_stats_min"]).float()
+                    self.trajectory_stats_max = torch.tensor(stats["trajectory_stats_max"]).float()
                 if "robot_action_stats" in stats:
                     ra = stats["robot_action_stats"]
                     self.robot_action_stats_mean = torch.tensor(ra["mean"]).float()
@@ -364,6 +366,22 @@ class TrossenAffordanceDataset(Dataset):
             print(
                 f"[TrossenAffordanceDataset] Online trajectory stats: mean/std/min/max from {len(all_trajectories)} samples"
             )
+        # Save normalization statistics to a file in the data root if needed
+        if getattr(self, "data_root", None) is not None:
+            stats = {
+                "trajectory_stats_mean": self.trajectory_stats_mean.tolist() if hasattr(self, "trajectory_stats_mean") else None,
+                "trajectory_stats_std": self.trajectory_stats_std.tolist() if hasattr(self, "trajectory_stats_std") else None,
+                "trajectory_stats_min": self.trajectory_stats_min.tolist() if hasattr(self, "trajectory_stats_min") else None,
+                "trajectory_stats_max": self.trajectory_stats_max.tolist() if hasattr(self, "trajectory_stats_max") else None,
+            }
+            stats_path = Path(self.data_root) / "trajectory_stats.json"
+            try:
+                import json
+                with open(stats_path, "w") as f:
+                    json.dump(stats, f, indent=2)
+                print(f"[TrossenAffordanceDataset] Saved normalization stats to {stats_path}")
+            except Exception as e:
+                print(f"[TrossenAffordanceDataset] Warning: Failed to save normalization stats to {stats_path}: {e}")
 
         if all_robot_actions:
             ra_data = np.concatenate(all_robot_actions, axis=0)
@@ -672,15 +690,18 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     data_root = args.data_root if args.data_root is not None else _default_data_root()
-
+    args.ee_hdf5 = f"{args.data_root}/trossen_ee_world.hdf5"
     ds = TrossenAffordanceDataset(
         repo_id=args.repo_id,
         data_root=data_root,
         ee_hdf5_path=args.ee_hdf5,
         split=args.split,
+        stats_file=f"{args.data_root}/trajectory_stats.json",
         action_chunking_horizon=args.horizon,
-        trajectory_representation="absolute",  # viz uses raw camera-frame positions from HDF5
+        normalize_coordinates=True,
+        trajectory_representation="delta",  # viz uses raw camera-frame positions from HDF5
     )
+    import ipdb; ipdb.set_trace()
     print(f"Dataset length: {len(ds)}")
     if len(ds) == 0:
         print("No samples; run add_trossen_ee_to_dataset.py first.")

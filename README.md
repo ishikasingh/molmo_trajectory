@@ -28,8 +28,10 @@ PYTHONPATH=. torchrun --nproc-per-node 6 --nnodes=${SKYPILOT_NUM_NODES} --node_r
 PYTHONPATH=. torchrun --nproc-per-node 6 --nnodes=${SKYPILOT_NUM_NODES} --node_rank=${SKYPILOT_NODE_RANK} --rdzv_id=311 --rdzv_endpoint=${SKYPILOT_MASTER_ADDR}:29500 launch_scripts/train_affordance.py 
  checkpoints/Molmo-7B-D-0924 --save_folder=finetuned_checkpoints_3d_traj_trossen_only_train --save_overwrite --wandb.name=trosson_3d_direct_0065 --wandb.entity=ishikasi --wandb.project=affordance --global_batch_size $((SKYPILOT_NUM_NODES*6*12)) --device_train_batch_size 12 --device_eval_batch_size 1 --seq_len 500 --action_horizon 30 --max_crops 2 --flow_matching_prediction_type=x0 --freeze_vlm
 
+<!-- trossen_3d_direct -->
+
 export num_gpus=$(nvidia-smi -L | wc -l)
-PYTHONPATH=. torchrun --nproc-per-node $num_gpus --nnodes=${SKYPILOT_NUM_NODES} --node_rank=${SKYPILOT_NODE_RANK} --rdzv_id=311 --rdzv_endpoint=${SKYPILOT_MASTER_ADDR}:29500 launch_scripts/train_affordance.py  trajectory_3d_trossen_action_direct checkpoints/Molmo-7B-D-0924 --save_folder=finetuned_checkpoints_3d_traj_trossen_human_labelled_train --save_overwrite --wandb.name=trosson_human_3d_direct_labelled_0065 --wandb.entity=ishikasi --wandb.project=affordance --global_batch_size $((SKYPILOT_NUM_NODES*$num_gpus*12)) --device_train_batch_size 12 --device_eval_batch_size 1 --seq_len 500 --action_horizon 30 --max_crops 2 --flow_matching_prediction_type=x0 --freeze_vlm
+PYTHONPATH=. torchrun --nproc-per-node $num_gpus --nnodes=${SKYPILOT_NUM_NODES} --node_rank=${SKYPILOT_NODE_RANK} --rdzv_id=311 --rdzv_endpoint=${SKYPILOT_MASTER_ADDR}:29500 launch_scripts/train_affordance.py  trajectory_3d_trossen_direct checkpoints/Molmo-7B-D-0924 --save_folder=finetuned_checkpoints_3d_traj_trossen_human_labelled_train --save_overwrite --wandb.name=trosson_human_3d_direct_labelled_0065 --wandb.entity=ishikasi --wandb.project=affordance --global_batch_size $((SKYPILOT_NUM_NODES*$num_gpus*12)) --device_train_batch_size 12 --device_eval_batch_size 1 --seq_len 500 --action_horizon 30 --max_crops 2 --flow_matching_prediction_type=x0 --freeze_vlm
 
 
 ```
