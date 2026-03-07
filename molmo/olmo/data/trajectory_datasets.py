@@ -388,7 +388,7 @@ class TrajectoryDataset(Dataset):
     def __len__(self):
         return len(self.index_mapping)
     
-    def get(self, idx, rng):
+    def get(self, idx):
         """Get a single training example."""
         mapping = self.index_mapping[idx]
         
@@ -412,8 +412,8 @@ class TrajectoryDataset(Dataset):
         else:
             final_trajectory = self._transform_trajectory_to_camera_frame(hdf5_path, mapping['frame_idx'], trajectory)
 
-        
-        final_trajectory = final_trajectory[:, [1, 6], :]
+        trajectory_absolute_cam = final_trajectory
+        # final_trajectory = final_trajectory[:, [1, 6], :]
         # print(f"final_trajectory shape: {final_trajectory.shape}")
         
         # Save initial state before converting to delta (if applicable)
@@ -478,6 +478,7 @@ class TrajectoryDataset(Dataset):
                 'frame_idx': mapping['frame_idx'],
                 'output_2d_trajectory': self.output_2d_trajectory,
                 'trajectory_representation': self.trajectory_representation,
+                'trajectory_absolute_cam': trajectory_absolute_cam,
             }
         }
         
@@ -947,8 +948,13 @@ def build_and_save_index_offline(
         joint_names=joint_names,
         frame_downsampling_ratio=1,
         pad_action_chunk=pad_action_chunk,
+        output_format="flow_matching",
+        output_2d_trajectory=False,
+        stats_file=os.environ.get("TRAJECTORY_STATS_FILE"),
+        trajectory_representation="delta",
     )
-    
+
+    import ipdb; ipdb.set_trace()
     if force_rebuild:
         cache_file = dataset._get_cache_filepath()
         if cache_file.exists():

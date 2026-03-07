@@ -441,6 +441,8 @@ class TrossenAffordanceDataset(Dataset):
             pad = np.repeat(trajectory[-1:], self.action_chunking_horizon - trajectory.shape[0], axis=0)
             trajectory = np.concatenate([trajectory, pad], axis=0)
 
+        trajectory_absolute_cam = trajectory.copy()
+
         # Delta representation if requested
         if self.trajectory_representation == "delta":
             deltas = trajectory[1:] - trajectory[:-1]
@@ -505,6 +507,7 @@ class TrossenAffordanceDataset(Dataset):
                 "trajectory_dim": trajectory_flat.shape[-1],
                 "robot_action_dim": robot_actions.shape[-1],
                 "robot_state_dim": robot_states.shape[-1],
+                "trajectory_absolute_cam": trajectory_absolute_cam,
             },
         }
         return result
@@ -578,41 +581,21 @@ def visualize_ee_trajectory_on_frame(
     img = _image_to_numpy_uint8(image)
     h, w = img.shape[:2]
 
-    # EE positions in camera frame (6D = left_xyz + right_xyz).
-    # state is always raw (current frame); trajectory may be normalized when dataset uses normalize_coordinates.
-    state = np.asarray(sample["state"], dtype=np.float64).ravel()  # (6,)
-    trajectory = np.asarray(sample["trajectory_target"], dtype=np.float64)  # (T, 6)
-    if trajectory.ndim == 1:
-        trajectory = trajectory.reshape(1, -1)
+    # EE and camera pose from HDF5 (current frame's camera for all transforms)
+    with _hdf5_with_retry(str(dataset.ee_hdf5_path)) as f:
+        head_pos = np.asarray(f["head_camera_position"][global_idx])
+        head_quat = np.asarray(f["head_camera_quat_xyzw"][global_idx])
+        n_steps = min(horizon + 1, num_frames - (global_idx - ep_start))
+        left_ee_world = f["left_ee_position"][global_idx:global_idx + n_steps]
+        right_ee_world = f["right_ee_position"][global_idx:global_idx + n_steps]
 
-    # Denormalize only the trajectory for display (state is never normalized)
-    if dataset.trajectory_stats_mean is not None and dataset.trajectory_stats_std is not None:
-        mean = dataset.trajectory_stats_mean.numpy()
-        std = dataset.trajectory_stats_std.numpy()
-        trajectory = trajectory * std + mean
-
-    rep = sample["metadata"].get("trajectory_representation", "absolute")
-    if rep == "delta":
-        # trajectory is (T, 6) deltas: trajectory[t] = pos[t+1] - pos[t]. Integrate from current state.
-        trajectory = state.reshape(1, 6) + np.cumsum(trajectory, axis=0)  # (T, 6) absolute
-
-    # Current: state is (6,) = left_xyz (3) + right_xyz (3)
-    left_cam_current = state[0:3]
-    right_cam_current = state[3:6]
-    # Future: trajectory is now (T, 6) absolute in both modes
-    left_cam_future = trajectory[:, 0:3]  # (T, 3)
-    right_cam_future = trajectory[:, 3:6]  # (T, 3)
-
-    # Build lists of 3D points: current + future for each arm
-    left_points = np.concatenate([left_cam_current.reshape(1, 3), left_cam_future], axis=0)
-    right_points = np.concatenate([right_cam_current.reshape(1, 3), right_cam_future], axis=0)
-
-    # Project to image
-    left_uvs = []
-    right_uvs = []
-    for i in range(left_points.shape[0]):
-        left_uv = _project_camera_frame_to_image(left_points[i], fx, fy, cx, cy)
-        right_uv = _project_camera_frame_to_image(right_points[i], fx, fy, cx, cy)
+    # Transform to current frame's camera and project to 2D
+    left_uvs, right_uvs = [], []
+    for i in range(left_ee_world.shape[0]):
+        left_cam = _world_to_camera(np.asarray(left_ee_world[i]), head_pos, head_quat)
+        right_cam = _world_to_camera(np.asarray(right_ee_world[i]), head_pos, head_quat)
+        left_uv = _project_camera_frame_to_image(left_cam, fx, fy, cx, cy)
+        right_uv = _project_camera_frame_to_image(right_cam, fx, fy, cx, cy)
         if left_uv and 0 <= left_uv[0] < w and 0 <= left_uv[1] < h:
             left_uvs.append(left_uv)
         if right_uv and 0 <= right_uv[0] < w and 0 <= right_uv[1] < h:
@@ -696,8 +679,7 @@ if __name__ == "__main__":
         ee_hdf5_path=args.ee_hdf5,
         split=args.split,
         action_chunking_horizon=args.horizon,
-        trajectory_representation=args.trajectory_representation,
-        normalize_coordinates=True,
+        trajectory_representation="absolute",  # viz uses raw camera-frame positions from HDF5
     )
     print(f"Dataset length: {len(ds)}")
     if len(ds) == 0:

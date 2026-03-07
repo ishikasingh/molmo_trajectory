@@ -298,13 +298,13 @@ if __name__ == "__main__":
     elif args.mixture == "trajectory_3d_trossen_direct":
         # EgoDex (human) + Trossen (robot) trajectory prediction with direct regression
         eval_tasks = []
-        tasks = [["egodex", ["trajectory_3d"], 0.8],
-                 ["trossen", ["trossen_3d"], 0.2]]
+        tasks = [["egodex", ["trajectory_3d"], 0.6],
+                 ["trossen", ["trossen_3d"], 0.4]]
     elif args.mixture == "trajectory_3d_trossen_action_direct":
         # EgoDex (human) + Trossen (robot) trajectory prediction with direct regression
         eval_tasks = []
-        tasks = [["egodex", ["trajectory_3d"], 0.8],
-                 ["trossen", ["trossen_action"], 0.2]]
+        tasks = [["egodex", ["trajectory_3d"], 0.6],
+                 ["trossen", ["trossen_action"], 0.4]]
     elif args.mixture == "trossen_3d_direct":
         # Trossen (robot) trajectory prediction with direct regression
         eval_tasks = []
