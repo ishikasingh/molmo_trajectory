@@ -501,7 +501,7 @@ class TrossenAffordanceDataset(Dataset):
                 "image": image,
                 "frame_idx": global_idx,
                 "episode_idx": ep_idx,
-                "task_name": entry['task_name'],
+                "task_name": self.lerobot_dataset.meta.episodes[ep_idx]['tasks'][0],
                 "output_2d_trajectory": False,
                 "trajectory_representation": self.trajectory_representation,
                 "trajectory_dim": trajectory_flat.shape[-1],
