@@ -424,7 +424,7 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None, pad_a
         )
     elif dataset_name == "trossen_3d" or dataset_name == "trossen_action":
         # Trossen/LeRobot dataset with EE positions (run data/add_trossen_ee_to_dataset.py first)
-        data_root = os.environ.get("TROSSEN_DATA_DIR", "aloha_play_dataset_part_3_with_fk_full_split")
+        data_root = os.environ.get("TROSSEN_DATA_DIR", "/root/lerobot/aloha_play_dataset_part_3_with_fk_full_split")
         repo_id = 'ishika/aloha_play_dataset_part_3_with_fk_full_split' if os.environ.get("TROSSEN_REPO_ID", None) is None else os.environ.get("TROSSEN_REPO_ID", None)
         ee_hdf5 = os.environ.get("TROSSEN_EE_HDF5", f"{data_root}/trossen_ee_world.hdf5")
         stats_file = os.environ.get("TROSSEN_STATS_FILE", f"{data_root}/trajectory_stats.json")
@@ -434,10 +434,12 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None, pad_a
             ee_hdf5_path=ee_hdf5,
             split=split,
             action_chunking_horizon=horizon,
+            actual_trajectory_length=100,
+            camera_keys=["observation.images.cam_high", "observation.images.cam_low"],
             normalize_coordinates=True,
             stats_file=stats_file,
             trajectory_representation="delta",
-            frame_downsampling_ratio=3,
+            frame_downsampling_ratio=1,
             pad_action_chunk=pad_action_chunk,
         )
     # Delta (velocity) representation variants

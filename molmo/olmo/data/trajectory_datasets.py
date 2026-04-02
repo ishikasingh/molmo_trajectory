@@ -388,7 +388,7 @@ class TrajectoryDataset(Dataset):
     def __len__(self):
         return len(self.index_mapping)
     
-    def get(self, idx):
+    def get(self, idx, rng):
         """Get a single training example."""
         mapping = self.index_mapping[idx]
         
@@ -413,7 +413,7 @@ class TrajectoryDataset(Dataset):
             final_trajectory = self._transform_trajectory_to_camera_frame(hdf5_path, mapping['frame_idx'], trajectory)
 
         trajectory_absolute_cam = final_trajectory
-        # final_trajectory = final_trajectory[:, [1, 6], :]
+        final_trajectory = final_trajectory[:, [1, 6], :]
         # print(f"final_trajectory shape: {final_trajectory.shape}")
         
         # Save initial state before converting to delta (if applicable)

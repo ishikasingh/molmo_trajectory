@@ -829,12 +829,18 @@ class Preprocessor:
     def __call__(self, example, rng=np.random):
         example = dict(example)
         if "image" in example:
-            try:
-                image = load_image(example["image"])
-            except Exception as e:
-                raise ValueError(f"Could not load image: {example['image']}")
+            raw = example["image"]
+            if isinstance(raw, (list, tuple)):
+                try:
+                    image = [load_image(im) for im in raw]
+                except Exception as e:
+                    raise ValueError(f"Could not load images: {e}")
             else:
-                example["image"] = image
+                try:
+                    image = load_image(raw)
+                except Exception as e:
+                    raise ValueError(f"Could not load image: {example['image']}")
+            example["image"] = image
         else:
             image = None
 
@@ -856,7 +862,8 @@ class Preprocessor:
         if self.include_image and image is not None:
             formatter_metadata["image"] = image
         if image is not None:
-            h, w = image.shape[:2]
+            img0 = image[0] if isinstance(image, (list, tuple)) else image
+            h, w = img0.shape[:2]
             formatter_metadata["image_size"] = (w, h)
         if "metadata" in example or formatter_metadata:
             metadata = example.get("metadata", {})

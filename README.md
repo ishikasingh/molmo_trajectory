@@ -25,14 +25,18 @@ PYTHONPATH=. torchrun --nproc-per-node 8 --nnodes=${SKYPILOT_NUM_NODES} --node_r
 PYTHONPATH=. torchrun --nproc-per-node 6 --nnodes=${SKYPILOT_NUM_NODES} --node_rank=${SKYPILOT_NODE_RANK} --rdzv_id=311 --rdzv_endpoint=${SKYPILOT_MASTER_ADDR}:29500 launch_scripts/train_affordance.py git stat checkpoints/Molmo-7B-D-0924 --save_folder=finetuned_checkpoints_3d_traj_trossen --save_overwrite --wandb.name=human_trosson_3d_direct_0065 --wandb.entity=ishikasi --wandb.project=affordance --global_batch_size $((SKYPILOT_NUM_NODES*6*12)) --device_train_batch_size 12 --device_eval_batch_size 1 --seq_len 500 --action_horizon 30 --max_crops 2 --flow_matching_prediction_type=x0 --freeze_vlm --robot_trajectory_dim=6
 
 
+
+
+
 PYTHONPATH=. torchrun --nproc-per-node 6 --nnodes=${SKYPILOT_NUM_NODES} --node_rank=${SKYPILOT_NODE_RANK} --rdzv_id=311 --rdzv_endpoint=${SKYPILOT_MASTER_ADDR}:29500 launch_scripts/train_affordance.py 
  checkpoints/Molmo-7B-D-0924 --save_folder=finetuned_checkpoints_3d_traj_trossen_only_train --save_overwrite --wandb.name=trosson_3d_direct_0065 --wandb.entity=ishikasi --wandb.project=affordance --global_batch_size $((SKYPILOT_NUM_NODES*6*12)) --device_train_batch_size 12 --device_eval_batch_size 1 --seq_len 500 --action_horizon 30 --max_crops 2 --flow_matching_prediction_type=x0 --freeze_vlm
 
 <!-- trossen_3d_direct -->
 
 export num_gpus=$(nvidia-smi -L | wc -l)
-PYTHONPATH=. torchrun --nproc-per-node $num_gpus --nnodes=${SKYPILOT_NUM_NODES} --node_rank=${SKYPILOT_NODE_RANK} --rdzv_id=311 --rdzv_endpoint=${SKYPILOT_MASTER_ADDR}:29500 launch_scripts/train_affordance.py  trajectory_3d_trossen_direct checkpoints/Molmo-7B-D-0924 --save_folder=finetuned_checkpoints_3d_traj_trossen_human_labelled_train --save_overwrite --wandb.name=trosson_human_3d_direct_labelled_0065 --wandb.entity=ishikasi --wandb.project=affordance --global_batch_size $((SKYPILOT_NUM_NODES*$num_gpus*12)) --device_train_batch_size 12 --device_eval_batch_size 1 --seq_len 500 --action_horizon 30 --max_crops 2 --flow_matching_prediction_type=x0 --freeze_vlm
+PYTHONPATH=. torchrun --nproc-per-node $num_gpus --nnodes=${SKYPILOT_NUM_NODES} --node_rank=${SKYPILOT_NODE_RANK} --rdzv_id=311 --rdzv_endpoint=${SKYPILOT_MASTER_ADDR}:29500 launch_scripts/train_affordance.py trajectory_3d_trossen_direct checkpoints/Molmo-7B-D-0924 --save_folder=finetuned_checkpoints_3d_traj_trossen_human_labelled_train_norm_100len --save_overwrite --wandb.name=trosson_human_3d_direct_labelled_0065_norm_100len --wandb.entity=ishikasi --wandb.project=affordance --global_batch_size $((SKYPILOT_NUM_NODES*$num_gpus*12)) --device_train_batch_size 12 --device_eval_batch_size 1 --seq_len 500 --action_horizon 30 --max_crops 2 --flow_matching_prediction_type=x0 --freeze_vlm
 
+trajectory_3d_trossen_direct
 
 ```
 note that the global batch size `--global_batch_size $((SKYPILOT_NUM_NODES*8*16))` should match `--device_train_batch_size 16`.
@@ -74,5 +78,9 @@ aws s3 sync s3://far-research-internal/ishikasi/checkpoints/action_chunck_100/ -
 
 
 python launch_scripts/eval_closed_loop.py finetuned_checkpoints_action_hz100/ --dataset_path /root/sky_workdir/dataset/robocasa_og/ --output_dir closed_loop_eval_results_hz50 --num_tasks 20 --steps_per_chunk 50 --action_horizon 100
+
+ aws s3 sync finetuned_checkpoints_3d_traj_trossen_human_labelled_train_norm_100len_multiview/step10 s3://far-research-internal/ishikasi/checkpoints/trossen_3d_traj_labelled_human_norm_100len/step90000-unsharded/ --region us-east-1
+
+ aws s3 sync outputs/train/aloha_molmo_traj_2d/checkpoints/  s3://far-research-internal/ishika/checkpoints/act_2D/ --region us-east-1
 
 ```
