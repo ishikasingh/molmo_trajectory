@@ -4025,7 +4025,7 @@ class Molmo(nn.Module):
             self.num_action_experts > 1 and
             expert_type is not None
         )
-        
+        # import ipdb; ipdb.set_trace()
         # Direct trajectory prediction case
         if self.config.use_direct_trajectory_prediction:
             with torch.autocast("cuda", enabled=False):

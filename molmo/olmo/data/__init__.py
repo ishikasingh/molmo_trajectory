@@ -422,7 +422,7 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None, pad_a
             frame_downsampling_ratio=10, # robocasa dataset is recorded at 20 fps, while egodex is recorded at 30 fps
             pad_action_chunk=pad_action_chunk
         )
-    elif dataset_name == "trossen_affordance" or dataset_name == "trossen_3d":
+    elif dataset_name == "trossen_3d" or dataset_name == "trossen_action":
         # Trossen/LeRobot dataset with EE positions (run data/add_trossen_ee_to_dataset.py first)
         data_root = os.environ.get("TROSSEN_DATA_DIR", "/root/sky_workdir/FAR-affordance/aloha_play_dataset_part_3_with_fk_full_split")
         repo_id = 'ishika/aloha_play_dataset_part_3_with_fk_full_split' if os.environ.get("TROSSEN_REPO_ID", None) is None else os.environ.get("TROSSEN_REPO_ID", None)
@@ -434,10 +434,12 @@ def get_dataset_by_name(dataset_name, split, action_chunking_horizon=None, pad_a
             ee_hdf5_path=ee_hdf5,
             split=split,
             action_chunking_horizon=horizon,
+            actual_trajectory_length=100,
+            camera_keys=["observation.images.cam_high", "observation.images.cam_low"],
             normalize_coordinates=True,
             stats_file=stats_file,
             trajectory_representation="delta",
-            frame_downsampling_ratio=3,
+            frame_downsampling_ratio=1,
             pad_action_chunk=pad_action_chunk,
         )
     # Delta (velocity) representation variants
